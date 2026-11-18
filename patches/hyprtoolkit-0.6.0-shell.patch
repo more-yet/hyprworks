@@ -1,0 +1,4050 @@
+Subject: [PATCH] support reloadable desktop shells
+
+Base: hyprtoolkit v0.6.0 (f8cbaf42e1f7fdc9c7565d7be3e935f6d56c7a39)
+Requires hyprgraphics v0.6.0 with hyprgraphics-0.6.0-resource-lifetime.patch.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c0fa337..5e2f7b6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,20 +25,20 @@ find_package(hyprwayland-scanner 0.4.0 REQUIRED)
+ set(AQUAMARINE_MINIMUM_VERSION 0.10.0)
+ set(HYPRLANG_MINIMUM_VERSION 0.6.0)
+ set(HYPRUTILS_MINIMUM_VERSION 0.14.2)
+-set(HYPRGRAPHICS_MINIMUM_VERSION 0.3.0)
++set(HYPRGRAPHICS_MINIMUM_VERSION 0.6.0)
+ 
+ # quotes and the spaces around '>=' in the list below are necessary for compability with pkg-config grama
+ set(PUBLIC_PKG_DEPS
+-    "aquamarine >= ${AQUAMARINE_MINIMUM_VERSION}"
+     "hyprgraphics >= ${HYPRGRAPHICS_MINIMUM_VERSION}"
++    "aquamarine >= ${AQUAMARINE_MINIMUM_VERSION}"
+     "hyprutils >= ${HYPRUTILS_MINIMUM_VERSION}"
++    pixman-1
+ )
+ set(PRIVATE_PKG_DEPS
+     wayland-client
+     wayland-protocols
+     egl
+     "hyprlang >= ${HYPRLANG_MINIMUM_VERSION}"
+-    pixman-1
+     libdrm
+     gbm
+     xkbcommon
+@@ -139,6 +139,7 @@ endfunction()
+ protocolwayland()
+ 
+ protocolnew("stable/xdg-shell" "xdg-shell" false)
++protocolnew("protocols" "hyprland-focus-grab-v1" true)
+ protocolnew("stable/linux-dmabuf" "linux-dmabuf-v1" false)
+ protocolnew("staging/fractional-scale" "fractional-scale-v1" false)
+ protocolnew("stable/viewporter" "viewporter" false)
+diff --git a/include/hyprtoolkit/core/Backend.hpp b/include/hyprtoolkit/core/Backend.hpp
+index 2cfd1ed..5e6bb6f 100644
+--- a/include/hyprtoolkit/core/Backend.hpp
++++ b/include/hyprtoolkit/core/Backend.hpp
+@@ -54,8 +54,8 @@ namespace Hyprtoolkit {
+         virtual void setLogFn(LogFn&& fn) = 0;
+ 
+         /* These are non-owning. */
+-        virtual void addFd(int fd, std::function<void()>&& callback) = 0;
+-        virtual void removeFd(int fd)                                = 0;
++        virtual std::expected<void, std::string> addFd(int fd, std::function<void()>&& callback, short events = POLLIN) = 0;
++        virtual void                             removeFd(int fd)                                                       = 0;
+ 
+         /*
+             Get the system icon factory object,
+@@ -96,6 +96,9 @@ namespace Hyprtoolkit {
+         virtual std::expected<Hyprutils::Memory::CSharedPointer<ISessionLockState>, eSessionLockError> aquireSessionLock() = 0;
+ 
+         struct {
++            // Emitted once, on the host thread, before resources or the display are released.
++            // Release retained windows here; listeners must not throw or create new resources.
++            Hyprutils::Signal::CSignalT<> destroying;
+             /*
+                 Get notified when a new output was added.
+             */
+diff --git a/include/hyprtoolkit/core/BackendServices.hpp b/include/hyprtoolkit/core/BackendServices.hpp
+index da1ba8a..1b7d708 100644
+--- a/include/hyprtoolkit/core/BackendServices.hpp
++++ b/include/hyprtoolkit/core/BackendServices.hpp
+@@ -4,6 +4,7 @@
+ #include <cstdint>
+ #include <expected>
+ #include <functional>
++#include <poll.h>
+ #include <string>
+ #include <vector>
+ 
+@@ -28,8 +29,8 @@ namespace Hyprtoolkit {
+ 
+         // All callbacks must execute serially on the thread that owns toolkit
+         // surfaces. The host retains callbacks until they run or are removed.
+-        virtual void addFd(int fd, std::function<void()>&& callback) = 0;
+-        virtual void removeFd(int fd)                                = 0;
++        virtual std::expected<void, std::string> addFd(int fd, std::function<void()>&& callback, short events = POLLIN) = 0;
++        virtual void                             removeFd(int fd)                                                       = 0;
+         virtual Hyprutils::Memory::CAtomicSharedPointer<CTimer>
+         addTimer(const TimerDuration& timeout, std::function<void(Hyprutils::Memory::CAtomicSharedPointer<CTimer> self, void* data)> callback, void* data, bool force = false) = 0;
+         virtual void addIdle(const std::function<void()>& callback)                                                                                                            = 0;
+@@ -39,12 +40,27 @@ namespace Hyprtoolkit {
+         virtual void enterLoop() = 0;
+     };
+ 
++    class IClipboardTransfer {
++      public:
++        virtual ~IClipboardTransfer() = default;
++    };
++
++    using ClipboardCallback = std::function<void(std::expected<std::string, std::string>)>;
++
+     class IClipboard {
+       public:
+         virtual ~IClipboard() = default;
+ 
+-        virtual void        setText(const std::string& text) = 0;
+-        virtual std::string getText()                        = 0;
++        virtual std::expected<void, std::string> setText(const std::string& text) = 0;
++        // Retain the transfer until completion. Releasing it cancels pending IO.
++        virtual Hyprutils::Memory::CSharedPointer<IClipboardTransfer> readText(ClipboardCallback callback) = 0;
++    };
++
++    struct STextInputState {
++        Hyprutils::Math::CBox cursorBox;
++        std::string_view      text;
++        size_t                cursor = 0, anchor = 0;
++        bool                  password = false, multiline = false;
+     };
+ 
+     class ITextInput {
+@@ -52,8 +68,8 @@ namespace Hyprtoolkit {
+         virtual ~ITextInput() = default;
+ 
+         // surface is zero for native backend windows.
+-        virtual void activate(EmbeddedSurfaceID surface, const Hyprutils::Math::CBox& cursorBox, const std::string& surroundingText, size_t cursor) = 0;
+-        virtual void deactivate(EmbeddedSurfaceID surface)                                                                                          = 0;
++        virtual void activate(EmbeddedSurfaceID surface, const STextInputState& state) = 0;
++        virtual void deactivate(EmbeddedSurfaceID surface)                             = 0;
+     };
+ 
+     class ICursor {
+diff --git a/include/hyprtoolkit/core/Input.hpp b/include/hyprtoolkit/core/Input.hpp
+index d9c769d..4dae2cb 100644
+--- a/include/hyprtoolkit/core/Input.hpp
++++ b/include/hyprtoolkit/core/Input.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <cstdint>
+ #include <string>
++#include <optional>
+ 
+ #include <hyprutils/math/Vector2D.hpp>
+ 
+@@ -44,4 +45,11 @@ namespace Hyprtoolkit::Input {
+         Hyprutils::Math::Vector2D local;
+         uint32_t                  timeMs = 0;
+     };
++
++    struct STextInputEvent {
++        std::string                preedit;
++        std::optional<std::string> commit;
++        int32_t                    cursorBegin = 0, cursorEnd = 0;
++        uint32_t                   deleteBefore = 0, deleteAfter = 0;
++    };
+ }
+diff --git a/include/hyprtoolkit/core/Output.hpp b/include/hyprtoolkit/core/Output.hpp
+index 1b55865..7933b0a 100644
+--- a/include/hyprtoolkit/core/Output.hpp
++++ b/include/hyprtoolkit/core/Output.hpp
+@@ -15,6 +15,7 @@ namespace Hyprtoolkit {
+         struct {
+             /* output removed */
+             Hyprutils::Signal::CSignalT<> removed;
++            Hyprutils::Signal::CSignalT<> changed;
+         } m_events;
+     };
+ }
+diff --git a/include/hyprtoolkit/element/Element.hpp b/include/hyprtoolkit/element/Element.hpp
+index f50a81a..9008873 100644
+--- a/include/hyprtoolkit/element/Element.hpp
++++ b/include/hyprtoolkit/element/Element.hpp
+@@ -46,7 +46,14 @@ namespace Hyprtoolkit {
+         virtual void                      paint() = 0;
+         virtual Hyprutils::Math::Vector2D size()  = 0;
+         virtual Hyprutils::Math::Vector2D posFromParent();
+-        virtual void                      reposition(const Hyprutils::Math::CBox& box, const Hyprutils::Math::Vector2D& maxSize = {-1, -1});
++        // Last layout box in surface-local logical coordinates, before clipping.
++        Hyprutils::Math::CBox geometry() const;
++        void                  setFocusable(bool focusable);
++        void                  focusKeyboard(bool focus = true);
++        bool                  keyboardFocused() const;
++        // On the root element, runs before native key handling. True consumes the event.
++        void         setKeyFilter(std::function<bool(const Input::SKeyboardKeyEvent&)>&& filter);
++        virtual void reposition(const Hyprutils::Math::CBox& box, const Hyprutils::Math::Vector2D& maxSize = {-1, -1});
+ 
+         // TODO: move this to builders, this is clunky
+         virtual void setPositionMode(ePositionMode mode);
+@@ -83,6 +90,7 @@ namespace Hyprtoolkit {
+         void animateOpacity(const SAnimation& animation);
+         void animateGeometry(const SAnimation& animation);
+         void setOpacity(float opacity);
++        void setFocusRing(bool enabled);
+ 
+         // forces a reposition right now, useful for pre-calculating expected sizes
+         virtual void forceReposition();
+@@ -101,8 +109,7 @@ namespace Hyprtoolkit {
+         virtual ePointerShape                            pointerShape();
+         virtual std::function<ePointerShape()>           pointerShapeFn();
+         virtual bool                                     alwaysGetMouseInput();
+-        virtual void                                     imCommitNewText(const std::string& text);
+-        virtual void                                     imApplyText();
++        virtual void                                     imUpdate(const Input::STextInputEvent& event);
+ 
+         virtual void                                     recheckColor();
+         virtual bool                                     positioningDependsOnChild();
+diff --git a/include/hyprtoolkit/element/Image.hpp b/include/hyprtoolkit/element/Image.hpp
+index c88bb2f..45697a7 100644
+--- a/include/hyprtoolkit/element/Image.hpp
++++ b/include/hyprtoolkit/element/Image.hpp
+@@ -21,15 +21,18 @@ namespace Hyprtoolkit {
+ 
+         static Hyprutils::Memory::CSharedPointer<CImageBuilder> begin();
+         Hyprutils::Memory::CSharedPointer<CImageBuilder>        path(std::string&&);
+-        Hyprutils::Memory::CSharedPointer<CImageBuilder>        icon(const Hyprutils::Memory::CSharedPointer<ISystemIconDescription>&);
+-        Hyprutils::Memory::CSharedPointer<CImageBuilder>        data(std::vector<uint8_t>&& data);
+-        Hyprutils::Memory::CSharedPointer<CImageBuilder>        a(float);
+-        Hyprutils::Memory::CSharedPointer<CImageBuilder>        fitMode(eImageFitMode);
+-        Hyprutils::Memory::CSharedPointer<CImageBuilder>        sync(bool);
+-        Hyprutils::Memory::CSharedPointer<CImageBuilder>        rounding(int);
+-        Hyprutils::Memory::CSharedPointer<CImageBuilder>        size(CDynamicSize&&);
++        // Delivered on the event-loop thread for the current source/raster request.
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> onLoaded(std::function<void(bool)>&&);
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> icon(const Hyprutils::Memory::CSharedPointer<ISystemIconDescription>&);
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> data(std::vector<uint8_t>&& data);
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> pixels(std::vector<uint8_t>&& rgba, int width, int height);
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> a(float);
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> fitMode(eImageFitMode);
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> sync(bool);
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> rounding(int);
++        Hyprutils::Memory::CSharedPointer<CImageBuilder> size(CDynamicSize&&);
+ 
+-        Hyprutils::Memory::CSharedPointer<CImageElement>        commence();
++        Hyprutils::Memory::CSharedPointer<CImageElement> commence();
+ 
+       private:
+         Hyprutils::Memory::CWeakPointer<CImageBuilder> m_self;
+diff --git a/include/hyprtoolkit/element/Textbox.hpp b/include/hyprtoolkit/element/Textbox.hpp
+index 91d524d..b804c88 100644
+--- a/include/hyprtoolkit/element/Textbox.hpp
++++ b/include/hyprtoolkit/element/Textbox.hpp
+@@ -66,8 +66,7 @@ namespace Hyprtoolkit {
+         virtual ePointerShape                            pointerShape();
+         virtual std::function<ePointerShape()>           pointerShapeFn();
+         virtual bool                                     acceptsKeyboardInput();
+-        virtual void                                     imCommitNewText(const std::string&);
+-        virtual void                                     imApplyText();
++        void                                             imUpdate(const Input::STextInputEvent& event) override;
+         virtual bool                                     positioningDependsOnChild();
+ 
+         Hyprutils::Memory::CUniquePointer<STextboxImpl>  m_impl;
+diff --git a/include/hyprtoolkit/window/EmbeddedSurface.hpp b/include/hyprtoolkit/window/EmbeddedSurface.hpp
+index c36b891..fd32e29 100644
+--- a/include/hyprtoolkit/window/EmbeddedSurface.hpp
++++ b/include/hyprtoolkit/window/EmbeddedSurface.hpp
+@@ -35,8 +35,7 @@ namespace Hyprtoolkit {
+         virtual void keyboardEnter()                                         = 0;
+         virtual void keyboardKey(const Input::SKeyboardKeyEvent& event)      = 0;
+         virtual void keyboardLeave()                                         = 0;
+-        virtual void imCommit(const std::string& text)                       = 0;
+-        virtual void imApply()                                               = 0;
++        virtual void imUpdate(const Input::STextInputEvent& event)           = 0;
+         // A primary touch without a touch-aware target emulates a captured
+         // left-button tap on release. Drag controls should consume touch events.
+         virtual void                                        touchDown(int32_t id, const Hyprutils::Math::Vector2D& local, uint32_t timeMs)   = 0;
+diff --git a/include/hyprtoolkit/window/Window.hpp b/include/hyprtoolkit/window/Window.hpp
+index 35c96a2..531e71b 100644
+--- a/include/hyprtoolkit/window/Window.hpp
++++ b/include/hyprtoolkit/window/Window.hpp
+@@ -3,6 +3,8 @@
+ #include <hyprutils/memory/SharedPtr.hpp>
+ #include <hyprutils/signal/Signal.hpp>
+ #include <hyprutils/math/Vector2D.hpp>
++#include <hyprutils/math/Region.hpp>
++#include <optional>
+ 
+ #include "../core/Input.hpp"
+ 
+@@ -96,14 +98,26 @@ namespace Hyprtoolkit {
+         // no-op for layer, lock, popup.
+         virtual void setSize(const Hyprutils::Math::Vector2D& size) {}
+ 
++        virtual bool repositionPopup(const Hyprutils::Math::Vector2D& position, const Hyprutils::Math::Vector2D& size);
++
++        // Surface-local logical coordinates. nullopt accepts the whole surface; an empty region accepts no pointer input.
++        // Retained across close/open. False if unsupported or a rectangle exceeds the protocol's signed 32-bit extents.
++        virtual bool setInputRegion(const std::optional<Hyprutils::Math::CRegion>& region);
++
+         // hand off to the compositor for an interactive edge/corner resize.
+         // must be called from a pointer-press handler so the latest button
+         // serial is fresh. no-op for layer, lock, popup.
+         virtual void startInteractiveResize(eResizeEdge edges) {}
+ 
++        // Hyprland focus restriction to this surface. False when unavailable or not open.
++        virtual bool grabFocus();
++        virtual void releaseFocus();
++        virtual bool hasFocusGrab();
++
+         struct {
+             // coordinates here are logical, meaning pixel size is this * scale()
+             Hyprutils::Signal::CSignalT<Hyprutils::Math::Vector2D> resized;
++            Hyprutils::Signal::CSignalT<float>                     scaleChanged;
+ 
+             // user requested a close.
+             Hyprutils::Signal::CSignalT<> closeRequest;
+@@ -114,6 +128,8 @@ namespace Hyprtoolkit {
+             // layer closed
+             Hyprutils::Signal::CSignalT<> layerClosed;
+ 
++            Hyprutils::Signal::CSignalT<> focusGrabCleared;
++
+             // (global) key events
+             Hyprutils::Signal::CSignalT<Input::SKeyboardKeyEvent> keyboardKey;
+         } m_events;
+diff --git a/protocols/hyprland-focus-grab-v1.xml b/protocols/hyprland-focus-grab-v1.xml
+new file mode 100644
+index 0000000..c497ef2
+--- /dev/null
++++ b/protocols/hyprland-focus-grab-v1.xml
+@@ -0,0 +1,118 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="hyprland_focus_grab_v1">
++  <copyright>
++    Copyright © 2024 outfoxxed
++    All rights reserved.
++
++    Redistribution and use in source and binary forms, with or without
++    modification, are permitted provided that the following conditions are met:
++
++    1. Redistributions of source code must retain the above copyright notice, this
++       list of conditions and the following disclaimer.
++
++    2. Redistributions in binary form must reproduce the above copyright notice,
++       this list of conditions and the following disclaimer in the documentation
++       and/or other materials provided with the distribution.
++
++    3. Neither the name of the copyright holder nor the names of its
++       contributors may be used to endorse or promote products derived from
++       this software without specific prior written permission.
++
++    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++    FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++    DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++    OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++  </copyright>
++
++  <description summary="limit input focus to a set of surfaces">
++    This protocol allows clients to limit input focus to a specific set
++    of surfaces and receive a notification when the limiter is removed as
++    detailed below.
++  </description>
++
++  <interface name="hyprland_focus_grab_manager_v1" version="1">
++    <description summary="manager for focus grab objects">
++      This interface allows a client to create surface grab objects.
++    </description>
++    <request name="create_grab">
++      <description summary="create a focus grab object">
++        Create a surface grab object.
++      </description>
++      <arg name="grab" type="new_id" interface="hyprland_focus_grab_v1"/>
++    </request>
++    <request name="destroy" type="destructor">
++      <description summary="destroy the focus grab manager">
++        Destroy the focus grab manager.
++        This doesn't destroy existing focus grab objects.
++      </description>
++    </request>
++  </interface>
++
++  <interface name="hyprland_focus_grab_v1" version="1">
++    <description summary="input focus limiter">
++      This interface restricts input focus to a specified whitelist of
++      surfaces as long as the focus grab object exists and has at least
++      one comitted surface.
++
++      Mouse and touch events inside a whitelisted surface will be passed
++      to the surface normally, while events outside of a whitelisted surface
++      will clear the grab object. Keyboard events will be passed to the client
++      and a compositor-picked surface in the whitelist will receive a
++      wl_keyboard::enter event if a whitelisted surface is not already entered.
++
++      Upon meeting implementation-defined criteria usually meaning a mouse or
++      touch input outside of any whitelisted surfaces, the compositor will
++      clear the whitelist, rendering the grab inert and sending the cleared
++      event. The same will happen if another focus grab or similar action
++      is started at the compositor's discretion.
++    </description>
++    <request name="add_surface">
++      <description summary="add a surface to the focus whitelist">
++        Add a surface to the whitelist. Destroying the surface is treated the
++        same as an explicit call to remove_surface and duplicate additions are
++        ignored.
++
++        Does not take effect until commit is called.
++      </description>
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
++    <request name="remove_surface">
++      <description summary="remove a surface from the focus whitelist">
++        Remove a surface from the whitelist. Destroying the surface is treated
++        the same as an explicit call to this function.
++
++        If the grab was active and the removed surface was entered by the
++        keyboard, another surface will be entered on commit.
++
++        Does not take effect until commit is called.
++      </description>
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
++    <request name="commit">
++      <description summary="commit the focus whitelist">
++        Commit pending changes to the surface whitelist.
++
++        If the list previously had no entries and now has at least one, the grab
++        will start. If it previously had entries and now has none, the grab will
++        become inert.
++      </description>
++    </request>
++    <request name="destroy" type="destructor">
++      <description summary="destroy the focus grab">
++        Destroy the grab object and remove the grab if active.
++      </description>
++    </request>
++    <event name="cleared">
++      <description summary="the focus grab was cleared">
++        Sent when an active grab is cancelled by the compositor,
++        regardless of cause.
++      </description>
++    </event>
++  </interface>
++</protocol>
+diff --git a/src/core/Backend.cpp b/src/core/Backend.cpp
+index d921846..f629ec2 100644
+--- a/src/core/Backend.cpp
++++ b/src/core/Backend.cpp
+@@ -15,6 +15,7 @@
+ #include "../window/WaylandWindow.hpp"
+ #include "../Macros.hpp"
+ #include "../element/Element.hpp"
++#include "../helpers/UTF8.hpp"
+ #include "../palette/ConfigManager.hpp"
+ #include "../system/Icons.hpp"
+ #include "../sessionLock/WaylandSessionLock.hpp"
+@@ -32,28 +33,62 @@ using namespace Hyprutils::OS;
+ 
+ class CWaylandClipboard final : public IClipboard {
+   public:
+-    void setText(const std::string& text) override {
+-        g_waylandPlatform->setClipboard(text);
++    std::expected<void, std::string> setText(const std::string& text) override {
++        return g_waylandPlatform->setClipboard(text);
+     }
+ 
+-    std::string getText() override {
+-        return g_waylandPlatform->readClipboard();
++    SP<IClipboardTransfer> readText(ClipboardCallback callback) override {
++        return g_waylandPlatform->readClipboard(std::move(callback));
+     }
+ };
+ 
+ class CWaylandTextInput final : public ITextInput {
+   public:
+-    void activate(EmbeddedSurfaceID surface, const Hyprutils::Math::CBox& cursorBox, const std::string& surroundingText, size_t cursor) override {
+-        if (!g_waylandPlatform->m_waylandState.textInput)
++    void activate(EmbeddedSurfaceID surface, const STextInputState& state) override {
++        auto& input = g_waylandPlatform->m_waylandState.textInput;
++        auto& im    = g_waylandPlatform->m_waylandState.imState;
++        if (!input || !im.window || im.suppressCommit)
+             return;
+ 
+-        if (!g_waylandPlatform->m_waylandState.imState.enabled) {
+-            g_waylandPlatform->m_waylandState.textInput->sendEnable();
+-            g_waylandPlatform->m_waylandState.imState.enabled = true;
++        const auto     low = std::min(state.cursor, state.anchor), high = std::max(state.cursor, state.anchor);
++        const bool     surrounding = !state.password && high - low <= 4000;
++        const uint32_t hints       = (state.multiline ? sc<uint32_t>(ZWP_TEXT_INPUT_V3_CONTENT_HINT_MULTILINE) : 0U) |
++            (state.password ? ZWP_TEXT_INPUT_V3_CONTENT_HINT_HIDDEN_TEXT | ZWP_TEXT_INPUT_V3_CONTENT_HINT_SENSITIVE_DATA : 0);
++        size_t           cursor = 0, anchor = 0;
++        std::string_view text;
++        if (surrounding) {
++            const size_t padding = (4000 - (high - low)) / 2;
++            size_t       begin   = low > padding ? low - padding : 0;
++            while (begin < state.text.size() && (state.text[begin] & 0xC0) == 0x80)
++                ++begin;
++            const size_t end = UTF8::floorBoundary(state.text, begin + 4000);
++            text             = std::string_view{state.text}.substr(begin, end - begin);
++            cursor           = state.cursor - begin;
++            anchor           = state.anchor - begin;
+         }
+-
+-        g_waylandPlatform->m_waylandState.textInput->sendSetCursorRectangle(cursorBox.x, cursorBox.y, cursorBox.w, cursorBox.h);
+-        g_waylandPlatform->m_waylandState.textInput->sendCommit();
++        const bool enable = !im.enabled || im.hints != hints || im.surrounding != surrounding;
++        // An unchanged reply to done can make the input method reply forever.
++        if (!enable && m_sent.text == text && m_sent.cursor == cursor && m_sent.anchor == anchor && m_sent.cursorBox == state.cursorBox)
++            return;
++        m_sent.text      = text;
++        m_sent.cursor    = cursor;
++        m_sent.anchor    = anchor;
++        m_sent.cursorBox = state.cursorBox;
++        if (enable) {
++            input->sendEnable();
++            im.enabled      = true;
++            im.enableSerial = im.serial + 1;
++            im.pending      = {};
++        }
++        im.hints       = hints;
++        im.surrounding = surrounding;
++        if (surrounding)
++            input->sendSetSurroundingText(m_sent.text.c_str(), cursor, anchor);
++        input->sendSetContentType(sc<zwpTextInputV3ContentHint>(hints), state.password ? ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_PASSWORD : ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
++        input->sendSetTextChangeCause(im.inDone ? ZWP_TEXT_INPUT_V3_CHANGE_CAUSE_INPUT_METHOD : ZWP_TEXT_INPUT_V3_CHANGE_CAUSE_OTHER);
++        input->sendSetCursorRectangle(state.cursorBox.x, state.cursorBox.y, state.cursorBox.w, state.cursorBox.h);
++        input->sendCommit();
++        ++im.serial;
+     }
+ 
+     void deactivate(EmbeddedSurfaceID surface) override {
+@@ -61,8 +96,18 @@ class CWaylandTextInput final : public ITextInput {
+             return;
+ 
+         g_waylandPlatform->m_waylandState.textInput->sendDisable();
++        g_waylandPlatform->m_waylandState.textInput->sendCommit();
++        ++g_waylandPlatform->m_waylandState.imState.serial;
+         g_waylandPlatform->m_waylandState.imState.enabled = false;
++        g_waylandPlatform->m_waylandState.imState.pending = {};
+     }
++
++  private:
++    struct {
++        std::string           text;
++        size_t                cursor = 0, anchor = 0;
++        Hyprutils::Math::CBox cursorBox;
++    } m_sent;
+ };
+ 
+ class CWaylandCursor final : public ICursor {
+@@ -117,7 +162,14 @@ CBackend::CBackend() {
+ 
+     m_aqBackend             = Aquamarine::CBackend::create(implementations, options);
+     g_asyncResourceGatherer = makeShared<CAsyncResourceGatherer>();
+-    g_animationManager      = makeShared<CHTAnimationManager>();
++    if (auto result = addFd(g_asyncResourceGatherer->fd(),
++                            [] {
++                                const auto queue = g_asyncResourceGatherer;
++                                queue->dispatch();
++                            });
++        !result)
++        throw std::runtime_error("resource event source: " + result.error());
++    g_animationManager = makeShared<CHTAnimationManager>();
+ }
+ 
+ CBackend::~CBackend() {
+@@ -398,66 +450,50 @@ static void reloadRecurse(SP<IElement> el) {
+     }
+ }
+ 
++static void reloadWindow(SP<IWaylandWindow> window) {
++    if (!window)
++        return;
++    reloadRecurse(window->m_rootElement);
++    for (const auto& popup : window->m_popups)
++        reloadWindow(popup.lock());
++}
++
+ void CBackend::reloadTheme() {
+     if (g_palette->m_isConfig)
+         g_palette = CPalette::palette();
+ 
+-    for (const auto& w : g_waylandPlatform->m_windows) {
+-        if (!w)
+-            continue;
+-
+-        reloadRecurse(w->m_rootElement);
+-
+-        for (const auto& p : w->m_popups) {
+-            if (!p)
+-                continue;
+-
+-            reloadRecurse(p->m_rootElement);
+-        }
+-    }
+-
+-    for (const auto& w : g_waylandPlatform->m_layers) {
+-        if (!w)
+-            continue;
+-
+-        reloadRecurse(w->m_rootElement);
+-
+-        for (const auto& p : w->m_popups) {
+-            if (!p)
+-                continue;
+-
+-            reloadRecurse(p->m_rootElement);
+-        }
+-    }
++    for (const auto& window : g_waylandPlatform->m_windows)
++        reloadWindow(window.lock());
++    for (const auto& layer : g_waylandPlatform->m_layers)
++        reloadWindow(layer.lock());
+ }
+ 
+-void CBackend::addFd(int fd, std::function<void()>&& callback) {
++std::expected<void, std::string> CBackend::addFd(int fd, std::function<void()>&& callback, short events) {
+     if (!m_eventLoop || m_terminate)
+-        return;
++        return std::unexpected("backend is closed");
++
++    if (std::ranges::any_of(m_userFds, [fd](const auto& listener) { return listener.fd == fd; }))
++        return std::unexpected("descriptor is already registered");
+ 
+     CFileDescriptor duplicatedFD{fcntl(fd, F_DUPFD_CLOEXEC, 0)};
+-    if (!duplicatedFD.isValid()) {
+-        g_logger->log(HT_LOG_ERROR, "couldn't duplicate fd {} for event loop: {}", fd, std::system_category().message(errno));
+-        return;
+-    }
++    if (!duplicatedFD.isValid())
++        return std::unexpected(std::format("duplicate descriptor {}: {}", fd, std::system_category().message(errno)));
+ 
+-    auto source = m_eventLoop->addFD(std::move(duplicatedFD), Hyprutils::EventLoop::eEventMask::READABLE,
+-                                     [callback = std::move(callback)](Hyprutils::EventLoop::IFDSource& self, Hyprutils::EventLoop::FdEventMask events) {
+-                                         if (events & Hyprutils::EventLoop::eEventMask::READABLE)
+-                                             callback();
+-
+-                                         if (events & (Hyprutils::EventLoop::eEventMask::HUP | Hyprutils::EventLoop::eEventMask::ERROR))
+-                                             (void)self.setMask(Hyprutils::EventLoop::eEventMask::EMPTY);
+-                                     });
+-    if (!source) {
+-        g_logger->log(HT_LOG_ERROR, "couldn't add fd {} to event loop: {}", fd, source.error());
+-        return;
+-    }
++    Hyprutils::EventLoop::FdEventMask mask = Hyprutils::EventLoop::eEventMask::EMPTY;
++    if (events & POLLIN)
++        mask |= Hyprutils::EventLoop::eEventMask::READABLE;
++    if (events & POLLOUT)
++        mask |= Hyprutils::EventLoop::eEventMask::WRITABLE;
++    auto source =
++        m_eventLoop->addFD(std::move(duplicatedFD), mask, [callback = std::move(callback)](Hyprutils::EventLoop::IFDSource&, Hyprutils::EventLoop::FdEventMask) { callback(); });
++    if (!source)
++        return std::unexpected(source.error());
+ 
+     m_userFds.emplace_back(SFDListener{
+         .fd     = fd,
+         .source = *source,
+     });
++    return {};
+ }
+ 
+ void CBackend::removeFd(int fd) {
+@@ -664,6 +700,13 @@ void CBackend::cleanup() {
+     if (m_cleaned.exchange(true))
+         return;
+ 
++    const auto keepAlive = g_backend;
++    m_events.destroying.emit();
++
++    if (g_asyncResourceGatherer) {
++        removeFd(g_asyncResourceGatherer->fd());
++        g_asyncResourceGatherer->stop();
++    }
+     g_asyncResourceGatherer.reset();
+ 
+     m_waylandPostDispatch.reset();
+diff --git a/src/core/Backend.hpp b/src/core/Backend.hpp
+index 51a8d21..c0ba304 100644
+--- a/src/core/Backend.hpp
++++ b/src/core/Backend.hpp
+@@ -27,7 +27,7 @@ namespace Hyprtoolkit {
+ 
+         virtual void                     destroy();
+         virtual void                     setLogFn(LogFn&& fn);
+-        virtual void                     addFd(int fd, std::function<void()>&& callback);
++        std::expected<void, std::string> addFd(int fd, std::function<void()>&& callback, short events = POLLIN) override;
+         virtual void                     removeFd(int fd);
+         virtual SP<ISystemIconFactory>   systemIcons();
+         virtual ASP<CTimer>              addTimer(const TimerDuration& timeout, std::function<void(ASP<CTimer> self, void* data)> cb_, void* data, bool force = false);
+diff --git a/src/core/BackendContext.cpp b/src/core/BackendContext.cpp
+index a19dd94..accda81 100644
+--- a/src/core/BackendContext.cpp
++++ b/src/core/BackendContext.cpp
+@@ -16,18 +16,19 @@ SBackendLifetime::SBackendLifetime() :
+ 
+ class CNullClipboard final : public IClipboard {
+   public:
+-    void setText(const std::string& text) override {
+-        ;
++    std::expected<void, std::string> setText(const std::string& text) override {
++        return std::unexpected("clipboard is unavailable");
+     }
+ 
+-    std::string getText() override {
++    SP<IClipboardTransfer> readText(ClipboardCallback callback) override {
++        callback(std::unexpected("clipboard is unavailable"));
+         return {};
+     }
+ };
+ 
+ class CNullTextInput final : public ITextInput {
+   public:
+-    void activate(EmbeddedSurfaceID surface, const Hyprutils::Math::CBox& cursorBox, const std::string& surroundingText, size_t cursor) override {
++    void activate(EmbeddedSurfaceID surface, const STextInputState& state) override {
+         ;
+     }
+ 
+diff --git a/src/core/EmbeddedBackend.cpp b/src/core/EmbeddedBackend.cpp
+index 840e3b6..f70b153 100644
+--- a/src/core/EmbeddedBackend.cpp
++++ b/src/core/EmbeddedBackend.cpp
+@@ -33,9 +33,18 @@ SP<IEmbeddedBackend> IEmbeddedBackend::create(const SCreationData& data) {
+     g_palette               = CPalette::palette();
+     g_iconFactory           = SP<CSystemIconFactory>(new CSystemIconFactory());
+     g_asyncResourceGatherer = makeShared<Hyprgraphics::CAsyncResourceGatherer>();
+-    g_animationManager      = makeShared<CHTAnimationManager>();
+-    g_openGL                = makeShared<COpenGLRenderer>();
+-    g_renderer              = g_openGL;
++    if (auto result = backend->addFd(g_asyncResourceGatherer->fd(),
++                                     [] {
++                                         const auto queue = g_asyncResourceGatherer;
++                                         queue->dispatch();
++                                     });
++        !result) {
++        backend->destroy();
++        return nullptr;
++    }
++    g_animationManager = makeShared<CHTAnimationManager>();
++    g_openGL           = makeShared<COpenGLRenderer>();
++    g_renderer         = g_openGL;
+ 
+     return backend;
+ }
+@@ -75,6 +84,8 @@ void CEmbeddedBackend::destroyNow() {
+     m_destroyed        = true;
+     m_destroyRequested = false;
+ 
++    m_events.destroying.emit();
++
+     g_backendServices->eventLoop->cancelPending();
+     m_outputAddedListener.reset();
+ 
+@@ -84,6 +95,8 @@ void CEmbeddedBackend::destroyNow() {
+     }
+     m_surfaces.clear();
+ 
++    if (g_asyncResourceGatherer)
++        g_asyncResourceGatherer->stop();
+     g_asyncResourceGatherer.reset();
+     g_animationManager.reset();
+     g_iconFactory.reset();
+@@ -104,10 +117,10 @@ void CEmbeddedBackend::setLogFn(LogFn&& fn) {
+     g_logger->m_logFn = std::move(fn);
+ }
+ 
+-void CEmbeddedBackend::addFd(int fd, std::function<void()>&& callback) {
++std::expected<void, std::string> CEmbeddedBackend::addFd(int fd, std::function<void()>&& callback, short events) {
+     if (m_destroyed)
+-        return;
+-    g_backendServices->eventLoop->addFd(fd, std::move(callback));
++        return std::unexpected("backend is closed");
++    return g_backendServices->eventLoop->addFd(fd, std::move(callback), events);
+ }
+ 
+ void CEmbeddedBackend::removeFd(int fd) {
+diff --git a/src/core/EmbeddedBackend.hpp b/src/core/EmbeddedBackend.hpp
+index 16dd9ba..916dbab 100644
+--- a/src/core/EmbeddedBackend.hpp
++++ b/src/core/EmbeddedBackend.hpp
+@@ -13,11 +13,11 @@ namespace Hyprtoolkit {
+         explicit CEmbeddedBackend(const SCreationData& data);
+         ~CEmbeddedBackend();
+ 
+-        void                     destroy() override;
+-        void                     setLogFn(LogFn&& fn) override;
+-        void                     addFd(int fd, std::function<void()>&& callback) override;
+-        void                     removeFd(int fd) override;
+-        SP<ISystemIconFactory>   systemIcons() override;
++        void                             destroy() override;
++        void                             setLogFn(LogFn&& fn) override;
++        std::expected<void, std::string> addFd(int fd, std::function<void()>&& callback, short events = POLLIN) override;
++        void                             removeFd(int fd) override;
++        SP<ISystemIconFactory>           systemIcons() override;
+         ASP<CTimer>              addTimer(const TimerDuration& timeout, std::function<void(ASP<CTimer> self, void* data)> callback, void* data, bool force = false) override;
+         void                     enterLoop() override;
+         void                     addIdle(const std::function<void()>& callback) override;
+diff --git a/src/core/platforms/WaylandPlatform.cpp b/src/core/platforms/WaylandPlatform.cpp
+index d6ad3a0..1a599e8 100644
+--- a/src/core/platforms/WaylandPlatform.cpp
++++ b/src/core/platforms/WaylandPlatform.cpp
+@@ -21,6 +21,8 @@
+ #include <sys/mman.h>
+ #include <fcntl.h>
+ #include <unistd.h>
++#include <signal.h>
++#include <system_error>
+ 
+ using namespace Hyprtoolkit;
+ using namespace Hyprutils::Math;
+@@ -116,6 +118,10 @@ bool CWaylandPlatform::attempt() {
+             TRACE(g_logger->log(HT_LOG_TRACE, "  > binding to global: {} (version {}) with id {}", name, 3, id));
+             m_waylandState.dataDeviceManager =
+                 makeShared<CCWlDataDeviceManager>((wl_proxy*)wl_registry_bind((wl_registry*)m_waylandState.registry->resource(), id, &wl_data_device_manager_interface, 3));
++        } else if (NAME == hyprland_focus_grab_manager_v1_interface.name) {
++            m_waylandState.focusGrabManager = makeShared<CCHyprlandFocusGrabManagerV1>(
++                rc<wl_proxy*>(wl_registry_bind(rc<wl_registry*>(m_waylandState.registry->resource()), id, &hyprland_focus_grab_manager_v1_interface, 1)));
++            m_waylandState.focusGrabManagerName = id;
+         } else if (NAME == zwp_keyboard_shortcuts_inhibit_manager_v1_interface.name) {
+             m_waylandState.shortcutsInhibitMgr = makeShared<CCZwpKeyboardShortcutsInhibitManagerV1>(
+                 (wl_proxy*)wl_registry_bind((wl_registry*)m_waylandState.registry->resource(), id, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface, 1));
+@@ -124,6 +130,11 @@ bool CWaylandPlatform::attempt() {
+     m_waylandState.registry->setGlobalRemove([this](CCWlRegistry* r, uint32_t id) {
+         TRACE(g_logger->log(HT_LOG_TRACE, "Global {} removed", id));
+ 
++        if (id == m_waylandState.focusGrabManagerName) {
++            m_waylandState.focusGrabManager.reset();
++            m_waylandState.focusGrabManagerName = 0;
++        }
++
+         if (m_sessionLockState)
+             m_sessionLockState->onOutputRemoved(id);
+ 
+@@ -190,28 +201,14 @@ bool CWaylandPlatform::dispatchEvents() {
+ 
+ SP<IWaylandWindow> CWaylandPlatform::windowForSurf(wl_proxy* proxy) {
+     for (const auto& w : m_windows) {
+-        if (w->m_waylandState.surface && w->m_waylandState.surface->resource() == proxy)
+-            return w.lock();
+-
+-        for (const auto& p : w->m_popups) {
+-            if (!p)
+-                continue;
+-            auto pp = reinterpretPointerCast<CWaylandWindow>(p.lock());
+-            if (pp->m_waylandState.surface && pp->m_waylandState.surface->resource() == proxy)
+-                return pp;
+-        }
++        if (w)
++            if (const auto window = w->windowForSurf(proxy))
++                return window;
+     }
+     for (const auto& w : m_layers) {
+-        if (w->m_waylandState.surface && w->m_waylandState.surface->resource() == proxy)
+-            return w.lock();
+-
+-        for (const auto& p : w->m_popups) {
+-            if (!p)
+-                continue;
+-            auto pp = reinterpretPointerCast<CWaylandWindow>(p.lock());
+-            if (pp->m_waylandState.surface && pp->m_waylandState.surface->resource() == proxy)
+-                return pp;
+-        }
++        if (w)
++            if (const auto window = w->windowForSurf(proxy))
++                return window;
+     }
+ 
+     if (m_sessionLockState) {
+@@ -234,36 +231,49 @@ WP<CWaylandOutput> CWaylandPlatform::outputForHandle(uint32_t handle) {
+ void CWaylandPlatform::initIM() {
+     m_waylandState.textInput = makeShared<CCZwpTextInputV3>(m_waylandState.textInputManager->sendGetTextInput(m_waylandState.seat->resource()));
+ 
++    m_waylandState.textInput->setEnter([this](CCZwpTextInputV3*, wl_proxy* surface) {
++        auto& im   = m_waylandState.imState;
++        im.window  = windowForSurf(surface);
++        im.enabled = false;
++        im.pending = {};
++        if (im.window && im.window->m_keyboardFocus)
++            im.window->m_keyboardFocus->imUpdate({});
++    });
++    m_waylandState.textInput->setLeave([this](CCZwpTextInputV3*, wl_proxy*) {
++        auto&      im     = m_waylandState.imState;
++        const auto window = im.window.lock();
++        im.window.reset();
++        im.enabled = false;
++        im.pending = {};
++        if (window && window->m_keyboardFocus)
++            window->m_keyboardFocus->imUpdate({});
++    });
++
+     m_waylandState.textInput->setPreeditString([this](CCZwpTextInputV3* r, const char* s, int32_t begin, int32_t end) {
+-        m_waylandState.imState.preeditBegin  = begin;
+-        m_waylandState.imState.preeditEnd    = end;
+-        m_waylandState.imState.preeditString = s;
++        m_waylandState.imState.pending.cursorBegin = begin;
++        m_waylandState.imState.pending.cursorEnd   = end;
++        m_waylandState.imState.pending.preedit     = s ? s : "";
+     });
+ 
+     m_waylandState.textInput->setDeleteSurroundingText([this](CCZwpTextInputV3* r, uint32_t bef, uint32_t aft) {
+-        m_waylandState.imState.deleteAfter  = aft;
+-        m_waylandState.imState.deleteBefore = bef;
++        m_waylandState.imState.pending.deleteAfter  = aft;
++        m_waylandState.imState.pending.deleteBefore = bef;
+     });
+ 
+-    m_waylandState.textInput->setCommitString([this](CCZwpTextInputV3* r, const char* s) { m_waylandState.imState.commitString = s; });
++    m_waylandState.textInput->setCommitString(
++        [this](CCZwpTextInputV3*, const char* s) { m_waylandState.imState.pending.commit = s ? std::optional<std::string>{s} : std::nullopt; });
+ 
+     m_waylandState.textInput->setDone([this](CCZwpTextInputV3* r, uint32_t serial) {
+-        if (!m_currentWindow || !m_currentWindow->m_keyboardFocus)
++        auto&      im    = m_waylandState.imState;
++        const auto event = std::exchange(im.pending, {});
++        if (!im.enabled || !im.window || !im.window->m_keyboardFocus || sc<int32_t>(serial - im.enableSerial) < 0)
+             return;
+-
+-        // FIXME: this is incomplete. Very incomplete, but works for CJK IMEs just fine.
+-
+-        const auto NEW_STR = m_waylandState.imState.commitString;
+-
+-        if (NEW_STR.empty()) {
+-            m_currentWindow->m_keyboardFocus->imCommitNewText(m_waylandState.imState.preeditString);
+-            return;
+-        }
+-
+-        m_waylandState.imState = {};
+-
+-        m_currentWindow->m_keyboardFocus->imCommitNewText(NEW_STR);
+-        m_currentWindow->m_keyboardFocus->imApplyText();
++        const auto focus  = im.window->m_keyboardFocus.lock();
++        im.inDone         = true;
++        im.suppressCommit = serial != im.serial;
++        focus->imUpdate(event);
++        im.inDone         = false;
++        im.suppressCommit = false;
+     });
+ }
+ 
+@@ -348,6 +358,8 @@ void CWaylandPlatform::initSeat() {
+             });
+ 
+             m_waylandState.keyboard->setKey([this](CCWlKeyboard* r, uint32_t serial, uint32_t time, uint32_t key, wl_keyboard_key_state state) { //
++                if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
++                    m_lastInputSerial = serial;
+                 onKey(key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
+             });
+ 
+@@ -409,8 +421,10 @@ void CWaylandPlatform::initSeat() {
+                 if (!m_currentWindow)
+                     return;
+ 
+-                if (state == WL_POINTER_BUTTON_STATE_PRESSED)
++                if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+                     m_lastPointerButtonPressSerial = serial;
++                    m_lastInputSerial              = serial;
++                }
+ 
+                 m_currentWindow->mouseButton(Input::buttonFromWayland(button), state == WL_POINTER_BUTTON_STATE_PRESSED);
+             });
+@@ -435,6 +449,125 @@ void CWaylandPlatform::initShell() {
+     m_waylandState.xdg->setPing([](CCXdgWmBase* r, uint32_t serial) { r->sendPong(serial); });
+ }
+ 
++static constexpr size_t CLIPBOARD_LIMIT = 4 * 1024 * 1024;
++
++class CClipboardTransfer final : public IClipboardTransfer {
++  public:
++    ~CClipboardTransfer() override {
++        stop();
++    }
++
++    void stop() {
++        if (source)
++            source->remove();
++        source.reset();
++        timer.reset();
++        destroying.reset();
++        outgoing.reset();
++        text.clear();
++        callback = {};
++    }
++
++    void finish(std::expected<std::string, std::string> result) {
++        auto done = std::move(callback);
++        stop();
++        if (done)
++            done(std::move(result));
++    }
++
++    void dispatch(int fd) {
++        std::array<char, 16384> buffer;
++        for (size_t budget = 0; budget < 65536;) {
++            ssize_t count = 0;
++            if (outgoing) {
++                if (offset == outgoing->size()) {
++                    finish(std::string{});
++                    return;
++                }
++                // A peer can close the pipe between readiness and write. Consume only our new SIGPIPE.
++                sigset_t blocked, previous, pending;
++                sigemptyset(&blocked);
++                sigaddset(&blocked, SIGPIPE);
++                const int maskError = pthread_sigmask(SIG_BLOCK, &blocked, &previous);
++                if (maskError) {
++                    finish(std::unexpected(std::system_category().message(maskError)));
++                    return;
++                }
++                sigpending(&pending);
++                count           = write(fd, outgoing->data() + offset, std::min(outgoing->size() - offset, buffer.size()));
++                const int error = errno;
++                if (count < 0 && error == EPIPE && !sigismember(&pending, SIGPIPE)) {
++                    const timespec timeout{};
++                    sigtimedwait(&blocked, nullptr, &timeout);
++                }
++                pthread_sigmask(SIG_SETMASK, &previous, nullptr);
++                errno = error;
++            } else
++                count = read(fd, buffer.data(), buffer.size());
++
++            if (count > 0) {
++                budget += sc<size_t>(count);
++                if (outgoing)
++                    offset += sc<size_t>(count);
++                else {
++                    if (text.size() + sc<size_t>(count) > CLIPBOARD_LIMIT) {
++                        finish(std::unexpected("clipboard exceeds 4 MiB"));
++                        return;
++                    }
++                    text.append(buffer.data(), sc<size_t>(count));
++                }
++            } else if (count == 0) {
++                finish(std::move(text));
++                return;
++            } else if (errno == EAGAIN || errno == EWOULDBLOCK)
++                return;
++            else if (errno != EINTR) {
++                finish(std::unexpected(std::system_category().message(errno)));
++                return;
++            }
++        }
++    }
++
++    SP<Hyprutils::EventLoop::IFDSource>    source;
++    SP<Hyprutils::EventLoop::ITimer>       timer;
++    Hyprutils::Signal::CHyprSignalListener destroying;
++    SP<const std::string>                  outgoing;
++    std::string                            text;
++    size_t                                 offset = 0;
++    ClipboardCallback                      callback;
++};
++
++static SP<IClipboardTransfer> startClipboardTransfer(Hyprutils::OS::CFileDescriptor fd, SP<const std::string> outgoing, ClipboardCallback callback) {
++    const int flags = fcntl(fd.get(), F_GETFL);
++    if (flags < 0 || fcntl(fd.get(), F_SETFL, flags | O_NONBLOCK) < 0) {
++        callback(std::unexpected(std::system_category().message(errno)));
++        return {};
++    }
++    auto transfer                     = makeShared<CClipboardTransfer>();
++    transfer->outgoing                = std::move(outgoing);
++    transfer->callback                = std::move(callback);
++    const WP<CClipboardTransfer> weak = transfer;
++    auto source = g_waylandBackend->m_eventLoop->addFD(std::move(fd), transfer->outgoing ? Hyprutils::EventLoop::eEventMask::WRITABLE : Hyprutils::EventLoop::eEventMask::READABLE,
++                                                       [weak](Hyprutils::EventLoop::IFDSource& source, Hyprutils::EventLoop::FdEventMask) {
++                                                           if (const auto transfer = weak.lock())
++                                                               transfer->dispatch(source.fd().get());
++                                                       });
++    if (!source) {
++        transfer->finish(std::unexpected(source.error()));
++        return {};
++    }
++    transfer->source     = *source;
++    transfer->timer      = g_waylandBackend->m_eventLoop->addTimer(std::chrono::seconds(5), [weak](auto&) {
++        if (const auto transfer = weak.lock())
++            transfer->finish(std::unexpected("clipboard transfer timed out"));
++    });
++    transfer->destroying = g_backend->m_events.destroying.listen([weak] {
++        if (const auto transfer = weak.lock())
++            transfer->stop();
++    });
++    return transfer;
++}
++
+ void CWaylandPlatform::initClipboard() {
+     if (!m_waylandState.dataDeviceManager || !m_waylandState.seat)
+         return;
+@@ -443,28 +576,41 @@ void CWaylandPlatform::initClipboard() {
+ 
+     m_waylandState.dataDevice->setDataOffer([this](CCWlDataDevice*, wl_proxy* offer) {
+         auto wrapped = makeShared<CCWlDataOffer>(offer);
+-        wrapped->setOffer([](CCWlDataOffer*, const char*) {});
+-        m_waylandState.pendingOffers.push_back(wrapped);
++        wrapped->setOffer([this, offer](CCWlDataOffer*, const char* mime) {
++            for (auto& pending : m_waylandState.pendingOffers) {
++                if (pending.offer->resource() != offer)
++                    continue;
++                const std::string_view type{mime};
++                if (type == "text/plain;charset=utf-8" || (pending.mime.empty() && (type == "text/plain" || type == "UTF8_STRING")))
++                    pending.mime = type;
++                break;
++            }
++        });
++        if (m_waylandState.pendingOffers.size() == 16)
++            m_waylandState.pendingOffers.clear();
++        m_waylandState.pendingOffers.push_back({wrapped, {}});
+     });
+ 
+     m_waylandState.dataDevice->setSelection([this](CCWlDataDevice*, wl_proxy* offer) {
+         auto& pending = m_waylandState.pendingOffers;
+         if (!offer) {
+-            m_waylandState.currentOffer.reset();
++            m_waylandState.currentOffer = {};
+             pending.clear();
+             return;
+         }
+-        const auto IT               = std::ranges::find_if(pending, [offer](const auto& po) { return po && po->resource() == offer; });
+-        m_waylandState.currentOffer = IT != pending.end() ? *IT : nullptr;
++        const auto IT               = std::ranges::find_if(pending, [offer](const auto& po) { return po.offer->resource() == offer; });
++        m_waylandState.currentOffer = IT != pending.end() ? std::move(*IT) : decltype(m_waylandState.currentOffer){};
+         pending.clear();
+     });
+ }
+ 
+-void CWaylandPlatform::setClipboard(const std::string& text) {
++std::expected<void, std::string> CWaylandPlatform::setClipboard(const std::string& text) {
+     if (!m_waylandState.dataDeviceManager || !m_waylandState.dataDevice)
+-        return;
+-
+-    m_waylandState.currentSourceText = text;
++        return std::unexpected("clipboard is unavailable");
++    if (!m_lastInputSerial)
++        return std::unexpected("clipboard requires an input serial");
++    if (text.size() > CLIPBOARD_LIMIT)
++        return std::unexpected("clipboard exceeds 4 MiB");
+ 
+     m_waylandState.currentSource = makeShared<CCWlDataSource>(m_waylandState.dataDeviceManager->sendCreateDataSource());
+ 
+@@ -472,54 +618,47 @@ void CWaylandPlatform::setClipboard(const std::string& text) {
+     m_waylandState.currentSource->sendOffer("text/plain;charset=utf-8");
+     m_waylandState.currentSource->sendOffer("UTF8_STRING");
+ 
+-    m_waylandState.currentSource->setSend([this](CCWlDataSource*, const char* /*mime*/, int32_t fd) {
+-        const auto& s    = m_waylandState.currentSourceText;
+-        size_t      sent = 0;
+-        while (sent < s.size()) {
+-            ssize_t n = write(fd, s.data() + sent, s.size() - sent);
+-            if (n <= 0) {
+-                if (errno == EINTR)
+-                    continue;
+-                break;
+-            }
+-            sent += (size_t)n;
+-        }
+-        close(fd);
++    m_waylandState.currentSource->setSend([this, text = makeShared<const std::string>(text)](CCWlDataSource*, const char*, int32_t fd) {
++        Hyprutils::OS::CFileDescriptor pipe{fd};
++        if (m_waylandState.clipboardWrites.size() == 4)
++            return;
++        auto transfer = startClipboardTransfer(std::move(pipe), text, [this](auto result) {
++            std::erase_if(m_waylandState.clipboardWrites, [](const auto& item) { return !static_cast<CClipboardTransfer*>(item.get())->source; });
++            if (!result)
++                g_logger->log(HT_LOG_ERROR, "clipboard write: {}", result.error());
++        });
++        if (transfer)
++            m_waylandState.clipboardWrites.emplace_back(std::move(transfer));
+     });
+ 
+-    m_waylandState.currentSource->setCancelled([this](CCWlDataSource*) {
+-        m_waylandState.currentSource.reset();
+-        m_waylandState.currentSourceText.clear();
+-    });
++    m_waylandState.currentSource->setCancelled([this](CCWlDataSource*) { m_waylandState.currentSource.reset(); });
+ 
+-    m_waylandState.dataDevice->sendSetSelection(m_waylandState.currentSource.get(), m_lastEnterSerial);
+-    wl_display_flush(m_waylandState.display);
++    m_waylandState.dataDevice->sendSetSelection(m_waylandState.currentSource.get(), *m_lastInputSerial);
++    return {};
+ }
+ 
+-std::string CWaylandPlatform::readClipboard() {
+-    auto& offer = m_waylandState.currentOffer;
+-    if (!offer)
++SP<IClipboardTransfer> CWaylandPlatform::readClipboard(ClipboardCallback callback) {
++    if (const auto previous = m_waylandState.clipboardRead.lock(); previous && static_cast<CClipboardTransfer*>(previous.get())->source) {
++        callback(std::unexpected("clipboard read is already active"));
+         return {};
++    }
++    auto& offer = m_waylandState.currentOffer;
++    if (!offer.offer || offer.mime.empty()) {
++        callback(std::string{});
++        return {};
++    }
+ 
+     int fds[2];
+-    if (pipe2(fds, O_CLOEXEC) != 0)
++    if (pipe2(fds, O_CLOEXEC) != 0) {
++        callback(std::unexpected(std::system_category().message(errno)));
+         return {};
+-
+-    offer->sendReceive("text/plain;charset=utf-8", fds[1]);
+-    close(fds[1]);
+-    wl_display_roundtrip(m_waylandState.display);
+-
+-    std::string            out;
+-    std::array<char, 4096> buf{};
+-    for (;;) {
+-        const ssize_t N = read(fds[0], buf.data(), buf.size());
+-        if (N > 0)
+-            out.append(buf.data(), (size_t)N);
+-        else if (N == 0 || errno != EINTR)
+-            break;
+     }
+-    close(fds[0]);
+-    return out;
++    auto transfer = startClipboardTransfer(Hyprutils::OS::CFileDescriptor{fds[0]}, {}, std::move(callback));
++    if (transfer)
++        offer.offer->sendReceive(offer.mime.c_str(), fds[1]);
++    close(fds[1]);
++    m_waylandState.clipboardRead = transfer;
++    return transfer;
+ }
+ 
+ bool CWaylandPlatform::initDmabuf() {
+@@ -669,24 +808,14 @@ void CWaylandPlatform::onKey(uint32_t keycode, bool state) {
+         return;
+ 
+     Input::SKeyboardKeyEvent e;
+-    e.down    = state;
+-    e.modMask = m_currentMods;
++    e.down      = state;
++    e.modMask   = m_currentMods;
++    e.xkbKeysym = xkb_state_key_get_one_sym(m_waylandState.seatState.xkbState, keycode + 8);
+ 
+     if (state) {
+-        const auto SYM = xkb_state_key_get_one_sym(m_waylandState.seatState.xkbState, keycode + 8);
+-
+-        if (SYM == XKB_KEY_Left || SYM == XKB_KEY_Right || SYM == XKB_KEY_Up || SYM == XKB_KEY_Down) {
+-            // skip compose
+-            e.xkbKeysym = SYM;
+-            m_keyboardWindow->keyboardKey(e);
+-            m_waylandState.seatState.repeatKeyEvent = e;
+-            startRepeatTimer();
+-            return;
+-        }
+-
+         enum xkb_compose_status composeStatus = XKB_COMPOSE_NOTHING;
+         if (m_waylandState.seatState.xkbComposeState) {
+-            xkb_compose_state_feed(m_waylandState.seatState.xkbComposeState, SYM);
++            xkb_compose_state_feed(m_waylandState.seatState.xkbComposeState, e.xkbKeysym);
+             composeStatus = xkb_compose_state_get_status(m_waylandState.seatState.xkbComposeState);
+         }
+ 
+@@ -694,16 +823,15 @@ void CWaylandPlatform::onKey(uint32_t keycode, bool state) {
+ 
+         char       buf[16] = {0};
+         int        len     = COMPOSED ? xkb_compose_state_get_utf8(m_waylandState.seatState.xkbComposeState, buf, sizeof(buf)) /* nullbyte */ + 1 :
+-                                        xkb_keysym_to_utf8(SYM, buf, sizeof(buf)) /* already includes a nullbyte */;
++                                        xkb_keysym_to_utf8(e.xkbKeysym, buf, sizeof(buf)) /* already includes a nullbyte */;
+ 
+-        if (len > 1) {
+-            e.xkbKeysym = SYM;
+-            e.utf8      = std::string{buf, sc<size_t>(len - 1)};
+-            m_keyboardWindow->keyboardKey(e);
+-            m_waylandState.seatState.repeatKeyEvent = e;
+-        }
++        if (len > 1 && composeStatus != XKB_COMPOSE_COMPOSING && composeStatus != XKB_COMPOSE_CANCELLED)
++            e.utf8 = std::string{buf, sc<size_t>(len - 1)};
+ 
+-        startRepeatTimer();
++        m_keyboardWindow->keyboardKey(e);
++        m_waylandState.seatState.repeatKeyEvent = e;
++        if (xkb_keymap_key_repeats(m_waylandState.seatState.xkbKeymap, keycode + 8))
++            startRepeatTimer();
+ 
+         return;
+ 
+@@ -718,6 +846,8 @@ void CWaylandPlatform::onKey(uint32_t keycode, bool state) {
+ void CWaylandPlatform::onKeyboardEnter(wl_proxy* surf, wl_array* keys) {
+     resetKeyboardState();
+     m_keyboardWindow = windowForSurf(surf);
++    if (m_keyboardWindow && m_keyboardWindow->m_keyboardFocus)
++        m_keyboardWindow->m_keyboardFocus->impl->m_externalEvents.keyboardEnter.emit();
+ 
+     if (!keys || !keys->data)
+         return;
+@@ -728,6 +858,8 @@ void CWaylandPlatform::onKeyboardEnter(wl_proxy* surf, wl_array* keys) {
+ }
+ 
+ void CWaylandPlatform::onKeyboardLeave() {
++    if (m_keyboardWindow && m_keyboardWindow->m_keyboardFocus)
++        m_keyboardWindow->m_keyboardFocus->impl->m_externalEvents.keyboardLeave.emit();
+     m_keyboardWindow.reset();
+     resetKeyboardState();
+ }
+diff --git a/src/core/platforms/WaylandPlatform.hpp b/src/core/platforms/WaylandPlatform.hpp
+index 06fd293..32ac5e8 100644
+--- a/src/core/platforms/WaylandPlatform.hpp
++++ b/src/core/platforms/WaylandPlatform.hpp
+@@ -4,6 +4,7 @@
+ #include <hyprtoolkit/core/Input.hpp>
+ #include <hyprtoolkit/core/Timer.hpp>
+ #include <hyprtoolkit/core/SessionLock.hpp>
++#include <hyprtoolkit/core/BackendServices.hpp>
+ 
+ #include "../../helpers/Memory.hpp"
+ 
+@@ -26,6 +27,7 @@
+ #include <linux-drm-syncobj-v1.hpp>
+ #include <ext-session-lock-v1.hpp>
+ #include <keyboard-shortcuts-inhibit-unstable-v1.hpp>
++#include <hyprland-focus-grab-v1.hpp>
+ 
+ #include <aquamarine/allocator/GBM.hpp>
+ #include <aquamarine/backend/Misc.hpp>
+@@ -44,33 +46,33 @@ namespace Hyprtoolkit {
+         CWaylandPlatform() = default;
+         ~CWaylandPlatform();
+ 
+-        bool                         attempt();
++        bool                             attempt();
+ 
+-        void                         initSeat();
+-        void                         initShell();
+-        bool                         initDmabuf();
+-        void                         initIM();
+-        void                         initClipboard();
+-        void                         setCursor(ePointerShape shape);
++        void                             initSeat();
++        void                             initShell();
++        bool                             initDmabuf();
++        void                             initIM();
++        void                             initClipboard();
++        void                             setCursor(ePointerShape shape);
+ 
+-        bool                         dispatchEvents();
++        bool                             dispatchEvents();
+ 
+-        void                         setClipboard(const std::string& text);
+-        std::string                  readClipboard();
++        std::expected<void, std::string> setClipboard(const std::string& text);
++        SP<IClipboardTransfer>           readClipboard(ClipboardCallback callback);
+ 
+-        SP<IWaylandWindow>           windowForSurf(wl_proxy* proxy);
+-        WP<CWaylandOutput>           outputForHandle(uint32_t handle);
++        SP<IWaylandWindow>               windowForSurf(wl_proxy* proxy);
++        WP<CWaylandOutput>               outputForHandle(uint32_t handle);
+ 
+-        void                         onKey(uint32_t keycode, bool state);
+-        void                         onKeyboardEnter(wl_proxy* surf, wl_array* keys);
+-        void                         onKeyboardLeave();
+-        void                         resetKeyboardState();
+-        void                         startRepeatTimer();
+-        void                         stopRepeatTimer();
++        void                             onKey(uint32_t keycode, bool state);
++        void                             onKeyboardEnter(wl_proxy* surf, wl_array* keys);
++        void                             onKeyboardLeave();
++        void                             resetKeyboardState();
++        void                             startRepeatTimer();
++        void                             stopRepeatTimer();
+ 
+-        void                         onRepeatTimerFire();
++        void                             onRepeatTimerFire();
+ 
+-        SP<CWaylandSessionLockState> aquireSessionLock();
++        SP<CWaylandSessionLockState>     aquireSessionLock();
+ 
+         // dmabuf formats
+         std::vector<Aquamarine::SDRMFormat> m_dmabufFormats;
+@@ -100,12 +102,18 @@ namespace Hyprtoolkit {
+             Hyprutils::Memory::CSharedPointer<CCWpLinuxDrmSyncobjManagerV1>           syncobj;
+             Hyprutils::Memory::CSharedPointer<CCExtSessionLockManagerV1>              sessionLock;
+             Hyprutils::Memory::CSharedPointer<CCZwpKeyboardShortcutsInhibitManagerV1> shortcutsInhibitMgr;
++            SP<CCHyprlandFocusGrabManagerV1>                                          focusGrabManager;
++            uint32_t                                                                  focusGrabManagerName = 0;
+             Hyprutils::Memory::CSharedPointer<CCWlDataDeviceManager>                  dataDeviceManager;
+             Hyprutils::Memory::CSharedPointer<CCWlDataDevice>                         dataDevice;
+-            std::vector<Hyprutils::Memory::CSharedPointer<CCWlDataOffer>>             pendingOffers;
+-            Hyprutils::Memory::CSharedPointer<CCWlDataOffer>                          currentOffer;
+-            Hyprutils::Memory::CSharedPointer<CCWlDataSource>                         currentSource;
+-            std::string                                                               currentSourceText;
++            struct SClipboardOffer {
++                SP<CCWlDataOffer> offer;
++                std::string       mime;
++            } currentOffer;
++            std::vector<SClipboardOffer>                      pendingOffers;
++            Hyprutils::Memory::CSharedPointer<CCWlDataSource> currentSource;
++            std::vector<SP<IClipboardTransfer>>               clipboardWrites;
++            WP<IClipboardTransfer>                            clipboardRead;
+ 
+             // control
+             bool initialized  = false;
+@@ -124,13 +132,10 @@ namespace Hyprtoolkit {
+             } seatState;
+ 
+             struct {
+-                bool        entered = false, enabled = false;
+-                std::string preeditString;
+-                int         preeditBegin = 0, preeditEnd = 0;
+-                std::string commitString;
+-                size_t      deleteBefore = 0, deleteAfter = 0;
+-
+-                std::string originalString;
++                WP<IWaylandWindow>     window;
++                Input::STextInputEvent pending;
++                uint32_t               serial = 0, enableSerial = 0, hints = 0;
++                bool                   enabled = false, surrounding = false, inDone = false, suppressCommit = false;
+             } imState;
+         } m_waylandState;
+ 
+@@ -149,6 +154,7 @@ namespace Hyprtoolkit {
+         uint32_t                        m_lastEnterSerial = 0;
+         // xdg_toplevel.resize requires the serial of a button PRESS, not release.
+         uint32_t                     m_lastPointerButtonPressSerial = 0;
++        std::optional<uint32_t>      m_lastInputSerial;
+ 
+         WP<CWaylandSessionLockState> m_sessionLockState;
+     };
+diff --git a/src/element/Element.cpp b/src/element/Element.cpp
+index 5928e49..4019b47 100644
+--- a/src/element/Element.cpp
++++ b/src/element/Element.cpp
+@@ -226,7 +226,6 @@ void IElement::removeChild(Hyprutils::Memory::CSharedPointer<IElement> child) {
+     std::erase(impl->children, child);
+ 
+     child->impl->parent.reset();
+-    child->impl->window.reset();
+     child->impl->breadthfirst([](SP<IElement> e) { e->impl->setWindow(nullptr); });
+ 
+     if (impl->window)
+@@ -273,18 +272,46 @@ void IElement::recheckColor() {
+ }
+ 
+ bool IElement::acceptsKeyboardInput() {
+-    return false;
++    return impl->userRequestedKeyboardInput;
++}
++
++CBox IElement::geometry() const {
++    return impl->position;
++}
++
++void IElement::setFocusable(bool focusable) {
++    impl->userRequestedKeyboardInput = focusable;
++    if (!focusable)
++        focusKeyboard(false);
++}
++
++void IElement::focusKeyboard(bool focus) {
++    if (!impl->window)
++        return;
++    if (focus)
++        impl->window->setKeyboardFocus(impl->self.lock());
++    else if (keyboardFocused())
++        impl->window->unfocusKeyboard();
++}
++
++bool IElement::keyboardFocused() const {
++    return impl->window && impl->window->m_keyboardFocus == impl->self;
++}
++
++void IElement::setFocusRing(bool enabled) {
++    impl->focusRing = enabled;
++    impl->damageEntire();
++}
++
++void IElement::setKeyFilter(std::function<bool(const Input::SKeyboardKeyEvent&)>&& filter) {
++    impl->userFns.keyFilter = std::move(filter);
+ }
+ 
+ bool IElement::acceptsTouchInput() {
+     return impl->userRequestedTouchInput;
+ }
+ 
+-void IElement::imCommitNewText(const std::string& text) {
+-    ;
+-}
+-
+-void IElement::imApplyText() {
++void IElement::imUpdate(const Input::STextInputEvent& event) {
+     ;
+ }
+ 
+@@ -417,6 +444,10 @@ void SElementInternalData::breadthfirst(const std::function<void(SP<IElement>)>&
+ }
+ 
+ void SElementInternalData::setWindow(SP<IToolkitWindow> w) {
++    if (window && window != w && window->m_mainHoverElement && window->m_mainHoverElement->m_el == self)
++        window->mouseLeave();
++    if (window && window != w && window->m_keyboardFocus == self)
++        window->unfocusKeyboard();
+     window           = w;
+     hasBeenPresented = false;
+     if (w)
+diff --git a/src/element/Element.hpp b/src/element/Element.hpp
+index 3cb2706..17ef3e7 100644
+--- a/src/element/Element.hpp
++++ b/src/element/Element.hpp
+@@ -30,13 +30,15 @@ namespace Hyprtoolkit {
+         IElement::ePositionMode                                  positionMode  = IElement::HT_POSITION_AUTO;
+         uint8_t                                                  positionFlags = 0;
+         Hyprutils::Math::Vector2D                                absoluteOffset;
+-        bool                                                     growV                   = false;
+-        bool                                                     growH                   = false;
+-        float                                                    margin                  = 0;
+-        bool                                                     userRequestedMouseInput = false;
+-        bool                                                     userRequestedTouchInput = false;
+-        bool                                                     grouped                 = false;
+-        bool                                                     hasBeenPresented        = false;
++        bool                                                     growV                      = false;
++        bool                                                     growH                      = false;
++        float                                                    margin                     = 0;
++        bool                                                     userRequestedMouseInput    = false;
++        bool                                                     userRequestedTouchInput    = false;
++        bool                                                     userRequestedKeyboardInput = false;
++        bool                                                     grouped                    = false;
++        bool                                                     hasBeenPresented           = false;
++        bool                                                     focusRing                  = false;
+ 
+         float                                                    opacity          = 1.F;
+         bool                                                     opacityAnimated  = false;
+@@ -84,6 +86,7 @@ namespace Hyprtoolkit {
+             std::function<void(const Input::STouchEvent&)>        touchUp;
+             std::function<void(const Input::STouchEvent&)>        touchCancel;
+             std::function<void()>                                 repositioned;
++            std::function<bool(const Input::SKeyboardKeyEvent&)>  keyFilter;
+         } userFns;
+ 
+         //
+diff --git a/src/element/LinearLayout.hpp b/src/element/LinearLayout.hpp
+index 6b5a875..1a91db7 100644
+--- a/src/element/LinearLayout.hpp
++++ b/src/element/LinearLayout.hpp
+@@ -146,12 +146,16 @@ namespace Hyprtoolkit::LinearLayout {
+ 
+             CBox     childBox;
+             if constexpr (Horizontal) {
+-                cSize.y  = std::clamp(cSize.y, 0.0, box.h);
+-                childBox = CBox{box.x + (double)cursor, box.y + ((box.h - cSize.y) / 2), (double)sizes.at(i), cSize.y};
++                cSize.y             = std::clamp(cSize.y, 0.0, box.h);
++                const auto   FLAGS  = child->impl->positionFlags;
++                const double OFFSET = FLAGS & IElement::HT_POSITION_FLAG_TOP ? 0 : FLAGS & IElement::HT_POSITION_FLAG_BOTTOM ? box.h - cSize.y : (box.h - cSize.y) / 2;
++                childBox            = CBox{box.x + (double)cursor, box.y + OFFSET, (double)sizes.at(i), cSize.y};
+                 g_positioner->position(child, childBox, Vector2D{childBox.w + (MAX - used), box.h});
+             } else {
+-                cSize.x  = std::clamp(cSize.x, 0.0, box.w);
+-                childBox = CBox{box.x + ((box.w - cSize.x) / 2), box.y + (double)cursor, cSize.x, (double)sizes.at(i)};
++                cSize.x             = std::clamp(cSize.x, 0.0, box.w);
++                const auto   FLAGS  = child->impl->positionFlags;
++                const double OFFSET = FLAGS & IElement::HT_POSITION_FLAG_LEFT ? 0 : FLAGS & IElement::HT_POSITION_FLAG_RIGHT ? box.w - cSize.x : (box.w - cSize.x) / 2;
++                childBox            = CBox{box.x + OFFSET, box.y + (double)cursor, cSize.x, (double)sizes.at(i)};
+                 g_positioner->position(child, childBox, Vector2D{box.w, childBox.h + (MAX - used)});
+             }
+ 
+diff --git a/src/element/image/Builder.cpp b/src/element/image/Builder.cpp
+index d20d5a8..dd9138d 100644
+--- a/src/element/image/Builder.cpp
++++ b/src/element/image/Builder.cpp
+@@ -1,20 +1,24 @@
+ #include "Image.hpp"
++#include <stdexcept>
+ 
+ using namespace Hyprtoolkit;
+ 
+ void SImageData::setPath(std::string&& value) {
++    pixelWidth = pixelHeight = 0;
+     path = std::move(value);
+     icon.reset();
+     data.clear();
+ }
+ 
+ void SImageData::setIcon(const SP<ISystemIconDescription>& value) {
++    pixelWidth = pixelHeight = 0;
+     path.clear();
+     icon = value;
+     data.clear();
+ }
+ 
+ void SImageData::setData(std::vector<uint8_t>&& value) {
++    pixelWidth = pixelHeight = 0;
+     path.clear();
+     icon.reset();
+     data = std::move(value);
+@@ -32,6 +36,11 @@ SP<CImageBuilder> CImageBuilder::path(std::string&& s) {
+     return m_self.lock();
+ }
+ 
++SP<CImageBuilder> CImageBuilder::onLoaded(std::function<void(bool)>&& callback) {
++    m_data->onLoaded = std::move(callback);
++    return m_self.lock();
++}
++
+ SP<CImageBuilder> CImageBuilder::a(float a) {
+     m_data->a = a;
+     return m_self.lock();
+@@ -62,6 +71,15 @@ SP<CImageBuilder> CImageBuilder::data(std::vector<uint8_t>&& x) {
+     return m_self.lock();
+ }
+ 
++SP<CImageBuilder> CImageBuilder::pixels(std::vector<uint8_t>&& rgba, int width, int height) {
++    if (width < 1 || width > 4096 || height < 1 || height > 4096 || sc<uint64_t>(width) * sc<uint64_t>(height) * 4 != rgba.size() || rgba.size() > 8 * 1024 * 1024)
++        throw std::invalid_argument("invalid RGBA image dimensions or payload");
++    m_data->setData(std::move(rgba));
++    m_data->pixelWidth  = width;
++    m_data->pixelHeight = height;
++    return m_self.lock();
++}
++
+ SP<CImageBuilder> CImageBuilder::size(CDynamicSize&& s) {
+     m_data->size = std::move(s);
+     return m_self.lock();
+diff --git a/src/element/image/Image.cpp b/src/element/image/Image.cpp
+index ac91783..c201844 100644
+--- a/src/element/image/Image.cpp
++++ b/src/element/image/Image.cpp
+@@ -28,6 +28,9 @@ void CImageElement::paint() {
+     if (m_impl->failed)
+         return;
+ 
++    if (impl->window)
++        m_impl->lastScale = impl->window->scale();
++
+     auto assetToUse = m_impl->cacheEntry;
+ 
+     if (!assetToUse || !assetToUse->tex())
+@@ -39,10 +42,7 @@ void CImageElement::paint() {
+         return;
+     }
+ 
+-    if (impl->window)
+-        m_impl->lastScale = impl->window->scale();
+-
+-    if (m_impl->scalable() && m_impl->preferredSvgSize() != m_impl->size && !m_impl->waitingForTex) {
++    if ((m_impl->data.icon || m_impl->scalable()) && m_impl->preferredSvgSize() != m_impl->requestedSize && !m_impl->waitingForTex) {
+         renderTex();
+         assetToUse = m_impl->oldCacheEntry;
+     }
+@@ -58,133 +58,130 @@ void CImageElement::paint() {
+     });
+ }
+ 
++static void completeImageLoad(const SP<Asset::CAssetCacheEntry>& entry, eImageFitMode fitMode) {
++    const auto resource = std::move(entry->resource);
++    if (!resource->m_asset.cairoSurface) {
++        g_logger->log(HT_LOG_ERROR, "Image: failed loading {}: {}", entry->source(), resource->m_error);
++        entry->fail();
++        return;
++    }
++    const auto size = resource->m_asset.pixelSize;
++    const auto max  = g_renderer->getMaxTextureSize();
++    if (size.x > max || size.y > max) {
++        g_logger->log(HT_LOG_ERROR, "Image: dimensions {}x{} exceed texture limit {}", size.x, size.y, max);
++        entry->fail();
++        return;
++    }
++    entry->texDone(g_renderer->uploadTexture({.resource = resource, .fitMode = fitMode}));
++}
++
+ void CImageElement::renderTex() {
+-    const uint64_t GENERATION = ++m_impl->requestGeneration;
++    if (impl->window)
++        m_impl->lastScale = impl->window->scale();
++    const auto size = m_impl->preferredSvgSize();
++    if ((m_impl->data.icon || m_impl->scalable() || !m_impl->data.data.empty()) && (size.x <= 0 || size.y <= 0))
++        return;
++    m_impl->requestedSize = size;
++    if (m_impl->data.icon) {
++        const auto icon   = reinterpretPointerCast<CSystemIconDescription>(m_impl->data.icon);
++        m_impl->data.icon = g_iconFactory->lookupIcon(icon->m_name, sc<int>(size.x));
++    }
+     m_impl->listeners.cacheEntryDone.reset();
+     m_impl->failed = false;
+     if (m_impl->cacheEntry && m_impl->cacheEntry->tex())
+         m_impl->oldCacheEntry = m_impl->cacheEntry;
+     m_impl->cacheEntry.reset();
++    m_impl->waitingForTex = false;
+ 
+     const auto CACHE_STR = m_impl->getCacheString();
+ 
+-    const auto ASSET = Asset::assetCache()->get(CACHE_STR);
+-    if (ASSET) {
+-        g_logger->log(HT_LOG_DEBUG, "CImageElement: path {} was already cached, reusing entry", m_impl->data.path);
+-        m_impl->failed     = false;
+-        m_impl->cacheEntry = ASSET;
+-        if (ASSET->status() == Asset::CACHE_ENTRY_DONE)
+-            m_impl->postImageScheduleRecalc();
+-        else {
+-            m_impl->waitingForTex            = true;
+-            m_impl->listeners.cacheEntryDone = ASSET->m_events.done.listen([this, self = impl->self, generation = GENERATION, entry = WP<Asset::CAssetCacheEntry>{ASSET}] {
+-                if (!self || generation != m_impl->requestGeneration)
+-                    return;
+-
+-                const auto ENTRY = entry.lock();
+-                m_impl->failed   = !ENTRY || ENTRY->status() == Asset::CACHE_ENTRY_FAILED;
+-                m_impl->postImageScheduleRecalc();
+-                m_impl->listeners.cacheEntryDone.reset();
+-            });
+-        }
++    auto       entry  = m_impl->data.data.empty() ? Asset::assetCache()->get(CACHE_STR) : nullptr;
++    const bool cached = bool(entry);
++    if (!entry)
++        entry = makeShared<Asset::CAssetCacheEntry>(CACHE_STR);
++    m_impl->cacheEntry = entry;
++    if (entry->status() != Asset::CACHE_ENTRY_PENDING) {
++        m_impl->failed = entry->status() == Asset::CACHE_ENTRY_FAILED;
++        m_impl->oldCacheEntry.reset();
++        m_impl->postImageScheduleRecalc();
+         return;
+     }
++    m_impl->waitingForTex            = true;
++    m_impl->listeners.cacheEntryDone = entry->m_events.done.listen([weak = m_impl->self] {
++        if (const auto self = weak.lock()) {
++            self->m_impl->failed = self->m_impl->cacheEntry->status() == Asset::CACHE_ENTRY_FAILED;
++            self->m_impl->oldCacheEntry.reset();
++            self->m_impl->listeners.cacheEntryDone.reset();
++            self->m_impl->postImageScheduleRecalc();
++        }
++    });
++    if (cached)
++        return;
+ 
+-    const auto REQUEST  = makeShared<SImageLoadRequest>();
+-    REQUEST->generation = GENERATION;
+-    REQUEST->fitMode    = m_impl->data.fitMode;
+-    REQUEST->cacheEntry = makeShared<Asset::CAssetCacheEntry>(CACHE_STR);
+-    m_impl->cacheEntry  = REQUEST->cacheEntry;
+-
++    if (m_impl->data.pixelWidth) {
++        const auto& DATA = m_impl->data;
++        entry->resource  = ASP<IAsyncResource>(new CImageResource(std::string{}));
++        auto surface     = makeShared<Hyprgraphics::CCairoSurface>(cairo_image_surface_create(CAIRO_FORMAT_ARGB32, DATA.pixelWidth, DATA.pixelHeight));
++        if (surface->status() == CAIRO_STATUS_SUCCESS) {
++            for (int y = 0; y < DATA.pixelHeight; ++y) {
++                auto* row = rc<uint32_t*>(surface->data() + y * surface->stride());
++                for (int x = 0; x < DATA.pixelWidth; ++x) {
++                    const auto     offset = (sc<size_t>(y) * DATA.pixelWidth + x) * 4;
++                    const uint32_t alpha  = DATA.data[offset + 3];
++                    row[x]                = (alpha << 24) | (((DATA.data[offset] * alpha + 127) / 255) << 16) | (((DATA.data[offset + 1] * alpha + 127) / 255) << 8) |
++                        ((DATA.data[offset + 2] * alpha + 127) / 255);
++                }
++            }
++            cairo_surface_mark_dirty(surface->cairo());
++            entry->resource->m_asset.cairoSurface = std::move(surface);
++            entry->resource->m_asset.pixelSize    = {DATA.pixelWidth, DATA.pixelHeight};
++        }
++        entry->resource->m_ready = true;
++        completeImageLoad(entry, m_impl->data.fitMode);
++        return;
++    }
+     if (!m_impl->data.data.empty()) {
+-        const auto SIZE   = m_impl->preferredSvgSize();
+-        REQUEST->resource = makeAtomicShared<CImageResource>(m_impl->data.data, SIZE);
+-        m_impl->lastData  = m_impl->data.data.data();
++        const auto SIZE = m_impl->preferredSvgSize();
++        entry->resource = ASP<IAsyncResource>(new CImageResource(m_impl->data.data, SIZE));
+     } else if (!m_impl->data.icon) {
+-        REQUEST->resource = makeAtomicShared<CImageResource>(m_impl->data.path);
+-        REQUEST->path     = m_impl->data.path;
+-        m_impl->lastPath  = m_impl->data.path;
+-    } else {
+-        REQUEST->path     = reinterpretPointerCast<CSystemIconDescription>(m_impl->data.icon)->m_bestPath;
+-        m_impl->lastPath  = REQUEST->path;
+-        const auto SIZE   = m_impl->preferredSvgSize();
+-        REQUEST->resource = makeAtomicShared<CImageResource>(REQUEST->path, SIZE);
+-
+-        if (SIZE.x == 0 || SIZE.y == 0)
++        const auto SIZE = m_impl->preferredSvgSize();
++        if (m_impl->scalable() && (SIZE.x == 0 || SIZE.y == 0)) {
++            m_impl->waitingForTex = false;
+             return;
+-    }
+-
+-    Asset::assetCache()->cache(REQUEST->cacheEntry);
+-    m_impl->requests.emplace_back(REQUEST);
+-
+-    m_impl->waitingForTex = true;
+-
+-    ASP<IAsyncResource> resourceGeneric(REQUEST->resource);
+-
+-    if (!m_impl->data.sync) {
+-        // attach listener before enqueueing to avoid missing the finished event
+-        REQUEST->resource->m_events.finished.listenStatic(
+-            [this, self = impl->self, lifetime = WP<SBackendLifetime>{g_backendServices->lifetime}, request = WP<SImageLoadRequest>{REQUEST}] {
+-                if (!self || !lifetime || !request)
+-                    return;
+-
+-                g_backend->addIdle([this, self = self, lifetime, request] {
+-                    if (!self || !lifetime)
+-                        return;
+-
+-                    const auto REQUEST = request.lock();
+-                    if (REQUEST)
+-                        m_impl->postImageLoad(REQUEST);
+-                });
+-            });
+-
+-        g_asyncResourceGatherer->enqueue(resourceGeneric);
+-    } else {
+-        g_asyncResourceGatherer->enqueue(resourceGeneric);
+-        g_asyncResourceGatherer->await(resourceGeneric);
+-        m_impl->postImageLoad(REQUEST);
+-    }
+-}
+-
+-void SImageImpl::postImageLoad(const SP<SImageLoadRequest>& request) {
+-    if (!request || !request->resource || !request->cacheEntry)
+-        return;
+-
+-    bool loaded = false;
+-    if (request->resource->m_asset.cairoSurface) {
+-        ASP<IAsyncResource> resourceGeneric(request->resource);
+-        const auto          imageSize = request->resource->m_asset.pixelSize;
+-
+-        const auto          MAX_SIZE = g_renderer->getMaxTextureSize();
+-        if (imageSize.x > MAX_SIZE || imageSize.y > MAX_SIZE) {
+-            request->cacheEntry->fail();
+-            g_logger->log(HT_LOG_ERROR, "Image: failed loading, image dimensions {}x{} exceed max texture size {}", (int)imageSize.x, (int)imageSize.y, MAX_SIZE);
+-        } else {
+-            request->cacheEntry->texDone(g_renderer->uploadTexture({.resource = resourceGeneric, .fitMode = request->fitMode}));
+-            loaded = true;
+         }
++
++        entry->resource = ASP<IAsyncResource>(new CImageResource(m_impl->data.path, SIZE));
+     } else {
+-        request->cacheEntry->fail();
+-        g_logger->log(HT_LOG_ERROR, "Image: failed loading, hyprgraphics couldn't load asset {}", request->path);
++        const auto SIZE = m_impl->preferredSvgSize();
++        entry->resource = ASP<IAsyncResource>(new CImageResource(reinterpretPointerCast<CSystemIconDescription>(m_impl->data.icon)->m_bestPath, SIZE));
++
++        if (SIZE.x == 0 || SIZE.y == 0) {
++            m_impl->waitingForTex = false;
++            return;
++        }
+     }
+ 
+-    const bool CURRENT = request->generation == requestGeneration;
+-    if (CURRENT) {
+-        cacheEntry = request->cacheEntry;
+-        failed     = !loaded;
+-        if (loaded)
+-            size = request->resource->m_asset.pixelSize;
+-        oldCacheEntry.reset();
++    if (m_impl->data.data.empty())
++        Asset::assetCache()->cache(entry);
++    entry->gatherer = g_asyncResourceGatherer;
++    auto completed  = [weak = WP<Asset::CAssetCacheEntry>{entry}, fit = m_impl->data.fitMode] {
++        if (const auto entry = weak.lock())
++            completeImageLoad(entry, fit);
++    };
++    if (auto result = g_asyncResourceGatherer->enqueue(entry->resource, m_impl->data.sync ? std::function<void()>{} : completed); !result) {
++        g_logger->log(HT_LOG_ERROR, "Image: {}", result.error());
++        entry->resource.reset();
++        entry->fail();
++    } else if (m_impl->data.sync) {
++        g_asyncResourceGatherer->await(entry->resource);
++        g_asyncResourceGatherer->cancel(entry->resource);
++        completed();
+     }
+-
+-    std::erase(requests, request);
+-
+-    if (CURRENT)
+-        postImageScheduleRecalc();
+ }
+ 
+ void SImageImpl::postImageScheduleRecalc() {
+     waitingForTex = false;
++    self->impl->damageEntire();
+     if (!failed) {
+         if (cacheEntry && cacheEntry->tex())
+             size = cacheEntry->tex()->size();
+@@ -193,6 +190,9 @@ void SImageImpl::postImageScheduleRecalc() {
+         if (self->impl->window)
+             self->impl->window->scheduleReposition(self);
+     }
++    const auto callback = data.onLoaded;
++    if (callback)
++        callback(!failed);
+ }
+ 
+ std::string SImageImpl::getCacheString() {
+diff --git a/src/element/image/Image.hpp b/src/element/image/Image.hpp
+index f3d586b..94650c4 100644
+--- a/src/element/image/Image.hpp
++++ b/src/element/image/Image.hpp
+@@ -9,8 +9,10 @@ namespace Hyprtoolkit {
+         float                      a        = 1.F;
+         int                        rounding = 0;
+         bool                       sync     = false;
++        std::function<void(bool)>  onLoaded;
+         SP<ISystemIconDescription> icon;
+         std::vector<uint8_t>       data;
++        int                        pixelWidth = 0, pixelHeight = 0;
+         eImageFitMode              fitMode = IMAGE_FIT_MODE_STRETCH;
+         CDynamicSize               size{CDynamicSize::HT_SIZE_PERCENT, CDynamicSize::HT_SIZE_PERCENT, {1, 1}};
+ 
+@@ -19,14 +21,6 @@ namespace Hyprtoolkit {
+         void                       setData(std::vector<uint8_t>&& value);
+     };
+ 
+-    struct SImageLoadRequest {
+-        uint64_t                                                              generation = 0;
+-        Hyprutils::Memory::CAtomicSharedPointer<Hyprgraphics::CImageResource> resource;
+-        SP<Asset::CAssetCacheEntry>                                           cacheEntry;
+-        eImageFitMode                                                         fitMode = IMAGE_FIT_MODE_STRETCH;
+-        std::string                                                           path;
+-    };
+-
+     struct SImageImpl {
+         SImageData                                                 data;
+ 
+@@ -37,16 +31,10 @@ namespace Hyprtoolkit {
+         Hyprutils::Memory::CSharedPointer<Asset::CAssetCacheEntry> cacheEntry;
+         Hyprutils::Memory::CSharedPointer<Asset::CAssetCacheEntry> oldCacheEntry; // while loading a new one
+         Hyprutils::Math::Vector2D                                  size;
++        Hyprutils::Math::Vector2D                                  requestedSize;
+ 
+         bool                                                       waitingForTex = false, failed = false;
+-        uint64_t                                                   requestGeneration = 0;
+-        std::vector<SP<SImageLoadRequest>>                         requests;
+-
+-        std::string                                                lastPath = "";
+-        void*                                                      lastData = nullptr;
+-
+         Hyprutils::Math::Vector2D                                  preferredSvgSize();
+-        void                                                       postImageLoad(const SP<SImageLoadRequest>& request);
+         void                                                       postImageScheduleRecalc();
+         std::string                                                getCacheString();
+         bool                                                       scalable() const;
+diff --git a/src/element/text/Text.cpp b/src/element/text/Text.cpp
+index ec1e462..4d13cd4 100644
+--- a/src/element/text/Text.cpp
++++ b/src/element/text/Text.cpp
+@@ -62,6 +62,12 @@ CTextElement::CTextElement(const STextData& data) : IElement(), m_impl(makeUniqu
+ 
+ CTextElement::~CTextElement() = default;
+ 
++STextImpl::~STextImpl() {
++    if (resource)
++        if (const auto queue = gatherer.lock())
++            queue->cancel(resource);
++}
++
+ void CTextElement::setText(std::string text) {
+     if (text == m_impl->data.text)
+         return;
+@@ -101,7 +107,8 @@ void CTextElement::replaceData(const STextData& data) {
+         *m_impl->color = COLOR;
+     } else {
+         m_impl->color->setValueAndWarp(COLOR);
+-        m_impl->needsTexRefresh = m_impl->needsTexRefresh || COLOR_DIFFERENT;
++        if (COLOR_DIFFERENT)
++            m_impl->scheduleTexRefresh();
+     }
+ 
+     if (ALIGN_DIFFERENT || ELLIPSIZE_DIFFERENT || FONT_DIFFERENT || TEXT_DIFFERENT || CLAMP_DIFFERENT)
+@@ -122,13 +129,15 @@ SP<CTextBuilder> CTextElement::rebuild() {
+ void CTextElement::animateColor(const SAnimation& animation) {
+     m_impl->colorAnimationEnabled = !std::holds_alternative<SNoAnimation>(animation);
+     m_impl->colorAnimationConfig  = g_animationManager->configFor(animation);
+-    m_impl->needsTexRefresh       = true;
++    m_impl->scheduleTexRefresh();
+     if (!m_impl->colorAnimationEnabled)
+         m_impl->color->setValueAndWarp(m_impl->color->goal());
+     impl->damageEntire();
+ }
+ 
+ void CTextElement::paint() {
++    if (m_impl->failed)
++        return;
+     SP<IRendererTexture> textureToUse = m_impl->tex;
+ 
+     if (!m_impl->tex)
+@@ -181,7 +190,7 @@ void CTextElement::reposition(const Hyprutils::Math::CBox& box, const Hyprutils:
+     IElement::reposition(box);
+ 
+     if (initial_position != impl->position)
+-        m_impl->needsTexRefresh = true;
++        m_impl->scheduleTexRefresh();
+ 
+     g_positioner->positionChildren(impl->self.lock());
+ 
+@@ -431,6 +440,14 @@ Vector2D STextImpl::unscale(const Vector2D& x) {
+ }
+ 
+ void STextImpl::scheduleTexRefresh() {
++    failed = false;
++    if (resource) {
++        if (const auto queue = gatherer.lock())
++            queue->cancel(resource);
++        resource.reset();
++        waitingForTex = false;
++        tex           = std::move(oldTex);
++    }
+     needsTexRefresh = true;
+ }
+ 
+@@ -475,26 +492,23 @@ void STextImpl::renderTex() {
+ 
+     ASP<IAsyncResource> resourceGeneric(resource);
+ 
+-    if (!data.async) {
+-        g_asyncResourceGatherer->enqueue(resourceGeneric);
++    gatherer       = g_asyncResourceGatherer;
++    auto completed = [weak = self] {
++        if (const auto self = weak.lock())
++            self->m_impl->postTexLoad();
++    };
++    if (auto result = g_asyncResourceGatherer->enqueue(resourceGeneric, data.async ? completed : std::function<void()>{}); !result) {
++        g_logger->log(HT_LOG_ERROR, "Text: {}", result.error());
++        resource.reset();
++        waitingForTex   = false;
++        tex             = std::move(oldTex);
++        needsTexRefresh = true;
++        if (self->impl->window)
++            self->impl->window->scheduleFrame();
++    } else if (!data.async) {
+         g_asyncResourceGatherer->await(resourceGeneric);
++        g_asyncResourceGatherer->cancel(resourceGeneric);
+         postTexLoad();
+-    } else {
+-        resource->m_events.finished.listenStatic([this, self = self->impl->self, lifetime = WP<SBackendLifetime>{g_backendServices->lifetime}] {
+-            if (self.expired() || !lifetime)
+-                return;
+-            if (!g_backend)
+-                return;
+-
+-            g_backend->addIdle([this, self = self, lifetime] {
+-                if (self.expired() || !lifetime)
+-                    return;
+-
+-                postTexLoad();
+-            });
+-        });
+-
+-        g_asyncResourceGatherer->enqueue(resourceGeneric);
+     }
+ }
+ 
+@@ -503,8 +517,13 @@ void STextImpl::postTexLoad() {
+         return;
+ 
+     ASP<IAsyncResource> resourceGeneric(resource);
+-    size               = resource->m_asset.pixelSize;
+-    tex                = g_renderer->uploadTexture({.resource = resourceGeneric});
++    size = resource->m_asset.pixelSize;
++    if (resource->m_asset.cairoSurface)
++        tex = g_renderer->uploadTexture({.resource = resourceGeneric});
++    else {
++        failed = true;
++        g_logger->log(HT_LOG_ERROR, "Text: {}", resource->m_error);
++    }
+     renderColorAtPaint = colorAnimationEnabled;
+     oldTex.reset();
+     if (self->impl->window)
+diff --git a/src/element/text/Text.hpp b/src/element/text/Text.hpp
+index 1ff8d23..7e930a9 100644
+--- a/src/element/text/Text.hpp
++++ b/src/element/text/Text.hpp
+@@ -51,51 +51,54 @@ namespace Hyprtoolkit {
+     };
+ 
+     struct STextImpl {
+-        STextData                                                                                      data;
++        ~STextImpl();
++        STextData                                          data;
+ 
+-        std::string                                                                                    parsedText;
+-        std::vector<STextLink>                                                                         parsedLinks;
+-        STextLink*                                                                                     hoveredTextLink = nullptr;
++        std::string                                        parsedText;
++        std::vector<STextLink>                             parsedLinks;
++        STextLink*                                         hoveredTextLink = nullptr;
+ 
+-        WP<CTextElement>                                                                               self;
++        WP<CTextElement>                                   self;
+ 
+-        float                                                                                          lastScale       = 1.F;
+-        bool                                                                                           needsTexRefresh = false, newTex = false;
++        float                                              lastScale       = 1.F;
++        bool                                               needsTexRefresh = false, newTex = false;
+ 
+-        SPangoData                                                                                     pangoData;
++        SPangoData                                         pangoData;
+ 
+-        SP<IRendererTexture>                                                                           tex;
+-        SP<IRendererTexture>                                                                           oldTex; // while loading a new one
+-        PHLANIMVAR<CHyprColor>                                                                         color;
+-        SP<Hyprutils::Animation::SAnimationPropertyConfig>                                             colorAnimationConfig;
+-        ASP<Hyprgraphics::CTextResource>                                                               resource;
+-        Hyprutils::Math::Vector2D                                                                      size;
++        SP<IRendererTexture>                               tex;
++        SP<IRendererTexture>                               oldTex; // while loading a new one
++        PHLANIMVAR<CHyprColor>                             color;
++        SP<Hyprutils::Animation::SAnimationPropertyConfig> colorAnimationConfig;
++        ASP<Hyprgraphics::CTextResource>                   resource;
++        WP<Hyprgraphics::CAsyncResourceGatherer>           gatherer;
++        Hyprutils::Math::Vector2D                          size;
+ 
+-        Hyprutils::Math::Vector2D                                                                      lastCursorPos;
++        Hyprutils::Math::Vector2D                          lastCursorPos;
+ 
+-        bool                                                                                           waitingForTex         = false;
+-        bool                                                                                           colorAnimationEnabled = false;
+-        bool                                                                                           renderColorAtPaint    = false;
++        bool                                               waitingForTex         = false;
++        bool                                               failed                = false;
++        bool                                               colorAnimationEnabled = false;
++        bool                                               renderColorAtPaint    = false;
+ 
+-        Hyprutils::Math::CBox                                                                          getCharBox(size_t offset);
+-        std::optional<size_t>                                                                          vecToOffset(const Hyprutils::Math::Vector2D& vec);
+-        float                                                                                          getCursorPos(size_t offset);
+-        float                                                                                          getCursorPos(const Hyprutils::Math::Vector2D& click);
+-        Hyprutils::Math::Vector2D                                                                      unscale(const Hyprutils::Math::Vector2D& x);
+-        void                                                                                           setPangoData();
+-        void                                                                                           setPangoFont();
+-        void                                                                                           setPangoAlign();
+-        void                                                                                           setPangoText();
+-        void                                                                                           setPangoEllipsize();
+-        void                                                                                           updateScale();
+-        void                                                                                           scheduleTexRefresh();
+-        void                                                                                           renderTex();
+-        void                                                                                           postTexLoad();
+-        void                                                                                           parseText();
+-        void                                                                                           recheckTextBoxes();
+-        void                                                                                           onMouseDown();
+-        void                                                                                           onMouseMove();
+-        Hyprutils::Math::Vector2D                                                                      applyClampSize(Hyprutils::Math::Vector2D);
++        Hyprutils::Math::CBox                              getCharBox(size_t offset);
++        std::optional<size_t>                              vecToOffset(const Hyprutils::Math::Vector2D& vec);
++        float                                              getCursorPos(size_t offset);
++        float                                              getCursorPos(const Hyprutils::Math::Vector2D& click);
++        Hyprutils::Math::Vector2D                          unscale(const Hyprutils::Math::Vector2D& x);
++        void                                               setPangoData();
++        void                                               setPangoFont();
++        void                                               setPangoAlign();
++        void                                               setPangoText();
++        void                                               setPangoEllipsize();
++        void                                               updateScale();
++        void                                               scheduleTexRefresh();
++        void                                               renderTex();
++        void                                               postTexLoad();
++        void                                               parseText();
++        void                                               recheckTextBoxes();
++        void                                               onMouseDown();
++        void                                               onMouseMove();
++        Hyprutils::Math::Vector2D                          applyClampSize(Hyprutils::Math::Vector2D);
+ 
+         friend class CTextboxElement;
+         friend struct STextboxImpl;
+diff --git a/src/element/textbox/Textbox.cpp b/src/element/textbox/Textbox.cpp
+index ddb82e1..da9c517 100644
+--- a/src/element/textbox/Textbox.cpp
++++ b/src/element/textbox/Textbox.cpp
+@@ -101,6 +101,7 @@ void CTextboxElement::init() {
+     m_impl->listeners.mouseButton = impl->m_externalEvents.mouseButton.listen([this](Input::eMouseButton button, bool down) {
+         if (!down)
+             return;
++        m_impl->clipboardRead.reset();
+         if (m_impl->eyeBg && m_impl->lastCursorPos.x >= impl->position.w - STextboxImpl::EYE_W) {
+             m_impl->data.password = !m_impl->data.password;
+             m_impl->updateLabel();
+@@ -111,13 +112,17 @@ void CTextboxElement::init() {
+     });
+ 
+     m_impl->listeners.enter = impl->m_externalEvents.keyboardEnter.listen([this] {
++        m_impl->active = true;
+         m_impl->bgInnerCont->addChild(m_impl->cursorCont);
+-        if (impl->window)
+-            impl->window->setIMTo(impl->position, m_impl->data.text, m_impl->inputState.cursor);
++        m_impl->updateCursor();
+         m_impl->bg->rebuild()->borderColor([] { return g_palette->m_colors.alternateBase.brighten(0.5F); })->commence();
+     });
+ 
+     m_impl->listeners.leave = impl->m_externalEvents.keyboardLeave.listen([this] {
++        m_impl->active = false;
++        m_impl->clipboardRead.reset();
++        m_impl->inputState.imText.clear();
++        m_impl->updateLabel();
+         m_impl->bgInnerCont->removeChild(m_impl->cursorCont);
+         if (impl->window)
+             impl->window->resetIM();
+@@ -125,6 +130,9 @@ void CTextboxElement::init() {
+     });
+ 
+     m_impl->listeners.key = impl->m_externalEvents.key.listen([this](const Input::SKeyboardKeyEvent& ev) {
++        if (!ev.down)
++            return;
++        m_impl->clipboardRead.reset();
+         if (ev.xkbKeysym == XKB_KEY_BackSpace) {
+             if (m_impl->inputState.cursor == 0)
+                 return;
+@@ -352,22 +360,17 @@ void CTextboxElement::init() {
+             return;
+         }
+ 
+-        if ((ev.xkbKeysym == XKB_KEY_C || ev.xkbKeysym == XKB_KEY_c) && (ev.modMask & Input::HT_MODIFIER_CTRL)) {
++        const bool CUT = ev.xkbKeysym == XKB_KEY_X || ev.xkbKeysym == XKB_KEY_x;
++        if ((CUT || ev.xkbKeysym == XKB_KEY_C || ev.xkbKeysym == XKB_KEY_c) && (ev.modMask & Input::HT_MODIFIER_CTRL)) {
+             if (m_impl->hasSelect() && g_backendServices && g_backendServices->clipboard) {
+                 const auto begin = std::min(m_impl->inputState.selectBegin, m_impl->inputState.selectEnd);
+                 const auto end   = std::max(m_impl->inputState.selectBegin, m_impl->inputState.selectEnd);
+-                g_backendServices->clipboard->setText(m_impl->data.text.substr(begin, end - begin));
+-            }
+-            return;
+-        }
+-
+-        if ((ev.xkbKeysym == XKB_KEY_X || ev.xkbKeysym == XKB_KEY_x) && (ev.modMask & Input::HT_MODIFIER_CTRL)) {
+-            if (m_impl->hasSelect() && g_backendServices && g_backendServices->clipboard) {
+-                const auto begin = std::min(m_impl->inputState.selectBegin, m_impl->inputState.selectEnd);
+-                const auto end   = std::max(m_impl->inputState.selectBegin, m_impl->inputState.selectEnd);
+-                g_backendServices->clipboard->setText(m_impl->data.text.substr(begin, end - begin));
+-                m_impl->removeSelectedText();
+-                m_impl->updateLabel(true);
++                if (const auto result = g_backendServices->clipboard->setText(m_impl->data.text.substr(begin, end - begin)); !result)
++                    g_logger->log(HT_LOG_ERROR, "clipboard copy: {}", result.error());
++                else if (CUT) {
++                    m_impl->removeSelectedText();
++                    m_impl->updateLabel(true);
++                }
+             }
+             return;
+         }
+@@ -375,20 +378,31 @@ void CTextboxElement::init() {
+         if ((ev.xkbKeysym == XKB_KEY_V || ev.xkbKeysym == XKB_KEY_v) && (ev.modMask & Input::HT_MODIFIER_CTRL)) {
+             if (!g_backendServices || !g_backendServices->clipboard)
+                 return;
+-            const auto pasted = g_backendServices->clipboard->getText();
+-            if (pasted.empty())
+-                return;
+-
+-            std::string text = pasted;
+-            if (!m_impl->data.multiline) {
+-                if (auto nl = text.find('\n'); nl != std::string::npos)
+-                    text.resize(nl);
+-            }
+-
+-            m_impl->removeSelectedText();
+-            m_impl->data.text = m_impl->data.text.insert(m_impl->inputState.cursor, text);
+-            m_impl->inputState.cursor += text.length();
+-            m_impl->updateLabel(true);
++            m_impl->clipboardRead = g_backendServices->clipboard->readText([weak = m_impl->self](auto result) {
++                const auto self = weak.lock();
++                if (!self || !self->m_impl->active)
++                    return;
++                if (!result) {
++                    g_logger->log(HT_LOG_ERROR, "clipboard paste: {}", result.error());
++                    return;
++                }
++                auto& text = *result;
++                if (!g_utf8_validate(text.data(), text.size(), nullptr)) {
++                    g_logger->log(HT_LOG_ERROR, "clipboard paste: invalid UTF-8");
++                    return;
++                }
++                auto& state = *self->m_impl;
++                if (!state.data.multiline) {
++                    if (const auto newline = text.find_first_of("\r\n"); newline != std::string::npos)
++                        text.resize(newline);
++                }
++                if (text.empty())
++                    return;
++                state.removeSelectedText();
++                state.data.text.insert(state.inputState.cursor, text);
++                state.inputState.cursor += text.size();
++                state.updateLabel(true);
++            });
+             return;
+         }
+ 
+@@ -400,8 +414,9 @@ void CTextboxElement::init() {
+ 
+         m_impl->removeSelectedText();
+ 
+-        m_impl->data.text = m_impl->data.text.insert(m_impl->inputState.cursor, ev.utf8);
+-        m_impl->inputState.cursor += ev.utf8.length();
++        const std::string_view inserted = ev.utf8 == "\r" ? std::string_view{"\n"} : std::string_view{ev.utf8};
++        m_impl->data.text.insert(m_impl->inputState.cursor, inserted);
++        m_impl->inputState.cursor += inserted.length();
+         m_impl->updateLabel(true);
+     });
+ 
+@@ -434,8 +449,10 @@ void CTextboxElement::setText(std::string text) {
+     if (text == m_impl->data.text)
+         return;
+ 
+-    m_impl->data.text         = std::move(text);
+-    m_impl->inputState.cursor = std::min(m_impl->inputState.cursor, m_impl->data.text.length());
++    m_impl->data.text = std::move(text);
++    m_impl->clipboardRead.reset();
++    m_impl->inputState.imText.clear();
++    m_impl->inputState.cursor = UTF8::floorBoundary(m_impl->data.text, m_impl->inputState.cursor);
+     m_impl->clearSelect();
+     m_impl->updateLabel();
+ 
+@@ -498,7 +515,7 @@ std::tuple<ssize_t, ssize_t> CTextboxElement::selection() const {
+ }
+ 
+ void STextboxImpl::updateLabel(bool textEdited) {
+-    if (data.text.empty()) {
++    if (data.text.empty() && inputState.imText.empty()) {
+         bgInnerCont->removeChild(text);
+         bgInnerCont->addChild(placeholder);
+     } else {
+@@ -506,21 +523,32 @@ void STextboxImpl::updateLabel(bool textEdited) {
+         bgInnerCont->addChild(text);
+     }
+ 
+-    if (!data.password) {
+-        auto fullLabel = data.text;
+-        if (!inputState.imText.empty())
+-            fullLabel.insert(inputState.cursor, "<u>" + inputState.imText + "</u>");
+-
+-        text->rebuild()->text(std::move(fullLabel))->commence();
+-    } else {
+-        std::string pwdText(UTF8::length(data.text), '*');
+-
+-        auto        fullLabel = inputState.imText.empty() ? //
+-            pwdText :                                       //
+-            pwdText.insert(srcToDisplay(inputState.cursor), "<u>" + inputState.imText + "</u>");
+-
+-        text->rebuild()->text(std::move(fullLabel))->commence();
++    std::string label;
++    const auto  appendText = [&](std::string_view fragment) {
++        if (data.password) {
++            for (const unsigned char byte : fragment)
++                if ((byte & 0xC0) != 0x80)
++                    label += '*';
++        } else {
++            auto* escaped = g_markup_escape_text(fragment.data(), fragment.size());
++            label += escaped;
++            g_free(escaped);
++        }
++    };
++    appendText(std::string_view{data.text}.substr(0, inputState.cursor));
++    if (!inputState.imText.empty()) {
++        const size_t begin = UTF8::floorBoundary(inputState.imText, std::max(0, std::min(inputState.imCursorBegin, inputState.imCursorEnd)));
++        const size_t end   = UTF8::floorBoundary(inputState.imText, std::max(0, std::max(inputState.imCursorBegin, inputState.imCursorEnd)));
++        label += "<u>";
++        appendText(std::string_view{inputState.imText}.substr(0, begin));
++        label += "<span underline=\"double\">";
++        appendText(std::string_view{inputState.imText}.substr(begin, end - begin));
++        label += "</span>";
++        appendText(std::string_view{inputState.imText}.substr(end));
++        label += "</u>";
+     }
++    appendText(std::string_view{data.text}.substr(inputState.cursor));
++    text->rebuild()->text(std::move(label))->commence();
+ 
+     updateCursor();
+ 
+@@ -528,31 +556,64 @@ void STextboxImpl::updateLabel(bool textEdited) {
+         data.onTextEdited(self.lock(), data.text);
+ }
+ 
+-void CTextboxElement::imCommitNewText(const std::string& s) {
+-    m_impl->inputState.imText = s;
+-    m_impl->updateLabel();
+-}
++void CTextboxElement::imUpdate(const Input::STextInputEvent& event) {
++    auto& state = *m_impl;
++    auto& input = state.inputState;
++    auto& text  = state.data.text;
++    state.clipboardRead.reset();
++    const size_t begin = state.hasSelect() ? std::min(input.selectBegin, input.selectEnd) : input.cursor;
++    const size_t end   = state.hasSelect() ? std::max(input.selectBegin, input.selectEnd) : input.cursor;
++    if (event.deleteBefore > begin || event.deleteAfter > text.size() - end || UTF8::floorBoundary(text, begin - event.deleteBefore) != begin - event.deleteBefore ||
++        UTF8::floorBoundary(text, end + event.deleteAfter) != end + event.deleteAfter)
++        return;
+ 
+-void CTextboxElement::imApplyText() {
+-    m_impl->data.text = m_impl->data.text.insert(m_impl->inputState.cursor, m_impl->inputState.imText);
+-    m_impl->inputState.cursor += m_impl->inputState.imText.length();
+-    m_impl->inputState.imText.clear();
+-    m_impl->updateLabel(true);
++    bool edited = event.deleteBefore || event.deleteAfter || (event.commit && !event.commit->empty());
++    input.imText.clear();
++    text.erase(end, event.deleteAfter);
++    text.erase(begin - event.deleteBefore, event.deleteBefore);
++    input.cursor -= event.deleteBefore;
++    if (state.hasSelect()) {
++        input.selectBegin -= event.deleteBefore;
++        input.selectEnd -= event.deleteBefore;
++        if (event.commit || !event.preedit.empty()) {
++            state.removeSelectedText();
++            edited = true;
++        }
++    }
++    std::string_view commit = event.commit ? *event.commit : std::string_view{};
++    if (!state.data.multiline)
++        commit = commit.substr(0, commit.find_first_of("\r\n"));
++    text.insert(input.cursor, commit);
++    input.cursor += commit.size();
++    input.imText        = event.preedit;
++    input.imCursorBegin = event.cursorBegin;
++    input.imCursorEnd   = event.cursorEnd;
++    state.updateSelect();
++    state.updateLabel(edited);
+ }
+ 
+ size_t STextboxImpl::srcToDisplay(size_t srcByte) const {
+-    return data.password ? UTF8::offsetToUTF8Len(data.text, srcByte) : srcByte;
++    const size_t offset = data.password ? UTF8::offsetToUTF8Len(data.text, srcByte) : srcByte;
++    return offset + (srcByte > inputState.cursor ? (data.password ? UTF8::length(inputState.imText) : inputState.imText.size()) : 0);
+ }
+ 
+ size_t STextboxImpl::displayToSrc(size_t displayByte) const {
++    const size_t start  = srcToDisplay(inputState.cursor);
++    const size_t length = data.password ? UTF8::length(inputState.imText) : inputState.imText.size();
++    if (displayByte >= start && displayByte < start + length)
++        return inputState.cursor;
++    if (displayByte >= start + length)
++        displayByte -= length;
+     return data.password ? UTF8::utf8ToOffset(data.text, displayByte) : displayByte;
+ }
+ 
+ void STextboxImpl::updateCursor() {
+-    inputState.cursor = std::clamp(inputState.cursor, (size_t)0, data.text.length());
++    inputState.cursor = UTF8::floorBoundary(data.text, inputState.cursor);
+ 
+-    const auto  CHARBOX = text->m_impl->getCharBox(srcToDisplay(inputState.cursor));
+-    const float XPOS    = CHARBOX.x;
++    const size_t imCursor = UTF8::floorBoundary(inputState.imText, std::max(0, inputState.imCursorBegin));
++    const auto   CHARBOX  = text->m_impl->getCharBox(srcToDisplay(inputState.cursor) + (data.password ? UTF8::offsetToUTF8Len(inputState.imText, imCursor) : imCursor));
++    const float  XPOS     = CHARBOX.x;
++    cursor->setOpacity(!inputState.imText.empty() && inputState.imCursorBegin == -1 ? 0.F : 1.F);
+ 
+     if (data.multiline) {
+         // For multiline, size the cursor to match the line height and position it at the character's Y position
+@@ -564,8 +625,12 @@ void STextboxImpl::updateCursor() {
+         cursor->setAbsolutePosition({XPOS, 0.F});
+     }
+ 
+-    if (self->impl->window)
+-        self->impl->window->setIMTo(self->impl->position.copy().translate({std::clamp(XPOS, 0.F, sc<float>(self->impl->position.w)), 0.F}), data.text, inputState.cursor);
++    if (active && self->impl->window) {
++        auto box            = CHARBOX.copy().translate(text->impl->position.pos());
++        box.w               = 1;
++        const size_t anchor = hasSelect() ? (inputState.cursor == sc<size_t>(inputState.selectBegin) ? inputState.selectEnd : inputState.selectBegin) : inputState.cursor;
++        self->impl->window->setIMTo({box, data.text, inputState.cursor, anchor, data.password, data.multiline});
++    }
+ 
+     g_positioner->repositionNeeded(cursor);
+ }
+@@ -781,7 +846,8 @@ void CTextboxElement::replaceData(const STextboxData& data) {
+     m_impl->data = data;
+ 
+     if (TEXT_CHANGED) {
+-        m_impl->inputState.cursor = std::min(m_impl->inputState.cursor, m_impl->data.text.length());
++        m_impl->clipboardRead.reset();
++        m_impl->inputState.cursor = UTF8::floorBoundary(m_impl->data.text, m_impl->inputState.cursor);
+         m_impl->inputState.imText.clear();
+         m_impl->clearSelect();
+     }
+diff --git a/src/element/textbox/Textbox.hpp b/src/element/textbox/Textbox.hpp
+index 51e6858..3256023 100644
+--- a/src/element/textbox/Textbox.hpp
++++ b/src/element/textbox/Textbox.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <hyprtoolkit/element/Textbox.hpp>
++#include <hyprtoolkit/core/BackendServices.hpp>
+ #include <hyprutils/signal/Listener.hpp>
+ 
+ #include "../../helpers/Memory.hpp"
+@@ -26,6 +27,7 @@ namespace Hyprtoolkit {
+         STextboxData                       data;
+ 
+         WP<CTextboxElement>                self;
++        SP<IClipboardTransfer>             clipboardRead;
+ 
+         SP<CRectangleElement>              bg;
+         SP<CNullElement>                   bgInnerCont;
+@@ -56,6 +58,7 @@ namespace Hyprtoolkit {
+         struct {
+             size_t      cursor = 0;
+             std::string imText;
++            int32_t     imCursorBegin = 0, imCursorEnd = 0;
+             ssize_t     selectBegin = -1, selectEnd = -1;
+         } inputState;
+ 
+diff --git a/src/helpers/UTF8.cpp b/src/helpers/UTF8.cpp
+index ffdc5fd..e0bf7ed 100644
+--- a/src/helpers/UTF8.cpp
++++ b/src/helpers/UTF8.cpp
+@@ -4,6 +4,13 @@
+ using namespace Hyprtoolkit;
+ using namespace Hyprtoolkit::UTF8;
+ 
++size_t UTF8::floorBoundary(std::string_view text, size_t offset) {
++    offset = std::min(offset, text.size());
++    while (offset > 0 && offset < text.size() && (text[offset] & 0xC0) == 0x80)
++        --offset;
++    return offset;
++}
++
+ size_t UTF8::codepointLen(const char* utf8Char, size_t max) {
+     size_t len = 1;
+     while (len < max) {
+diff --git a/src/helpers/UTF8.hpp b/src/helpers/UTF8.hpp
+index 8b5f487..7509899 100644
+--- a/src/helpers/UTF8.hpp
++++ b/src/helpers/UTF8.hpp
+@@ -1,8 +1,10 @@
+ #pragma once
+ 
+ #include <string>
++#include <string_view>
+ 
+ namespace Hyprtoolkit::UTF8 {
++    size_t      floorBoundary(std::string_view text, size_t offset);
+     size_t      codepointLen(const char* utf8Char, size_t max);
+     size_t      codepointLenBefore(const std::string& s, size_t offset);
+     size_t      length(const std::string&);
+diff --git a/src/output/WaylandOutput.cpp b/src/output/WaylandOutput.cpp
+index bebb27a..3812245 100644
+--- a/src/output/WaylandOutput.cpp
++++ b/src/output/WaylandOutput.cpp
+@@ -35,6 +35,7 @@ CWaylandOutput::CWaylandOutput(wl_proxy* wlResource, uint32_t id) : m_id(id), m_
+ 
+     m_wlOutput->setDone([this](CCWlOutput* r) {
+         m_configuration.done = true;
++        m_events.changed.emit();
+         g_logger->log(HT_LOG_DEBUG, "wayland output {}: done", m_id);
+     });
+ 
+diff --git a/src/renderer/gl/GLTexture.cpp b/src/renderer/gl/GLTexture.cpp
+index fe10aed..f7485d6 100644
+--- a/src/renderer/gl/GLTexture.cpp
++++ b/src/renderer/gl/GLTexture.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "../../core/InternalBackend.hpp"
+ #include "../../core/BackendContext.hpp"
++#include "../../Macros.hpp"
+ 
+ using namespace Hyprtoolkit;
+ 
+@@ -11,27 +12,10 @@ CGLTexture::CGLTexture() {
+         m_lifetime = g_backendServices->lifetime;
+ }
+ 
+-void CGLTexture::attachAsync(WP<CGLTexture> self, ASP<Hyprgraphics::IAsyncResource> resource) {
+-    if (resource->m_ready) {
+-        m_resource = resource;
+-        uploadOnContext(self);
+-        return;
+-    }
+-
+-    resource->m_events.finished.listenStatic([self, resource, lifetime = WP<SBackendLifetime>{g_backendServices->lifetime}] {
+-        // backend may have been torn down between enqueue and finish (shutdown
+-        // race). dropping the upload is safe: the texture is either gone too
+-        // (lock fails below) or about to be.
+-        if (!g_backend || !lifetime)
+-            return;
+-        g_backend->addIdle([self, resource, lifetime] {
+-            const auto SELF = self.lock();
+-            if (!SELF || !lifetime)
+-                return;
+-            SELF->m_resource = resource;
+-            SELF->uploadOnContext(SELF);
+-        });
+-    });
++void CGLTexture::attach(WP<CGLTexture> self, ASP<Hyprgraphics::IAsyncResource> resource) {
++    ASSERT(resource->m_ready && resource->m_asset.cairoSurface);
++    m_resource = std::move(resource);
++    uploadOnContext(self);
+ }
+ 
+ void CGLTexture::uploadOnContext(WP<CGLTexture> self) {
+diff --git a/src/renderer/gl/GLTexture.hpp b/src/renderer/gl/GLTexture.hpp
+index 0b8d99a..c2a5cda 100644
+--- a/src/renderer/gl/GLTexture.hpp
++++ b/src/renderer/gl/GLTexture.hpp
+@@ -32,11 +32,7 @@ namespace Hyprtoolkit {
+         virtual eImageFitMode             fitMode();
+         virtual Hyprutils::Math::Vector2D size();
+ 
+-        // attaches an async resource. uploads immediately if ready, otherwise
+-        // arms a listener that runs upload() when the resource is ready. self is
+-        // captured weakly so the listener becomes a no-op if the texture is
+-        // destroyed before the resource finishes loading.
+-        void                              attachAsync(WP<CGLTexture> self, ASP<Hyprgraphics::IAsyncResource> resource);
++        void                              attach(WP<CGLTexture> self, ASP<Hyprgraphics::IAsyncResource> resource);
+ 
+         eGLTextureType                    m_type      = TEXTURE_RGBA;
+         GLenum                            m_target    = GL_TEXTURE_2D;
+diff --git a/src/renderer/gl/OpenGL.cpp b/src/renderer/gl/OpenGL.cpp
+index 6f65ee6..559e18f 100644
+--- a/src/renderer/gl/OpenGL.cpp
++++ b/src/renderer/gl/OpenGL.cpp
+@@ -918,6 +918,16 @@ void COpenGLRenderer::renderBreadthfirst(SP<IElement> e) {
+             // grouped: render all children as one
+             renderBreadthfirst(el);
+         }
++        if (el->impl->focusRing && el->keyboardFocused()) {
++            renderBreadthfirst(el);
++            m_currentElement = el;
++            renderBorder(SBorderRenderData{
++                .box      = el->impl->position,
++                .gradient = CGradientValueData{g_palette->m_colors.accent},
++                .rounding = 3,
++                .thick    = 2,
++            });
++        }
+     });
+ }
+ 
+@@ -1024,7 +1034,7 @@ SP<IRendererTexture> COpenGLRenderer::uploadTexture(const STextureData& data) {
+     const auto TEX = makeShared<CGLTexture>();
+     registerTexture(TEX);
+     TEX->m_fitMode = data.fitMode;
+-    TEX->attachAsync(TEX, data.resource);
++    TEX->attach(TEX, data.resource);
+     return TEX;
+ }
+ 
+diff --git a/src/resource/assetCache/AssetCacheEntry.cpp b/src/resource/assetCache/AssetCacheEntry.cpp
+index f121d05..de49dba 100644
+--- a/src/resource/assetCache/AssetCacheEntry.cpp
++++ b/src/resource/assetCache/AssetCacheEntry.cpp
+@@ -1,9 +1,16 @@
+ #include "AssetCacheEntry.hpp"
+ #include "../../core/BackendContext.hpp"
++#include <hyprgraphics/resource/AsyncResourceGatherer.hpp>
+ 
+ using namespace Hyprtoolkit;
+ using namespace Hyprtoolkit::Asset;
+ 
++CAssetCacheEntry::~CAssetCacheEntry() {
++    if (resource)
++        if (const auto queue = gatherer.lock())
++            queue->cancel(resource);
++}
++
+ CAssetCacheEntry::CAssetCacheEntry(const std::string_view& source, const SP<IRendererTexture> tex) :
+     m_source(source), m_tex(tex), m_status(CACHE_ENTRY_DONE), m_generation(g_backendServices ? g_backendServices->lifetime->generation : 0) {
+     ;
+diff --git a/src/resource/assetCache/AssetCacheEntry.hpp b/src/resource/assetCache/AssetCacheEntry.hpp
+index 6a634a2..fc8d888 100644
+--- a/src/resource/assetCache/AssetCacheEntry.hpp
++++ b/src/resource/assetCache/AssetCacheEntry.hpp
+@@ -4,6 +4,7 @@
+ #include <string_view>
+ 
+ #include <hyprutils/signal/Signal.hpp>
++#include <hyprutils/memory/Atomic.hpp>
+ 
+ #include "../../helpers/Memory.hpp"
+ 
+@@ -11,6 +12,11 @@ namespace Hyprtoolkit {
+     class IRendererTexture;
+ }
+ 
++namespace Hyprgraphics {
++    class CAsyncResourceGatherer;
++    class IAsyncResource;
++}
++
+ namespace Hyprtoolkit::Asset {
+     enum eAssetCacheEntryStatus : uint8_t {
+         CACHE_ENTRY_PENDING = 0,
+@@ -22,7 +28,7 @@ namespace Hyprtoolkit::Asset {
+       public:
+         CAssetCacheEntry(const std::string_view& source, const SP<IRendererTexture> tex);
+         CAssetCacheEntry(const std::string_view& source);
+-        ~CAssetCacheEntry() = default;
++        ~CAssetCacheEntry();
+ 
+         CAssetCacheEntry(const CAssetCacheEntry&) = delete;
+         CAssetCacheEntry(CAssetCacheEntry&)       = delete;
+@@ -34,10 +40,13 @@ namespace Hyprtoolkit::Asset {
+         uint64_t               generation() const;
+ 
+         // if created without a tex, this will mark asset as done
+-        void texDone(SP<IRendererTexture> tex);
+-        void fail();
++        void                                     texDone(SP<IRendererTexture> tex);
++        void                                     fail();
+ 
+-        bool operator==(const CAssetCacheEntry& e) const {
++        ASP<Hyprgraphics::IAsyncResource>        resource;
++        WP<Hyprgraphics::CAsyncResourceGatherer> gatherer;
++
++        bool                                     operator==(const CAssetCacheEntry& e) const {
+             return m_tex == e.m_tex;
+         }
+ 
+diff --git a/src/system/Icons.cpp b/src/system/Icons.cpp
+index 23e592f..457e54f 100644
+--- a/src/system/Icons.cpp
++++ b/src/system/Icons.cpp
+@@ -8,10 +8,12 @@
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
++#include <algorithm>
++#include <cmath>
++#include <cctype>
+ 
+ #include <hyprutils/string/String.hpp>
+ #include <hyprutils/string/ConstVarList.hpp>
+-#include <hyprutils/string/VarList2.hpp>
+ #include <hyprutils/utils/ScopeGuard.hpp>
+ #include <ranges>
+ 
+@@ -23,19 +25,6 @@ using namespace Hyprtoolkit;
+ using namespace Hyprutils::String;
+ using namespace Hyprutils::Utils;
+ 
+-static std::optional<std::string> readFileAsString(const std::string& path) {
+-    std::error_code ec;
+-
+-    if (!std::filesystem::exists(path, ec) || ec)
+-        return std::nullopt;
+-
+-    std::ifstream file(path);
+-    if (!file.good())
+-        return std::nullopt;
+-
+-    return trim(std::string((std::istreambuf_iterator<char>(file)), (std::istreambuf_iterator<char>())));
+-}
+-
+ static std::vector<std::string> getXDGIconThemeDirsFromEnv() {
+     auto dataDirs    = Env::getEnv("XDG_DATA_DIRS").value_or("/usr/local/share/:/usr/share/");
+     auto dataHomeDir = std::string(Env::getEnv("XDG_DATA_HOME").value_or("~/.local/share/"));
+@@ -163,13 +152,7 @@ static std::optional<std::vector<std::string>> findAnyTheme() {
+ }
+ 
+ static std::optional<std::vector<std::string>> getIconThemeDirs() {
+-    static std::optional<std::vector<std::string>> paths;
+-    static bool                                    once = true;
+-
+-    if (!once)
+-        return paths;
+-
+-    once = false;
++    std::optional<std::vector<std::string>> paths;
+ 
+     // if we have an explicit one, try to find it.
+     if (!g_palette->m_vars.iconTheme.empty())
+@@ -194,57 +177,63 @@ void CSystemIconFactory::parseTheme(const std::string& themeDir) {
+         return;
+     }
+ 
+-    const auto THEME_DATA = readFileAsString(themeDir + "/index.theme");
+-
+-    if (!THEME_DATA)
++    std::ifstream file(themeDir + "/index.theme");
++    if (!file)
+         return;
+-
+-    size_t directoriesEntry = THEME_DATA->find("\nDirectories=");
+-    if (directoriesEntry == std::string::npos)
+-        directoriesEntry = THEME_DATA->find("\nDirectories =");
+-
+-    if (directoriesEntry != std::string::npos) {
+-        const auto BASE_PATH = std::filesystem::path{themeDir};
+-
+-        size_t     directoriesLineEnd = THEME_DATA->find('\n', directoriesEntry + 2);
+-        directoriesEntry              = THEME_DATA->find('=', directoriesEntry + 2) + 1;
+-
+-        std::string   directoriesList = THEME_DATA->substr(directoriesEntry, directoriesLineEnd - directoriesEntry);
+-
+-        CConstVarList dirs(directoriesList, 0, ',', true);
+-
+-        for (const auto& d : dirs) {
+-            m_lookupPaths.emplace_back(BASE_PATH / d);
++    auto*       ini = dictionary_new(0);
++    CScopeGuard freeIni([ini] { iniparser_freedict(ini); });
++    // Directories= exceeds the fixed buffers in both iniparser_load and iniparser_set.
++    std::string section, line;
++    while (std::getline(file, line)) {
++        line = trim(line);
++        if (line.empty() || line.front() == '#')
++            continue;
++        if (line.front() == '[' && line.back() == ']') {
++            section = trim(line.substr(1, line.size() - 2));
++            continue;
+         }
++        const auto equals = line.find('=');
++        if (equals == std::string::npos || section.empty())
++            continue;
++        auto key = section + ":" + trim(line.substr(0, equals));
++        std::ranges::transform(key, key.begin(), [](unsigned char c) { return std::tolower(c); });
++        const auto value = trim(line.substr(equals + 1));
++        dictionary_set(ini, key.c_str(), value.c_str());
++    }
++    const auto theme = m_parsedThemes.size() - 1;
+ 
+-        g_logger->log(HT_LOG_TRACE, "CSystemIconFactory: theme {} has {} dirs", themeDir, dirs.size());
++    for (const auto key : {"Icon Theme:Directories", "Icon Theme:ScaledDirectories"}) {
++        const auto    directories = iniparser_getstring(ini, key, "");
++        CConstVarList dirs(directories, 0, ',', true);
++        for (const auto& d : dirs) {
++            const auto        section = trim(std::string{d});
++            const double      size    = iniparser_getdouble(ini, (section + ":Size").c_str(), 0);
++            const double      scale   = iniparser_getdouble(ini, (section + ":Scale").c_str(), 1);
++            const std::string type    = iniparser_getstring(ini, (section + ":Type").c_str(), "Threshold");
++            double            min = size, max = size;
++            if (type == "Scalable") {
++                min = iniparser_getdouble(ini, (section + ":MinSize").c_str(), size);
++                max = iniparser_getdouble(ini, (section + ":MaxSize").c_str(), size);
++            } else if (type == "Threshold") {
++                const double threshold = iniparser_getdouble(ini, (section + ":Threshold").c_str(), 2);
++                min                    = std::max(0.0, size - threshold);
++                max                    = size + threshold;
++            }
++            min *= scale;
++            max *= scale;
++            if (section.empty() || size <= 0 || scale <= 0 || !std::isfinite(min) || !std::isfinite(max) || min < 0 || max < min)
++                continue;
++            m_lookupPaths.push_back({.path = themeDir + "/" + section, .theme = theme, .minSize = min, .maxSize = max});
++        }
+     }
+ 
+-    size_t inheritsEntry = THEME_DATA->find("\nInherits=");
+-    if (inheritsEntry == std::string::npos)
+-        inheritsEntry = THEME_DATA->find("\nInherits =");
+-
+-    if (inheritsEntry != std::string::npos) {
+-        size_t inheritsLineEnd = THEME_DATA->find('\n', inheritsEntry + 2);
+-        inheritsEntry          = THEME_DATA->find('=', inheritsEntry + 2) + 1;
+-
+-        std::string inheritsList = THEME_DATA->substr(inheritsEntry, inheritsLineEnd - inheritsEntry);
+-
+-        CVarList2   inherits(std::move(inheritsList), 0, ',', true);
+-
+-        g_logger->log(HT_LOG_TRACE, "CSystemIconFactory: theme {} inherits {} themes", themeDir, inherits.size());
+-
+-        for (const auto& inheritName : inherits) {
+-            if (inheritName == "hicolor")
+-                m_hicolorAdded = true;
+-
+-            auto inheritTheme = getThemeDir(trim(std::string{inheritName}));
+-            if (inheritTheme) {
+-                g_logger->log(HT_LOG_TRACE, "CSystemIconFactory: parsing inherited theme {}", *inheritTheme);
+-                parseThemes(*inheritTheme);
+-            } else
+-                g_logger->log(HT_LOG_WARNING, "CSystemIconFactory: inherited theme {} not found", std::string{inheritName});
+-        }
++    CConstVarList inherits(iniparser_getstring(ini, "Icon Theme:Inherits", ""), 0, ',', true);
++    for (const auto& inheritName : inherits) {
++        const auto name = trim(std::string{inheritName});
++        if (name == "hicolor")
++            m_hicolorAdded = true;
++        if (auto inheritTheme = getThemeDir(name))
++            parseThemes(*inheritTheme);
+     }
+ }
+ 
+@@ -255,6 +244,15 @@ void CSystemIconFactory::parseThemes(const std::vector<std::string>& themeDirs)
+ }
+ 
+ CSystemIconFactory::CSystemIconFactory() {
++    refreshTheme();
++}
++
++void CSystemIconFactory::refreshTheme() {
++    m_theme = g_palette->m_vars.iconTheme;
++    m_lookupPaths.clear();
++    m_parsedThemes.clear();
++    m_pathCache.clear();
++    m_hicolorAdded    = false;
+     auto baseThemeDir = getIconThemeDirs();
+ 
+     if (!baseThemeDir)
+@@ -272,10 +270,13 @@ CSystemIconFactory::CSystemIconFactory() {
+ }
+ 
+ SP<ISystemIconDescription> CSystemIconFactory::lookupIcon(const std::string& iconName) {
+-    if (m_lookupPaths.empty())
+-        return makeShared<CSystemIconDescription>();
++    return lookupIcon(iconName, 32);
++}
+ 
+-    return makeShared<CSystemIconDescription>(iconName);
++SP<ISystemIconDescription> CSystemIconFactory::lookupIcon(const std::string& iconName, int pixelSize) {
++    if (m_theme != g_palette->m_vars.iconTheme)
++        refreshTheme();
++    return makeShared<CSystemIconDescription>(iconName, pixelSize);
+ }
+ 
+ void CSystemIconFactory::cacheEntry(const std::string& iconName, SIconCacheResult&& result) {
+diff --git a/src/system/Icons.hpp b/src/system/Icons.hpp
+index c78dfdf..584511a 100644
+--- a/src/system/Icons.hpp
++++ b/src/system/Icons.hpp
+@@ -15,13 +15,14 @@ namespace Hyprtoolkit {
+         // invalid icon
+         CSystemIconDescription();
+         // lookup icon
+-        CSystemIconDescription(const std::string& name);
++        CSystemIconDescription(const std::string& name, int pixelSize = 32);
+         virtual ~CSystemIconDescription() = default;
+ 
+         virtual bool exists();
+         virtual bool scalable();
+ 
+         std::string  m_bestPath = "";
++        std::string  m_name;
+         bool         m_scalable = false;
+     };
+ 
+@@ -41,6 +42,7 @@ namespace Hyprtoolkit {
+             This object can be used to create an ImageElement
+         */
+         virtual Hyprutils::Memory::CSharedPointer<ISystemIconDescription> lookupIcon(const std::string& iconName);
++        Hyprutils::Memory::CSharedPointer<ISystemIconDescription>         lookupIcon(const std::string& iconName, int pixelSize);
+ 
+         /*
+             A cache is kept: loopkup paths can grow large, this is to avoid tons of disk I/O
+@@ -51,10 +53,17 @@ namespace Hyprtoolkit {
+         bool                            m_hicolorAdded = false;
+ 
+       private:
+-        void                     parseThemes(const std::vector<std::string>& themeDirs);
+-        void                     parseTheme(const std::string& themeDir);
++        void parseThemes(const std::vector<std::string>& themeDirs);
++        void parseTheme(const std::string& themeDir);
++        void refreshTheme();
+ 
+-        std::vector<std::string> m_lookupPaths;
++        struct SIconDirectory {
++            std::string path;
++            size_t      theme   = 0;
++            double      minSize = 0, maxSize = 0;
++        };
++        std::vector<SIconDirectory> m_lookupPaths;
++        std::string                 m_theme;
+ 
+         // theme dirs already walked, to break cyclic Inherits= chains
+         std::unordered_set<std::string>                    m_parsedThemes;
+diff --git a/src/system/SystemIcon.cpp b/src/system/SystemIcon.cpp
+index 5eb4fb7..11730ae 100644
+--- a/src/system/SystemIcon.cpp
++++ b/src/system/SystemIcon.cpp
+@@ -2,6 +2,8 @@
+ #include "../core/InternalBackend.hpp"
+ 
+ #include <filesystem>
++#include <algorithm>
++#include <limits>
+ 
+ using namespace Hyprtoolkit;
+ 
+@@ -9,36 +11,49 @@ CSystemIconDescription::CSystemIconDescription() {
+     ;
+ }
+ 
+-CSystemIconDescription::CSystemIconDescription(const std::string& name) {
+-    if (g_iconFactory->m_lookupPaths.empty() || name.empty())
++CSystemIconDescription::CSystemIconDescription(const std::string& name, int pixelSize) : m_name(name) {
++    if (name.empty())
+         return;
+ 
+-    if (const auto CK = g_iconFactory->getCached(name); CK) {
++    const auto key = std::format("{}-{}", name, pixelSize);
++    if (const auto CK = g_iconFactory->getCached(key); CK) {
+         m_bestPath = CK->badIcon ? "" : CK->path;
+         m_scalable = CK->badIcon ? false : CK->scalable;
+         return;
+     }
+ 
+-    bool found = false;
++    bool   found        = false;
++    size_t theme        = 0;
++    double bestDistance = std::numeric_limits<double>::max();
++    bool   bestUpscaled = true;
+ 
+     for (const auto& lookupDir : g_iconFactory->m_lookupPaths) {
+-        std::filesystem::path fullDirPath = lookupDir + "/";
++        if (found && lookupDir.theme != theme)
++            break;
++        const double distance = std::max({0.0, lookupDir.minSize - pixelSize, pixelSize - lookupDir.maxSize});
++        const bool   upscaled = pixelSize > lookupDir.maxSize;
++        if (distance > bestDistance || (distance == bestDistance && (upscaled || !bestUpscaled)))
++            continue;
++        std::filesystem::path fullDirPath = lookupDir.path;
+ 
+         auto                  iconPath = fullDirPath / (name + ".svg");
+-        m_scalable                     = true;
+-        std::error_code ec;
++        bool                  scalable = true;
++        std::error_code       ec;
+ 
+         if (!std::filesystem::exists(iconPath, ec) || ec) {
+-            iconPath   = fullDirPath / (name + ".png");
+-            m_scalable = false;
++            iconPath = fullDirPath / (name + ".png");
++            scalable = false;
+         }
+ 
+         if (!std::filesystem::exists(iconPath, ec) || ec)
+             continue;
+ 
+-        m_bestPath = iconPath;
+-        found      = true;
+-        break;
++        m_bestPath   = iconPath;
++        m_scalable   = scalable;
++        bestDistance = distance;
++        bestUpscaled = upscaled;
++        theme        = lookupDir.theme;
++        found        = true;
+     }
+ 
+     if (!found) {
+@@ -58,9 +73,9 @@ CSystemIconDescription::CSystemIconDescription(const std::string& name) {
+     }
+ 
+     if (found)
+-        g_iconFactory->cacheEntry(name, CSystemIconFactory::SIconCacheResult{.badIcon = false, .path = m_bestPath, .scalable = m_scalable});
++        g_iconFactory->cacheEntry(key, CSystemIconFactory::SIconCacheResult{.badIcon = false, .path = m_bestPath, .scalable = m_scalable});
+     else
+-        g_iconFactory->cacheEntry(name, CSystemIconFactory::SIconCacheResult{});
++        g_iconFactory->cacheEntry(key, CSystemIconFactory::SIconCacheResult{});
+ }
+ 
+ bool CSystemIconDescription::exists() {
+diff --git a/src/window/EmbeddedSurface.cpp b/src/window/EmbeddedSurface.cpp
+index fc8b4f8..832ea4f 100644
+--- a/src/window/EmbeddedSurface.cpp
++++ b/src/window/EmbeddedSurface.cpp
+@@ -61,12 +61,15 @@ void CEmbeddedSurface::resize(const Vector2D& logicalSize, const Vector2D& pixel
+     if (!m_valid || logicalSize.x <= 0 || logicalSize.y <= 0 || pixelSize.x <= 0 || pixelSize.y <= 0 || scale <= 0)
+         return;
+ 
+-    m_logicalSize = logicalSize;
+-    m_pixelSize   = pixelSize;
+-    m_scale       = scale;
++    const bool SCALE_CHANGED = m_scale != scale;
++    m_logicalSize            = logicalSize;
++    m_pixelSize              = pixelSize;
++    m_scale                  = scale;
+     m_damageRing.setSize(pixelSize);
+     m_rootElement->reposition({{}, logicalSize});
+     damageEntire();
++    if (SCALE_CHANGED)
++        IWindow::m_events.scaleChanged.emit(scale);
+ }
+ 
+ void CEmbeddedSurface::render(uint32_t bufferAge) {
+@@ -190,16 +193,10 @@ void CEmbeddedSurface::keyboardLeave() {
+     unfocusKeyboard();
+ }
+ 
+-void CEmbeddedSurface::imCommit(const std::string& text) {
++void CEmbeddedSurface::imUpdate(const Input::STextInputEvent& event) {
+     if (!m_valid || !m_keyboardFocus)
+         return;
+-    m_keyboardFocus->imCommitNewText(text);
+-}
+-
+-void CEmbeddedSurface::imApply() {
+-    if (!m_valid || !m_keyboardFocus)
+-        return;
+-    m_keyboardFocus->imApplyText();
++    m_keyboardFocus->imUpdate(event);
+ }
+ 
+ bool CEmbeddedSurface::clippedAt(SP<IElement> element, const Vector2D& local) {
+@@ -304,18 +301,14 @@ void CEmbeddedSurface::setCursor(ePointerShape shape) {
+     IEmbeddedSurface::m_events.cursorChanged.emit(shape);
+ }
+ 
+-void CEmbeddedSurface::setIMTo(const CBox& box, const std::string& text, size_t cursor) {
++void CEmbeddedSurface::setIMTo(const STextInputState& state) {
+     if (!m_valid || !g_backendServices)
+         return;
+ 
+-    m_currentInput       = text;
+-    m_currentInputCursor = cursor;
+-    g_backendServices->textInput->activate(m_id, box, text, cursor);
++    g_backendServices->textInput->activate(m_id, state);
+ }
+ 
+ void CEmbeddedSurface::resetIM() {
+-    m_currentInput.clear();
+-    m_currentInputCursor = 0;
+     if (g_backendServices)
+         g_backendServices->textInput->deactivate(m_id);
+ }
+diff --git a/src/window/EmbeddedSurface.hpp b/src/window/EmbeddedSurface.hpp
+index f1a71e5..d8a994a 100644
+--- a/src/window/EmbeddedSurface.hpp
++++ b/src/window/EmbeddedSurface.hpp
+@@ -26,8 +26,7 @@ namespace Hyprtoolkit {
+         void                      keyboardEnter() override;
+         void                      keyboardKey(const Input::SKeyboardKeyEvent& event) override;
+         void                      keyboardLeave() override;
+-        void                      imCommit(const std::string& text) override;
+-        void                      imApply() override;
++        void                      imUpdate(const Input::STextInputEvent& event) override;
+         void                      touchDown(int32_t id, const Hyprutils::Math::Vector2D& local, uint32_t timeMs) override;
+         void                      touchMotion(int32_t id, const Hyprutils::Math::Vector2D& local, uint32_t timeMs) override;
+         void                      touchUp(int32_t id, uint32_t timeMs) override;
+@@ -44,7 +43,7 @@ namespace Hyprtoolkit {
+         void                      damage(Hyprutils::Math::CRegion&& region) override;
+         void                      damageEntire() override;
+         void                      setCursor(ePointerShape shape) override;
+-        void                      setIMTo(const Hyprutils::Math::CBox& box, const std::string& text, size_t cursor) override;
++        void                      setIMTo(const STextInputState& state) override;
+         void                      resetIM() override;
+         SP<IWindow>               openPopup(const SWindowCreationData& data) override;
+ 
+diff --git a/src/window/IWaylandWindow.cpp b/src/window/IWaylandWindow.cpp
+index 4ad0655..7118c7b 100644
+--- a/src/window/IWaylandWindow.cpp
++++ b/src/window/IWaylandWindow.cpp
+@@ -1,5 +1,6 @@
+ #include "IWaylandWindow.hpp"
+ #include "WaylandPopup.hpp"
++#include <algorithm>
+ 
+ #include <hyprtoolkit/element/Null.hpp>
+ 
+@@ -54,7 +55,7 @@ void IWaylandWindow::onScaleUpdate() {
+ }
+ 
+ void IWaylandWindow::configure(const Vector2D& size, uint32_t serial) {
+-
++    const bool SCALE_CHANGED    = m_waylandState.appliedScale != m_fractionalScale;
+     m_waylandState.logicalSize  = size;
+     m_waylandState.appliedScale = m_fractionalScale;
+ 
+@@ -66,6 +67,8 @@ void IWaylandWindow::configure(const Vector2D& size, uint32_t serial) {
+     damageEntire();
+ 
+     m_rootElement->reposition({0, 0, m_waylandState.logicalSize.x, m_waylandState.logicalSize.y});
++    if (SCALE_CHANGED)
++        m_events.scaleChanged.emit(m_fractionalScale);
+ }
+ 
+ void IWaylandWindow::resizeSwapchain(const Vector2D& pixelSize) {
+@@ -120,6 +123,30 @@ void IWaylandWindow::onPreRender() {
+         m_waylandState.surface->sendSetOpaqueRegion(nullptr);
+ }
+ 
++bool IWaylandWindow::setInputRegion(const std::optional<CRegion>& region) {
++    bool valid = true;
++    if (region)
++        region->forEachRect([&](const pixman_box32_t& rect) { valid = valid && sc<int64_t>(rect.x2) - rect.x1 <= INT32_MAX && sc<int64_t>(rect.y2) - rect.y1 <= INT32_MAX; });
++    if (!valid)
++        return false;
++    m_inputRegion = region;
++    if (m_open && m_waylandState.surface) {
++        applyInputRegion();
++        m_waylandState.surface->sendCommit();
++    }
++    return true;
++}
++
++void IWaylandWindow::applyInputRegion() {
++    if (!m_inputRegion) {
++        m_waylandState.surface->sendSetInputRegion(nullptr);
++        return;
++    }
++    const auto region = makeShared<CCWlRegion>(g_waylandPlatform->m_waylandState.compositor->sendCreateRegion());
++    m_inputRegion->forEachRect([&](const pixman_box32_t& rect) { region->sendAdd(rect.x1, rect.y1, rect.x2 - rect.x1, rect.y2 - rect.y1); });
++    m_waylandState.surface->sendSetInputRegion(region.get());
++}
++
+ void IWaylandWindow::prepareExplicit(SP<CWaylandBuffer> buffer) {
+     if (!g_renderer->explicitSyncSupported() || !g_waylandPlatform->m_waylandState.syncobj)
+         return;
+@@ -238,53 +265,111 @@ void IWaylandWindow::setCursor(ePointerShape shape) {
+ }
+ 
+ SP<IWindow> IWaylandWindow::openPopup(const SWindowCreationData& data) {
++    if (!data.passive)
++        closeTooltip();
++    std::erase_if(m_popups, [](const auto& popup) { return !popup; });
++    if (!m_open || !m_popups.empty())
++        return nullptr;
+     auto x    = makeShared<CWaylandPopup>(data, reinterpretPointerCast<IWaylandWindow>(m_self.lock()));
+     x->m_self = x;
+     m_popups.emplace_back(x);
+     return x;
+ }
+ 
++bool IWaylandWindow::grabFocus() {
++    if (!m_open || !m_waylandState.surface || !g_waylandPlatform || !g_waylandPlatform->m_waylandState.focusGrabManager)
++        return false;
++
++    releaseFocus();
++    m_focusGrab = makeShared<CCHyprlandFocusGrabV1>(g_waylandPlatform->m_waylandState.focusGrabManager->sendCreateGrab());
++    if (!m_focusGrab->resource()) {
++        m_focusGrab.reset();
++        return false;
++    }
++
++    const auto weak = m_self;
++    m_focusGrab->setCleared([weak](CCHyprlandFocusGrabV1* resource) {
++        const auto window = dynamicPointerCast<IWaylandWindow>(weak.lock());
++        if (!window || window->m_focusGrab.get() != resource)
++            return;
++
++        const auto keepGrab       = window->m_focusGrab;
++        window->m_focusGrabActive = false;
++        window->m_events.focusGrabCleared.emit();
++    });
++    m_focusGrab->sendAddSurface(m_waylandState.surface->resource());
++    m_focusGrab->sendCommit();
++    m_focusGrabActive = true;
++    return true;
++}
++
++void IWaylandWindow::releaseFocus() {
++    m_focusGrabActive = false;
++    m_focusGrab.reset();
++}
++
++bool IWaylandWindow::hasFocusGrab() {
++    return m_focusGrabActive;
++}
++
++void IWaylandWindow::closePopups() {
++    mouseLeave();
++    const auto popups = std::exchange(m_popups, {});
++    for (auto i = popups.rbegin(); i != popups.rend(); ++i) {
++        const auto popup = i->lock();
++        if (popup)
++            popup->close();
++    }
++    // The compositor's leave may arrive after the surface is no longer discoverable.
++    if (!m_open && g_waylandPlatform && g_waylandPlatform->m_currentWindow == m_self)
++        g_waylandPlatform->m_currentWindow.reset();
++}
++
++SP<IWaylandWindow> IWaylandWindow::windowForSurf(wl_proxy* proxy) {
++    if (m_waylandState.surface && m_waylandState.surface->resource() == proxy)
++        return reinterpretPointerCast<IWaylandWindow>(m_self.lock());
++    for (const auto& popup : m_popups) {
++        if (!popup)
++            continue;
++        if (const auto window = popup->windowForSurf(proxy))
++            return window;
++    }
++    return nullptr;
++}
++
+ void IWaylandWindow::mouseButton(const Input::eMouseButton button, bool state) {
++    closeTooltip();
+     if (m_popups.empty() || !state || m_ignoreNextButtonEvent) {
+         m_ignoreNextButtonEvent = false;
+         IToolkitWindow::mouseButton(button, state);
+         return;
+     }
+ 
+-    for (const auto& p : m_popups) {
+-        if (p)
+-            p->close();
+-    }
+-
+-    m_popups.clear();
++    closePopups();
+ 
+     m_ignoreNextButtonEvent = true;
+ }
+ 
+ void IWaylandWindow::mouseMove(const Hyprutils::Math::Vector2D& local) {
+-    if (!m_popups.empty())
++    if (std::ranges::any_of(m_popups, [this](const auto& popup) { return popup && popup.get() != m_tooltip.tooltipPopup.get(); }))
+         return;
+ 
+     IToolkitWindow::mouseMove(local);
+ }
+ 
+ void IWaylandWindow::mouseAxis(const Input::eAxisAxis axis, float delta) {
+-    if (!m_popups.empty())
++    if (std::ranges::any_of(m_popups, [this](const auto& popup) { return popup && popup.get() != m_tooltip.tooltipPopup.get(); }))
+         return;
+ 
+     IToolkitWindow::mouseAxis(axis, delta);
+ }
+ 
+-void IWaylandWindow::setIMTo(const Hyprutils::Math::CBox& box, const std::string& str, size_t cursor) {
+-    g_backendServices->textInput->activate(0, box, str, cursor);
+-
+-    m_currentInput       = str;
+-    m_currentInputCursor = cursor;
++void IWaylandWindow::setIMTo(const STextInputState& state) {
++    if (g_waylandPlatform->m_waylandState.imState.window == m_self)
++        g_backendServices->textInput->activate(0, state);
+ }
+ 
+ void IWaylandWindow::resetIM() {
+-    g_backendServices->textInput->deactivate(0);
+-
+-    m_currentInput       = "";
+-    m_currentInputCursor = 0;
++    if (g_waylandPlatform->m_waylandState.imState.window == m_self)
++        g_backendServices->textInput->deactivate(0);
+ }
+diff --git a/src/window/IWaylandWindow.hpp b/src/window/IWaylandWindow.hpp
+index 0bbb425..621d0b1 100644
+--- a/src/window/IWaylandWindow.hpp
++++ b/src/window/IWaylandWindow.hpp
+@@ -17,6 +17,7 @@
+ #include <text-input-unstable-v3.hpp>
+ #include <linux-drm-syncobj-v1.hpp>
+ #include <keyboard-shortcuts-inhibit-unstable-v1.hpp>
++#include <hyprland-focus-grab-v1.hpp>
+ 
+ #include <chrono>
+ 
+@@ -53,25 +54,35 @@ namespace Hyprtoolkit {
+         virtual void                      mouseMove(const Hyprutils::Math::Vector2D& local);
+         virtual void                      mouseButton(const Input::eMouseButton button, bool state);
+         virtual void                      mouseAxis(const Input::eAxisAxis axis, float delta);
+-        virtual void                      setIMTo(const Hyprutils::Math::CBox& box, const std::string& str, size_t cursor);
++        virtual void                      setIMTo(const STextInputState& state);
+         virtual void                      resetIM();
+         virtual void                      onPreRender();
++        virtual bool                      grabFocus();
++        virtual void                      releaseFocus();
++        virtual bool                      hasFocusGrab();
++        bool                              setInputRegion(const std::optional<Hyprutils::Math::CRegion>& region) override;
+ 
+-        std::vector<WP<IWindow>>          m_popups;
++        void                              closePopups();
++        SP<IWaylandWindow>                windowForSurf(wl_proxy* proxy);
++        std::vector<WP<IWaylandWindow>>   m_popups;
+ 
+       protected:
+-        virtual void onCallback();
+-        virtual void onScaleUpdate();
+-        virtual void configure(const Hyprutils::Math::Vector2D& size, uint32_t serial);
+-        virtual void resizeSwapchain(const Hyprutils::Math::Vector2D& pixelSize);
++        virtual void                            onCallback();
++        virtual void                            onScaleUpdate();
++        virtual void                            configure(const Hyprutils::Math::Vector2D& size, uint32_t serial);
++        virtual void                            resizeSwapchain(const Hyprutils::Math::Vector2D& pixelSize);
+ 
+-        void         prepareExplicit(SP<CWaylandBuffer>);
+-        void         submitExplicit(SP<CWaylandBuffer>);
++        void                                    prepareExplicit(SP<CWaylandBuffer>);
++        void                                    submitExplicit(SP<CWaylandBuffer>);
++        void                                    applyInputRegion();
++        std::optional<Hyprutils::Math::CRegion> m_inputRegion;
+ 
+-        float        m_fractionalScale = 1.0;
++        float                                   m_fractionalScale = 1.0;
+ 
+-        bool         m_open                  = false;
+-        bool         m_ignoreNextButtonEvent = false;
++        bool                                    m_open                  = false;
++        bool                                    m_ignoreNextButtonEvent = false;
++        SP<CCHyprlandFocusGrabV1>               m_focusGrab;
++        bool                                    m_focusGrabActive = false;
+ 
+         struct {
+             SP<CCWlSurface>                         surface;
+@@ -102,4 +113,4 @@ namespace Hyprtoolkit {
+         friend class CWaylandWindow;
+     };
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/src/window/ToolkitWindow.cpp b/src/window/ToolkitWindow.cpp
+index 5cf1527..18991f4 100644
+--- a/src/window/ToolkitWindow.cpp
++++ b/src/window/ToolkitWindow.cpp
+@@ -14,6 +14,26 @@
+ 
+ using namespace Hyprtoolkit;
+ 
++bool IWindow::repositionPopup(const Hyprutils::Math::Vector2D& position, const Hyprutils::Math::Vector2D& size) {
++    return false;
++}
++
++bool IWindow::setInputRegion(const std::optional<Hyprutils::Math::CRegion>& region) {
++    return false;
++}
++
++bool IWindow::grabFocus() {
++    return false;
++}
++
++void IWindow::releaseFocus() {
++    ;
++}
++
++bool IWindow::hasFocusGrab() {
++    return false;
++}
++
+ struct Hyprtoolkit::SToolkitWindowData {
+     void         lock(const Hyprutils::Math::Vector2D& coord = {});
+     void         unlock();
+@@ -178,6 +198,8 @@ void IToolkitWindow::updateFocus(const Hyprutils::Math::Vector2D& coords) {
+         return;
+     }
+ 
++    closeTooltip();
++
+     if (el) {
+         initElementIfNeeded(el);
+         m_mainHoverElement = makeShared<SToolkitFocusLock>(el, coords - el->impl->position.pos());
+@@ -199,17 +221,19 @@ void IToolkitWindow::updateFocus(const Hyprutils::Math::Vector2D& coords) {
+     if (m_pointerFn)
+         setCursor(m_pointerFn());
+ 
+-    if (m_mainHoverElement && m_mainHoverElement->m_el && m_mainHoverElement->m_el->impl->hasTooltip && !m_tooltip.hoverTooltipTimer) {
++    if (m_mainHoverElement && m_mainHoverElement->m_el && m_mainHoverElement->m_el->impl->hasTooltip) {
+         m_tooltip.hoverTooltipTimer = g_backend->addTimer(
+             std::chrono::milliseconds(1000),
+             [this, self = m_self](ASP<CTimer> s, void*) {
+-                if (!self || !m_mainHoverElement || !m_mainHoverElement->m_el || !m_mainHoverElement->m_el->impl->hasTooltip)
++                if (!self)
++                    return;
++                m_tooltip.hoverTooltipTimer.reset();
++                if (!m_mainHoverElement || !m_mainHoverElement->m_el || !m_mainHoverElement->m_el->impl->hasTooltip)
+                     return;
+                 openTooltip(m_mainHoverElement->m_el->impl->tooltip, m_mousePos);
+             },
+             nullptr);
+-    } else
+-        m_tooltip.hoverTooltipTimer.reset();
++    }
+ }
+ 
+ void IToolkitWindow::mouseEnter(const Hyprutils::Math::Vector2D& local) {
+@@ -228,12 +252,6 @@ void IToolkitWindow::mouseEnter(const Hyprutils::Math::Vector2D& local) {
+ void IToolkitWindow::mouseMove(const Hyprutils::Math::Vector2D& local) {
+     updateFocus(local);
+ 
+-    if (m_tooltip.tooltipPopup)
+-        closeTooltip();
+-
+-    if (m_tooltip.hoverTooltipTimer)
+-        m_tooltip.hoverTooltipTimer->updateTimeout(std::chrono::seconds(1));
+-
+     if (m_mainHoverElement && m_mainHoverElement->m_el)
+         m_mainHoverElement->m_el->impl->m_externalEvents.mouseMove.emit(local - m_mainHoverElement->m_el->impl->position.pos());
+ 
+@@ -248,16 +266,12 @@ void IToolkitWindow::mouseButton(const Input::eMouseButton button, bool state) {
+     m_mouseIsDown = state;
+ 
+     if (state) {
++        closeTooltip();
+         if (m_mainHoverElement && m_mainHoverElement->m_el && m_mainHoverElement->m_el->acceptsKeyboardInput() && m_keyboardFocus != m_mainHoverElement->m_el) {
+             // enter this element
+-            if (m_keyboardFocus)
+-                m_keyboardFocus->impl->m_externalEvents.keyboardLeave.emit();
+-            m_keyboardFocus = m_mainHoverElement->m_el;
+-            m_keyboardFocus->impl->m_externalEvents.keyboardEnter.emit();
++            setKeyboardFocus(m_mainHoverElement->m_el.lock());
+         } else if (!m_mainHoverElement || m_keyboardFocus != m_mainHoverElement->m_el) {
+-            if (m_keyboardFocus)
+-                m_keyboardFocus->impl->m_externalEvents.keyboardLeave.emit();
+-            m_keyboardFocus.reset();
++            unfocusKeyboard();
+         }
+     }
+ 
+@@ -272,6 +286,7 @@ void IToolkitWindow::mouseButton(const Input::eMouseButton button, bool state) {
+ }
+ 
+ void IToolkitWindow::mouseAxis(const Input::eAxisAxis axis, float delta) {
++    closeTooltip();
+ 
+     if (m_mainHoverElement && m_mainHoverElement->m_el)
+         m_mainHoverElement->m_el->impl->m_externalEvents.mouseAxis.emit(axis, delta);
+@@ -284,11 +299,17 @@ void IToolkitWindow::mouseAxis(const Input::eAxisAxis axis, float delta) {
+ }
+ 
+ void IToolkitWindow::mouseLeave() {
++    closeTooltip();
++    m_mouseIsDown = false;
++    m_pointerFn   = nullptr;
+     m_mainHoverElement.reset();
+     m_hoveredElements.clear();
+ }
+ 
+ void IToolkitWindow::keyboardKey(const Input::SKeyboardKeyEvent& ev) {
++    closeTooltip();
++    if (m_rootElement->impl->userFns.keyFilter && m_rootElement->impl->userFns.keyFilter(ev))
++        return;
+     m_events.keyboardKey.emit(ev);
+ 
+     if (!m_keyboardFocus)
+@@ -302,6 +323,7 @@ void IToolkitWindow::unfocusKeyboard() {
+         return;
+ 
+     m_keyboardFocus->impl->m_externalEvents.keyboardLeave.emit();
++    m_keyboardFocus->impl->damageEntire();
+     m_keyboardFocus.reset();
+ }
+ 
+@@ -311,14 +333,15 @@ void IToolkitWindow::setKeyboardFocus(SP<IElement> e) {
+ 
+     unfocusKeyboard();
+ 
+-    if (!e->acceptsKeyboardInput())
++    if (!e || !e->acceptsKeyboardInput())
+         return;
+ 
+     m_keyboardFocus = e;
+     e->impl->m_externalEvents.keyboardEnter.emit();
++    e->impl->damageEntire();
+ }
+ 
+-void IToolkitWindow::setIMTo(const Hyprutils::Math::CBox& box, const std::string& str, size_t cursor) {
++void IToolkitWindow::setIMTo(const STextInputState& state) {
+     ;
+ }
+ 
+@@ -336,7 +359,12 @@ void IToolkitWindow::openTooltip(const std::string& s, const Hyprutils::Math::Ve
+ 
+     constexpr const double MAX_TOOLTIP_WIDTH = 400;
+ 
+-    m_tooltip.text = CTextBuilder::begin()->color([] { return g_palette->m_colors.text; })->clampSize({MAX_TOOLTIP_WIDTH, -1.F})->text(std::string{s})->commence();
++    m_tooltip.text = CTextBuilder::begin()
++                         ->color([] { return g_palette->m_colors.text; })
++                         ->fontSize(CFontSize{CFontSize::HT_FONT_SMALL})
++                         ->clampSize({MAX_TOOLTIP_WIDTH, -1.F})
++                         ->text(std::string{s})
++                         ->commence();
+     m_tooltip.bg   = CRectangleBuilder::begin()
+                          ->color([] { return g_palette->m_colors.base; })
+                          ->borderThickness(1)
+@@ -344,27 +372,25 @@ void IToolkitWindow::openTooltip(const std::string& s, const Hyprutils::Math::Ve
+                          ->rounding(g_palette->m_vars.smallRounding)
+                          ->size({CDynamicSize::HT_SIZE_PERCENT, CDynamicSize::HT_SIZE_PERCENT, {1, 1}})
+                          ->commence();
+-    m_tooltip.bg->setReceivesMouse(true);
+-    m_tooltip.bg->setMouseLeave([self = m_self, this]() {
+-        if (!self)
+-            return;
+-
+-        closeTooltip();
+-    });
+-
+     m_tooltip.text->setPositionMode(IElement::HT_POSITION_ABSOLUTE);
+     m_tooltip.text->setPositionFlag(IElement::HT_POSITION_FLAG_CENTER, true);
+ 
+     m_tooltip.bg->addChild(m_tooltip.text);
+ 
+-    const auto EXPECTED_TEXT_SIZE = m_tooltip.text->preferredSize({0, 0}).value();
++    const auto          EXPECTED_TEXT_SIZE = m_tooltip.text->preferredSize({0, 0}).value();
+ 
+-    m_tooltip.tooltipPopup = reinterpretPointerCast<IToolkitWindow>(CWindowBuilder::begin()
+-                                                                        ->type(eWindowType::HT_WINDOW_POPUP)
+-                                                                        ->pos(pos)
+-                                                                        ->preferredSize(EXPECTED_TEXT_SIZE + Hyprutils::Math::Vector2D{30, 10})
+-                                                                        ->parent(m_self.lock())
+-                                                                        ->commence());
++    SWindowCreationData data;
++    data.type = HT_WINDOW_POPUP;
++    data.pos  = pos;
++    if (m_mainHoverElement && m_mainHoverElement->m_el) {
++        const auto& box = m_mainHoverElement->m_el->impl->position;
++        data.pos        = box.pos();
++        data.anchorSize = box.size();
++    }
++    data.preferredSize     = EXPECTED_TEXT_SIZE + Hyprutils::Math::Vector2D{20, 8};
++    data.parent            = m_self.lock();
++    data.passive           = true;
++    m_tooltip.tooltipPopup = reinterpretPointerCast<IToolkitWindow>(openPopup(data));
+ 
+     if (!m_tooltip.tooltipPopup) {
+         g_logger->log(HT_LOG_ERROR, "IToolkitWindow: couldn't open tooltip");
+@@ -372,14 +398,17 @@ void IToolkitWindow::openTooltip(const std::string& s, const Hyprutils::Math::Ve
+     }
+ 
+     m_tooltip.tooltipPopup->m_rootElement->addChild(m_tooltip.bg);
+-
++    m_tooltip.tooltipPopup->setInputRegion(Hyprutils::Math::CRegion{});
+     m_tooltip.tooltipPopup->open();
+ }
+ 
+ void IToolkitWindow::closeTooltip() {
+-    if (!m_tooltip.tooltipPopup)
+-        return;
+-
+-    m_tooltip.tooltipPopup->close();
+-    m_tooltip.tooltipPopup.reset();
++    if (m_tooltip.hoverTooltipTimer)
++        m_tooltip.hoverTooltipTimer->cancel();
++    m_tooltip.hoverTooltipTimer.reset();
++    const auto popup = std::exchange(m_tooltip.tooltipPopup, nullptr);
++    if (popup)
++        popup->close();
++    m_tooltip.bg.reset();
++    m_tooltip.text.reset();
+ }
+diff --git a/src/window/ToolkitWindow.hpp b/src/window/ToolkitWindow.hpp
+index a39c46d..e3f1a21 100644
+--- a/src/window/ToolkitWindow.hpp
++++ b/src/window/ToolkitWindow.hpp
+@@ -15,6 +15,7 @@ namespace Hyprtoolkit {
+     class CColumnLayoutElement;
+     class CTextElement;
+     class CTimer;
++    struct STextInputState;
+ 
+     struct SToolkitFocusLock {
+         SToolkitFocusLock(SP<IElement> e, const Hyprutils::Math::Vector2D& coord);
+@@ -56,7 +57,7 @@ namespace Hyprtoolkit {
+         virtual void                      updateFocus(const Hyprutils::Math::Vector2D& coords);
+         virtual void                      setCursor(ePointerShape shape) = 0;
+ 
+-        virtual void                      setIMTo(const Hyprutils::Math::CBox& box, const std::string& str, size_t cursor);
++        virtual void                      setIMTo(const STextInputState& state);
+         virtual void                      resetIM();
+ 
+         virtual void                      openTooltip(const std::string& s, const Hyprutils::Math::Vector2D& pos);
+@@ -71,9 +72,6 @@ namespace Hyprtoolkit {
+         Hyprutils::Math::Vector2D          m_mousePos;
+         bool                               m_mouseIsDown = false;
+ 
+-        std::string                        m_currentInput       = "";
+-        size_t                             m_currentInputCursor = 0;
+-
+         SP<SToolkitFocusLock>              m_mainHoverElement;
+         std::vector<SP<SToolkitFocusLock>> m_hoveredElements;
+         WP<IElement>                       m_keyboardFocus;
+diff --git a/src/window/WaylandLayer.cpp b/src/window/WaylandLayer.cpp
+index 9cd9ce4..d1341a1 100644
+--- a/src/window/WaylandLayer.cpp
++++ b/src/window/WaylandLayer.cpp
+@@ -40,34 +40,47 @@ void CWaylandLayer::open() {
+     m_rootElement->impl->window = m_self;
+     m_rootElement->impl->breadthfirst([this](SP<IElement> e) { e->impl->window = m_self; });
+ 
+-    if (!m_waylandState.surface) {
+-        m_waylandState.surface = makeShared<CCWlSurface>(g_waylandPlatform->m_waylandState.compositor->sendCreateSurface());
++    m_waylandState.surface = makeShared<CCWlSurface>(g_waylandPlatform->m_waylandState.compositor->sendCreateSurface());
+ 
+-        if (!m_waylandState.surface->resource()) {
+-            g_logger->log(HT_LOG_ERROR, "layer opening failed: no surface given. Errno: {}", errno);
++    if (!m_waylandState.surface->resource()) {
++        g_logger->log(HT_LOG_ERROR, "layer opening failed: no surface given. Errno: {}", errno);
++        return;
++    }
++
++    m_waylandState.surface->setEnter([this](CCWlSurface*, wl_proxy* resource) {
++        for (const auto& output : g_waylandPlatform->m_outputs) {
++            if (output->m_wlOutput->resource() != resource)
++                continue;
++            m_layerState.output        = output;
++            m_layerState.outputChanged = output->m_events.changed.listen([this] {
++                // Hyprland advertises a mapped layer's preferred scale when it commits a frame.
++                damageEntire();
++            });
+             return;
+         }
++    });
++    m_waylandState.surface->setLeave([this](CCWlSurface*, wl_proxy* resource) {
++        if (m_layerState.output && m_layerState.output->m_wlOutput->resource() == resource) {
++            m_layerState.outputChanged.reset();
++            m_layerState.output.reset();
++        }
++    });
+ 
+-        auto inputRegion = makeShared<CCWlRegion>(g_waylandPlatform->m_waylandState.compositor->sendCreateRegion());
+-        inputRegion->sendAdd(0, 0, INT32_MAX, INT32_MAX);
++    applyInputRegion();
+ 
+-        m_waylandState.surface->sendSetInputRegion(inputRegion.get());
++    m_waylandState.fractional = makeShared<CCWpFractionalScaleV1>(g_waylandPlatform->m_waylandState.fractional->sendGetFractionalScale(m_waylandState.surface->resource()));
+ 
+-        m_waylandState.fractional = makeShared<CCWpFractionalScaleV1>(g_waylandPlatform->m_waylandState.fractional->sendGetFractionalScale(m_waylandState.surface->resource()));
++    m_waylandState.fractional->setPreferredScale([this](CCWpFractionalScaleV1*, uint32_t scale) {
++        const bool SAMESCALE = m_fractionalScale == scale / 120.0;
++        m_fractionalScale    = scale / 120.0;
+ 
+-        m_waylandState.fractional->setPreferredScale([this](CCWpFractionalScaleV1*, uint32_t scale) {
+-            const bool SAMESCALE = m_fractionalScale == scale / 120.0;
+-            m_fractionalScale    = scale / 120.0;
++        g_logger->log(HT_LOG_DEBUG, "layer: got fractional scale: {:.1f}%", m_fractionalScale * 100.F);
+ 
+-            g_logger->log(HT_LOG_DEBUG, "layer: got fractional scale: {:.1f}%", m_fractionalScale * 100.F);
++        if (!SAMESCALE && m_layerState.configured)
++            onScaleUpdate();
++    });
+ 
+-            if (!SAMESCALE && m_layerState.configured)
+-                onScaleUpdate();
+-        });
+-
+-        m_waylandState.viewport = makeShared<CCWpViewport>(g_waylandPlatform->m_waylandState.viewporter->sendGetViewport(m_waylandState.surface->resource()));
+-    } else
+-        m_waylandState.surface->sendAttach(nullptr, 0, 0);
++    m_waylandState.viewport = makeShared<CCWpViewport>(g_waylandPlatform->m_waylandState.viewporter->sendGetViewport(m_waylandState.surface->resource()));
+ 
+     wl_proxy* outputProxy = nullptr;
+     if (m_creationData.prefferedOutputId) {
+@@ -95,24 +108,17 @@ void CWaylandLayer::open() {
+ 
+     m_layerState.layerSurface->setConfigure([this](CCZwlrLayerSurfaceV1* r, uint32_t serial, uint32_t w, uint32_t h) {
+         g_logger->log(HT_LOG_DEBUG, "wayland: configure layer with {}x{}", w, h);
++        r->sendAckConfigure(serial);
+         m_layerState.configured = true;
+-        if (w == 0 || h == 0) {
+-            if (m_creationData.preferredSize) {
+-                w = m_creationData.preferredSize->x;
+-                h = m_creationData.preferredSize->y;
+-            } else {
+-                g_logger->log(HT_LOG_DEBUG, "configure: w/h is 0, sending default hardcoded 1280x720");
+-                w = 1280;
+-                h = 720;
+-            }
+-        }
++        if (w == 0)
++            w = m_creationData.preferredSize->x;
++        if (h == 0)
++            h = m_creationData.preferredSize->y;
+ 
+         if (m_waylandState.logicalSize == Vector2D{sc<float>(w), sc<float>(h)})
+             return;
+ 
+-        m_layerState.layerSurface->sendAckConfigure(serial);
+-
+-        configure(Vector2D{sc<float>(w), sc<float>(h)}, m_waylandState.serial);
++        configure(Vector2D{sc<float>(w), sc<float>(h)}, serial);
+ 
+         m_events.resized.emit(m_waylandState.logicalSize);
+     });
+@@ -124,16 +130,19 @@ void CWaylandLayer::open() {
+ }
+ 
+ void CWaylandLayer::close() {
++    releaseFocus();
+     if (!m_open)
+         return;
+ 
+-    m_open = false;
++    const auto keepAlive = m_self.lock();
++    m_open               = false;
++    unfocusKeyboard();
++    closePopups();
+ 
+     m_waylandState.frameCallback.reset();
+ 
+-    m_layerState.layerSurface.reset();
+-    m_waylandState.logicalSize = {};
+-    m_layerState.configured    = false;
++    m_layerState   = {};
++    m_waylandState = {};
+ }
+ 
+ void CWaylandLayer::render() {
+diff --git a/src/window/WaylandLayer.hpp b/src/window/WaylandLayer.hpp
+index a3b8816..fba03e0 100644
+--- a/src/window/WaylandLayer.hpp
++++ b/src/window/WaylandLayer.hpp
+@@ -3,8 +3,10 @@
+ #include "IWaylandWindow.hpp"
+ #include <wlr-layer-shell-unstable-v1.hpp>
+ #include <hyprutils/math/Vector2D.hpp>
++#include <hyprutils/signal/Listener.hpp>
+ 
+ namespace Hyprtoolkit {
++    class CWaylandOutput;
+ 
+     class CWaylandLayer : public IWaylandWindow {
+       public:
+@@ -20,8 +22,10 @@ namespace Hyprtoolkit {
+         SWindowCreationData m_creationData;
+ 
+         struct {
+-            SP<CCZwlrLayerSurfaceV1> layerSurface;
+-            bool                     configured = false;
++            SP<CCZwlrLayerSurfaceV1>               layerSurface;
++            WP<CWaylandOutput>                     output;
++            Hyprutils::Signal::CHyprSignalListener outputChanged;
++            bool                                   configured = false;
+         } m_layerState;
+ 
+         friend class CWaylandPlatform;
+diff --git a/src/window/WaylandLockSurface.cpp b/src/window/WaylandLockSurface.cpp
+index 9180576..99730b2 100644
+--- a/src/window/WaylandLockSurface.cpp
++++ b/src/window/WaylandLockSurface.cpp
+@@ -59,11 +59,6 @@ void CWaylandLockSurface::open() {
+             return;
+         }
+ 
+-        auto inputRegion = makeShared<CCWlRegion>(g_waylandPlatform->m_waylandState.compositor->sendCreateRegion());
+-        inputRegion->sendAdd(0, 0, INT32_MAX, INT32_MAX);
+-
+-        m_waylandState.surface->sendSetInputRegion(inputRegion.get());
+-
+         m_waylandState.fractional = makeShared<CCWpFractionalScaleV1>(g_waylandPlatform->m_waylandState.fractional->sendGetFractionalScale(m_waylandState.surface->resource()));
+ 
+         m_waylandState.fractional->setPreferredScale([this](CCWpFractionalScaleV1*, uint32_t scale) {
+@@ -80,6 +75,7 @@ void CWaylandLockSurface::open() {
+     } else
+         m_waylandState.surface->sendAttach(nullptr, 0, 0);
+ 
++    applyInputRegion();
+     m_lockSurfaceState.lockSurface = makeShared<CCExtSessionLockSurfaceV1>(lockObject->sendGetLockSurface(m_waylandState.surface->resource(), wlOutput->m_wlOutput->resource()));
+     if (!m_lockSurfaceState.lockSurface->resource()) {
+         g_logger->log(HT_LOG_ERROR, "lock surface opening failed: no lock surface. Errno: {}", errno);
+@@ -107,10 +103,12 @@ void CWaylandLockSurface::open() {
+ }
+ 
+ void CWaylandLockSurface::close() {
++    releaseFocus();
+     if (!m_open)
+         return;
+ 
+     m_open = false;
++    unfocusKeyboard();
+ 
+     m_waylandState.frameCallback.reset();
+ 
+diff --git a/src/window/WaylandPopup.cpp b/src/window/WaylandPopup.cpp
+index 74fd7fe..8c61326 100644
+--- a/src/window/WaylandPopup.cpp
++++ b/src/window/WaylandPopup.cpp
+@@ -1,6 +1,8 @@
+ #include "WaylandPopup.hpp"
+ #include "WaylandWindow.hpp"
+ #include "WaylandLayer.hpp"
++#include <algorithm>
++#include <cmath>
+ 
+ #include <hyprtoolkit/element/Null.hpp>
+ 
+@@ -25,15 +27,22 @@ CWaylandPopup::~CWaylandPopup() {
+ }
+ 
+ void CWaylandPopup::open() {
+-    if (m_open)
++    if (m_open || !m_parent || !m_parent->m_open)
+         return;
+ 
++    std::erase_if(m_parent->m_popups, [](const auto& popup) { return !popup; });
++    if (std::ranges::any_of(m_parent->m_popups, [this](const auto& popup) { return popup.get() != this; }))
++        return;
++    if (m_parent->m_popups.empty())
++        m_parent->m_popups.emplace_back(reinterpretPointerCast<IWaylandWindow>(m_self.lock()));
++
+     m_rootElement->impl->window = m_self;
+     m_rootElement->impl->breadthfirst([this](SP<IElement> e) { e->impl->window = m_self; });
+ 
+     m_open = true;
+ 
+-    m_parent->updateFocus(Vector2D{-100000, -100000});
++    if (!m_creationData.passive)
++        m_parent->mouseLeave();
+ 
+     m_waylandState.surface = makeShared<CCWlSurface>(g_waylandPlatform->m_waylandState.compositor->sendCreateSurface());
+ 
+@@ -53,16 +62,22 @@ void CWaylandPopup::open() {
+         g_logger->log(HT_LOG_DEBUG, "wayland window: configure surface with {}", serial);
+         r->sendAckConfigure(serial);
+         m_waylandState.serial = serial;
++        if (m_wlPopupState.pendingSize != m_waylandState.logicalSize) {
++            configure(m_wlPopupState.pendingSize, serial);
++            m_events.resized.emit(m_waylandState.logicalSize);
++        }
+     });
+ 
+     m_wlPopupState.xdgPositioner = makeShared<CCXdgPositioner>(g_waylandPlatform->m_waylandState.xdg->sendCreatePositioner());
+ 
+-    m_wlPopupState.xdgPositioner->sendSetAnchorRect(m_creationData.pos.x, m_creationData.pos.y, 1, 1);
+-    m_wlPopupState.xdgPositioner->sendSetAnchor(XDG_POSITIONER_ANCHOR_TOP_LEFT);
+-    m_wlPopupState.xdgPositioner->sendSetGravity(XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
++    m_wlPopupState.xdgPositioner->sendSetAnchorRect(m_creationData.pos.x, m_creationData.pos.y, m_creationData.anchorSize.x, m_creationData.anchorSize.y);
++    m_wlPopupState.xdgPositioner->sendSetAnchor(m_creationData.passive ? XDG_POSITIONER_ANCHOR_BOTTOM : XDG_POSITIONER_ANCHOR_TOP_LEFT);
++    m_wlPopupState.xdgPositioner->sendSetGravity(m_creationData.passive ? XDG_POSITIONER_GRAVITY_BOTTOM : XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+     m_wlPopupState.xdgPositioner->sendSetSize(m_creationData.preferredSize.value_or(Vector2D{200, 200}).x, m_creationData.preferredSize.value_or(Vector2D{200, 200}).y);
+-    m_wlPopupState.xdgPositioner->sendSetConstraintAdjustment(
+-        (xdgPositionerConstraintAdjustment)(XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X));
++    uint32_t constraints = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X;
++    if (m_creationData.passive)
++        constraints |= XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y;
++    m_wlPopupState.xdgPositioner->sendSetConstraintAdjustment(sc<xdgPositionerConstraintAdjustment>(constraints));
+ 
+     m_wlPopupState.xdgPopup = makeShared<CCXdgPopup>(m_waylandState.xdgSurface->sendGetPopup(m_parent->m_waylandState.xdgSurface.get(), m_wlPopupState.xdgPositioner.get()));
+ 
+@@ -77,21 +92,18 @@ void CWaylandPopup::open() {
+     m_wlPopupState.xdgPopup->setConfigure([this](CCXdgPopup* r, int32_t x, int32_t y, int32_t w, int32_t h) {
+         g_logger->log(HT_LOG_DEBUG, "wayland: configure toplevel with {}x{}", w, h);
+ 
+-        if (!m_wlPopupState.grabbed) {
+-            m_wlPopupState.grabbed = true;
+-            m_wlPopupState.xdgPopup->sendGrab(g_waylandPlatform->m_waylandState.seat->resource(), g_waylandPlatform->m_lastEnterSerial);
+-        }
+-
+-        if (m_waylandState.logicalSize == Vector2D{w, h})
+-            return;
+-
+-        configure({w, h}, m_waylandState.serial);
+-
+-        m_events.resized.emit(m_waylandState.logicalSize);
++        m_wlPopupState.pendingSize = {w, h};
+     });
+ 
+     m_wlPopupState.xdgPopup->setPopupDone([this](CCXdgPopup* r) { close(); });
+ 
++    // xdg_popup.grab must precede the initial commit; popup parents must already hold a grab.
++    const auto POPUP_PARENT = dynamicPointerCast<CWaylandPopup>(m_parent.lock());
++    if (!m_creationData.passive && g_waylandPlatform->m_lastInputSerial && (!POPUP_PARENT || POPUP_PARENT->m_wlPopupState.grabbed)) {
++        m_wlPopupState.xdgPopup->sendGrab(g_waylandPlatform->m_waylandState.seat->resource(), *g_waylandPlatform->m_lastInputSerial);
++        m_wlPopupState.grabbed = true;
++    }
++
+     m_waylandState.fractional = makeShared<CCWpFractionalScaleV1>(g_waylandPlatform->m_waylandState.fractional->sendGetFractionalScale(m_waylandState.surface->resource()));
+ 
+     m_waylandState.fractional->setPreferredScale([this](CCWpFractionalScaleV1*, uint32_t scale) {
+@@ -106,27 +118,23 @@ void CWaylandPopup::open() {
+ 
+     m_waylandState.viewport = makeShared<CCWpViewport>(g_waylandPlatform->m_waylandState.viewporter->sendGetViewport(m_waylandState.surface->resource()));
+ 
+-    auto inputRegion = makeShared<CCWlRegion>(g_waylandPlatform->m_waylandState.compositor->sendCreateRegion());
+-    inputRegion->sendAdd(0, 0, INT32_MAX, INT32_MAX);
+-
+-    m_waylandState.surface->sendSetInputRegion(inputRegion.get());
++    applyInputRegion();
+     m_waylandState.surface->sendAttach(nullptr, 0, 0);
+     m_waylandState.surface->sendCommit();
+-
+-    inputRegion->sendDestroy();
+ }
+ 
+ void CWaylandPopup::close() {
+-    if (g_waylandPlatform->m_currentWindow == m_self)
+-        g_waylandPlatform->m_currentWindow = m_parent;
+-
+-    if (m_parent)
+-        std::erase(m_parent->m_popups, m_self);
+-
++    releaseFocus();
+     if (!m_open)
+         return;
+ 
+-    m_open = false;
++    const auto keepAlive = m_self.lock();
++    m_open               = false;
++    unfocusKeyboard();
++    closePopups();
++
++    if (m_parent)
++        std::erase(m_parent->m_popups, m_self);
+ 
+     m_waylandState.frameCallback.reset();
+ 
+@@ -137,13 +145,23 @@ void CWaylandPopup::close() {
+     if (m_waylandState.surface)
+         m_waylandState.surface->sendDestroy();
+ 
++    m_wlPopupState = {};
+     m_waylandState = {};
+ 
+     m_events.popupClosed.emit();
+ }
+ 
+-SP<IWindow> CWaylandPopup::openPopup(const SWindowCreationData& data) {
+-    // nested popups (popup-on-popup) are not implemented
+-    g_logger->log(HT_LOG_WARNING, "CWaylandPopup::openPopup: nested popups are not supported");
+-    return nullptr;
++bool CWaylandPopup::repositionPopup(const Vector2D& position, const Vector2D& size) {
++    if (!m_open || !m_parent || !m_wlPopupState.xdgPopup || m_wlPopupState.xdgPopup->version() < 3)
++        return false;
++    const auto parentSize = m_parent->m_waylandState.logicalSize;
++    if (!std::isfinite(position.x) || !std::isfinite(position.y) || position.x < 0 || position.y < 0 || position.x >= parentSize.x || position.y >= parentSize.y ||
++        !std::isfinite(size.x) || !std::isfinite(size.y) || size.x < 1 || size.y < 1 || size.x > 16384 || size.y > 16384)
++        return false;
++    m_creationData.pos           = position;
++    m_creationData.preferredSize = size;
++    m_wlPopupState.xdgPositioner->sendSetAnchorRect(position.x, position.y, 1, 1);
++    m_wlPopupState.xdgPositioner->sendSetSize(size.x, size.y);
++    m_wlPopupState.xdgPopup->sendReposition(m_wlPopupState.xdgPositioner.get(), ++m_wlPopupState.token);
++    return true;
+ }
+diff --git a/src/window/WaylandPopup.hpp b/src/window/WaylandPopup.hpp
+index d5f808f..672e33c 100644
+--- a/src/window/WaylandPopup.hpp
++++ b/src/window/WaylandPopup.hpp
+@@ -6,24 +6,25 @@ namespace Hyprtoolkit {
+ 
+     class CWaylandWindow;
+ 
+-    // TODO: de-dup this shit
+     class CWaylandPopup : public IWaylandWindow {
+       public:
+         CWaylandPopup(const SWindowCreationData& data, SP<IWaylandWindow> parent);
+         virtual ~CWaylandPopup();
+ 
+-        virtual void                                       close();
+-        virtual void                                       open();
+-        virtual Hyprutils::Memory::CSharedPointer<IWindow> openPopup(const SWindowCreationData& data);
++        virtual void close();
++        virtual void open();
++        bool         repositionPopup(const Hyprutils::Math::Vector2D& position, const Hyprutils::Math::Vector2D& size) override;
+ 
+       private:
+         WP<IWaylandWindow>  m_parent;
+         SWindowCreationData m_creationData;
+ 
+         struct {
+-            SP<CCXdgPositioner> xdgPositioner;
+-            SP<CCXdgPopup>      xdgPopup;
+-            bool                grabbed = false;
++            SP<CCXdgPositioner>       xdgPositioner;
++            SP<CCXdgPopup>            xdgPopup;
++            bool                      grabbed = false;
++            uint32_t                  token   = 0;
++            Hyprutils::Math::Vector2D pendingSize;
+         } m_wlPopupState;
+ 
+         friend class CWaylandPlatform;
+diff --git a/src/window/WaylandWindow.cpp b/src/window/WaylandWindow.cpp
+index b1a0365..a335cc1 100644
+--- a/src/window/WaylandWindow.cpp
++++ b/src/window/WaylandWindow.cpp
+@@ -145,14 +145,9 @@ void CWaylandWindow::open() {
+     if (m_creationData.maxSize)
+         m_waylandState.xdgToplevel->sendSetMaxSize(m_creationData.maxSize->x, m_creationData.maxSize->y);
+ 
+-    auto inputRegion = makeShared<CCWlRegion>(g_waylandPlatform->m_waylandState.compositor->sendCreateRegion());
+-    inputRegion->sendAdd(0, 0, INT32_MAX, INT32_MAX);
+-
+-    m_waylandState.surface->sendSetInputRegion(inputRegion.get());
++    applyInputRegion();
+     m_waylandState.surface->sendAttach(nullptr, 0, 0);
+     m_waylandState.surface->sendCommit();
+-
+-    inputRegion->sendDestroy();
+ }
+ 
+ void CWaylandWindow::deferCloseRequest() {
+@@ -177,10 +172,14 @@ void CWaylandWindow::deferCloseRequest() {
+ }
+ 
+ void CWaylandWindow::close() {
++    releaseFocus();
+     if (!m_open)
+         return;
+ 
+-    m_open = false;
++    const auto keepAlive = m_self.lock();
++    m_open               = false;
++    unfocusKeyboard();
++    closePopups();
+ 
+     m_waylandState.frameCallback.reset();
+ 
+diff --git a/src/window/Window.hpp b/src/window/Window.hpp
+index 74cd9ca..6d14995 100644
+--- a/src/window/Window.hpp
++++ b/src/window/Window.hpp
+@@ -20,7 +20,9 @@ namespace Hyprtoolkit {
+ 
+         // popups
+         Hyprutils::Math::Vector2D pos;
++        Hyprutils::Math::Vector2D anchorSize{1, 1};
+         SP<IWindow>               parent;
++        bool                      passive = false;
+ 
+         // layers
+         uint32_t                  layer         = 0;

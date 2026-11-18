@@ -1,0 +1,1437 @@
+diff --git c/include/hyprgraphics/resource/AsyncResourceGatherer.hpp i/include/hyprgraphics/resource/AsyncResourceGatherer.hpp
+index 922aa93919cd664e0c242ff691affe70c1d02338..89681cd7c6c85678c7e741f84288bde162fe27ea 100644
+--- c/include/hyprgraphics/resource/AsyncResourceGatherer.hpp
++++ i/include/hyprgraphics/resource/AsyncResourceGatherer.hpp
+@@ -1,13 +1,14 @@
+ #pragma once
+ 
+ #include <thread>
+-#include <atomic>
+ #include <vector>
+-#include <unordered_map>
+ #include <condition_variable>
+-#include "../cairo/CairoSurface.hpp"
++#include <expected>
++#include <functional>
++#include <mutex>
+ #include "./resources/AsyncResource.hpp"
+ #include <hyprutils/memory/Atomic.hpp>
++#include <hyprutils/os/FileDescriptor.hpp>
+ 
+ namespace Hyprgraphics {
+     class CAsyncResourceGatherer {
+@@ -15,27 +16,31 @@ namespace Hyprgraphics {
+         CAsyncResourceGatherer();
+         ~CAsyncResourceGatherer();
+ 
+-        void enqueue(Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> resource);
++        // Enqueue, cancel, dispatch and stop belong to the host event-loop thread.
++        // Capacity includes completed resources awaiting dispatch.
++        static constexpr size_t          CAPACITY = 64;
++        std::expected<void, std::string> enqueue(Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> resource, std::function<void()> completed = {});
++        void                             cancel(const Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource>& resource);
++        int                              fd() const;
++        void                             dispatch();
++        void                             stop();
+ 
+         // Synchronously await the resource being available
+         void await(Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> resource);
+ 
+       private:
+-        std::thread m_gatherThread;
+-
+-        struct {
+-            std::mutex              requestMutex;
+-            std::condition_variable requestsCV;
+-
+-            bool                    exit           = false;
+-            bool                    needsToProcess = false;
+-        } m_asyncLoopState;
+-
+-        std::vector<Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource>> m_targetsToLoad;
+-        std::mutex                                                           m_targetsToLoadMutex;
+-
+-        //
+-        void asyncAssetSpinLock();
+-        void wakeUpMainThread();
++        struct SRequest {
++            Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> resource;
++            std::function<void()>                                   completed;
++            bool                                                    started = false, done = false;
++        };
++        Hyprutils::OS::CFileDescriptor                          m_fd;
++        std::mutex                                              m_mutex;
++        std::condition_variable                                 m_wake;
++        std::vector<SRequest>                                   m_requests;
++        Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> m_running;
++        bool                                                    m_stopping = false;
++        std::thread                                             m_thread;
++        void                                                    run();
+     };
+ }
+diff --git c/include/hyprgraphics/resource/resources/AsyncResource.hpp i/include/hyprgraphics/resource/resources/AsyncResource.hpp
+index c1aa04ab7c8aa1711d1a68406d3a5c948e8bb49b..3bdfee53f0e40ecac5b5fbdd13e95aba87d60ee1 100644
+--- c/include/hyprgraphics/resource/resources/AsyncResource.hpp
++++ i/include/hyprgraphics/resource/resources/AsyncResource.hpp
+@@ -1,14 +1,11 @@
+ #pragma once
+ 
+-#include <hyprutils/memory/UniquePtr.hpp>
+ #include <hyprutils/math/Vector2D.hpp>
+-#include <hyprutils/signal/Signal.hpp>
++#include <hyprutils/memory/SharedPtr.hpp>
+ #include "../../cairo/CairoSurface.hpp"
+ #include <atomic>
+ 
+ namespace Hyprgraphics {
+-    struct SAsyncResourceImpl;
+-
+     class IAsyncResource {
+       public:
+         IAsyncResource();
+@@ -16,22 +13,18 @@ namespace Hyprgraphics {
+ 
+         virtual void render() = 0;
+ 
+-        struct {
+-            // this signal fires on the worker thread. **Really** consider making this signal handler call something to wake your
+-            // main event loop up and do things there.
+-            Hyprutils::Signal::CSignalT<> finished;
+-        } m_events;
+-
+-        // you probably shouldn't use this but it's here just in case.
+-        std::atomic<bool> m_ready = false;
++        // Asset and error are published by the release store to m_ready.
++        std::atomic<bool> m_ready     = false;
++        std::atomic<bool> m_cancelled = false;
++        std::string       m_error;
+ 
+         struct {
+-            // This pointer can be made not thread safe as after .finished the worker thread will not touch it anymore
+-            // and before that you shouldnt touch it either
+             Hyprutils::Memory::CSharedPointer<CCairoSurface> cairoSurface;
+             Hyprutils::Math::Vector2D                        pixelSize;
+         } m_asset;
+ 
+-        Hyprutils::Memory::CUniquePointer<SAsyncResourceImpl> m_impl;
++      private:
++        std::atomic<bool> m_submitted = false;
++        friend class CAsyncResourceGatherer;
+     };
+ }
+diff --git c/include/hyprgraphics/resource/resources/ImageResource.hpp i/include/hyprgraphics/resource/resources/ImageResource.hpp
+index 0638ae2d4b9b7983dbd9da04d789630e11ecca5a..2fcefeec0f08a5f9b791d0e478ad3716d557e751 100644
+--- c/include/hyprgraphics/resource/resources/ImageResource.hpp
++++ i/include/hyprgraphics/resource/resources/ImageResource.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <string>
+ #include <span>
++#include <vector>
+ #include <hyprutils/math/Vector2D.hpp>
+ #include "./AsyncResource.hpp"
+ #include "../../color/Color.hpp"
+@@ -28,6 +29,6 @@ namespace Hyprgraphics {
+       private:
+         std::string               m_path;
+         Hyprutils::Math::Vector2D m_svgSize;
+-        std::span<const uint8_t>  m_data;
++        std::vector<uint8_t>      m_data;
+     };
+ };
+diff --git c/src/image/Image.cpp i/src/image/Image.cpp
+index 8709d1e40a9027067eb333cede0e1da6a35e9000..49446d8c4f8ac3ec6ea592da6f44e716f297143a 100644
+--- c/src/image/Image.cpp
++++ i/src/image/Image.cpp
+@@ -19,6 +19,10 @@ using namespace Hyprutils::Memory;
+ using namespace Hyprutils::Math;
+ 
+ Hyprgraphics::CImage::CImage(std::span<const uint8_t> data, eImageFormat format, const Vector2D& size) {
++    if (data.empty() || data.size() > MAX_IMAGE_BYTES) {
++        lastError = "image exceeds 64 MiB or is empty";
++        return;
++    }
+ 
+     const auto FORMAT = format == IMAGE_FORMAT_AUTO ? formatFromStream(data) : format;
+ 
+@@ -47,6 +51,7 @@ Hyprgraphics::CImage::CImage(std::span<const uint8_t> data, eImageFormat format,
+ 
+     if (const auto STATUS = cairo_surface_status(*CAIROSURFACE); STATUS != CAIRO_STATUS_SUCCESS) {
+         lastError = std::format("Could not create surface: {}", cairo_status_to_string(STATUS));
++        cairo_surface_destroy(*CAIROSURFACE);
+         return;
+     }
+ 
+@@ -93,6 +98,7 @@ Hyprgraphics::CImage::CImage(const std::string& path, const Vector2D& size) : fi
+ 
+     if (const auto STATUS = cairo_surface_status(*CAIROSURFACE); STATUS != CAIRO_STATUS_SUCCESS) {
+         lastError = std::format("Could not create surface: {}", cairo_status_to_string(STATUS));
++        cairo_surface_destroy(*CAIROSURFACE);
+         return;
+     }
+ 
+diff --git c/src/image/formats/Avif.cpp i/src/image/formats/Avif.cpp
+index f7be95eebb41156be31142f53a47e5230830039f..1cb52a8ae66bf8cbf912d33bc3fcfcdd1ecefeef 100644
+--- c/src/image/formats/Avif.cpp
++++ i/src/image/formats/Avif.cpp
+@@ -1,92 +1,56 @@
+ #include "Avif.hpp"
+-#include <cairo.h>
+-#include <cstdint>
+-#include <cstring>
+-#include <expected>
+-#include <filesystem>
+-#include <hyprutils/utils/ScopeGuard.hpp>
++#include "../utils/Format.hpp"
+ #include <libheif/heif.h>
+-#include <vector>
++#include <hyprutils/utils/ScopeGuard.hpp>
++
+ using namespace Hyprutils::Utils;
+ 
+-static std::expected<cairo_surface_t*, std::string> loadFromContext(heif_context* ctx) {
+-    heif_image_handle* handle;
+-    heif_context_get_primary_image_handle(ctx, &handle);
++std::expected<cairo_surface_t*, std::string> AVIF::createSurfaceFromAvif(const std::string& path) {
++    const auto bytes = Hyprgraphics::readImageFile(path);
++    if (!bytes)
++        return std::unexpected(bytes.error());
++    return createSurfaceFromAvif(*bytes);
++}
+ 
+-    heif_image*       img;
+-    struct heif_error err = heif_decode_image(handle, &img, heif_colorspace_RGB, heif_chroma_interleaved_RGBA, nullptr);
+-
+-    if (err.code != heif_error_Ok)
+-        return std::unexpected("loading avif: failed to decode image");
+-
+-    size_t width  = heif_image_get_width(img, heif_channel_interleaved);
+-    size_t height = heif_image_get_height(img, heif_channel_interleaved);
+-
+-    if (width == static_cast<size_t>(-1) || height == static_cast<size_t>(-1))
+-        return std::unexpected("loading avif: failed to get width or height");
+-
+-    int            stride;
+-    const uint8_t* data = heif_image_get_plane_readonly(img, heif_channel_interleaved, &stride);
+-
+-    if (!data)
+-        return std::unexpected("loading avif: get_plane_readonly failed");
+-
+-    std::vector<uint8_t> rawData;
+-    rawData.resize(width * height * 4);
+-
+-    for (size_t y = 0; y < height; y++) {
+-        const uint8_t* src = data + (y * stride);
+-        uint32_t*      dst = (uint32_t*)(rawData.data() + (y * width * 4));
+-        for (size_t x = 0; x < width; x++) {
+-            uint8_t r = src[(4 * x) + 0];
+-            uint8_t g = src[(4 * x) + 1];
+-            uint8_t b = src[(4 * x) + 2];
+-            uint8_t a = src[(4 * x) + 3];
+-
+-            r = (r * a) / 255.F;
+-            g = (g * a) / 255.F;
+-            b = (b * a) / 255.F;
+-
+-            dst[x] = (a << 24) | (r << 16) | (g << 8) | b;
++std::expected<cairo_surface_t*, std::string> AVIF::createSurfaceFromAvif(std::span<const uint8_t> bytes) {
++    auto* context = heif_context_alloc();
++    if (!context)
++        return std::unexpected("loading avif: allocation failed");
++    CScopeGuard freeContext([&] { heif_context_free(context); });
++    if (heif_context_read_from_memory_without_copy(context, bytes.data(), bytes.size(), nullptr).code != heif_error_Ok)
++        return std::unexpected("loading avif: invalid image");
++    heif_image_handle* handle = nullptr;
++    if (heif_context_get_primary_image_handle(context, &handle).code != heif_error_Ok)
++        return std::unexpected("loading avif: missing primary image");
++    CScopeGuard freeHandle([&] { heif_image_handle_release(handle); });
++    if (!Hyprgraphics::validImageSize(heif_image_handle_get_width(handle), heif_image_handle_get_height(handle)))
++        return std::unexpected("loading avif: image dimensions exceed limits");
++    heif_image* image = nullptr;
++    if (heif_decode_image(handle, &image, heif_colorspace_RGB, heif_chroma_interleaved_RGBA, nullptr).code != heif_error_Ok)
++        return std::unexpected("loading avif: decoding failed");
++    CScopeGuard freeImage([&] { heif_image_release(image); });
++    const int   width = heif_image_get_width(image, heif_channel_interleaved), height = heif_image_get_height(image, heif_channel_interleaved);
++    if (!Hyprgraphics::validImageSize(width, height))
++        return std::unexpected("loading avif: invalid decoded dimensions");
++    int         sourceStride = 0;
++    const auto* source       = heif_image_get_plane_readonly(image, heif_channel_interleaved, &sourceStride);
++    if (!source)
++        return std::unexpected("loading avif: missing pixel plane");
++    auto surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
++    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
++        cairo_surface_destroy(surface);
++        return std::unexpected("loading avif: cairo failed");
++    }
++    auto*     pixels = cairo_image_surface_get_data(surface);
++    const int stride = cairo_image_surface_get_stride(surface);
++    for (int y = 0; y < height; ++y) {
++        auto*       row = reinterpret_cast<uint32_t*>(pixels + size_t(y) * stride);
++        const auto* src = source + size_t(y) * sourceStride;
++        for (int x = 0; x < width; ++x) {
++            const uint32_t alpha = src[x * 4 + 3];
++            row[x] = (alpha << 24) | (((src[x * 4] * alpha + 127) / 255) << 16) | (((src[x * 4 + 1] * alpha + 127) / 255) << 8) | ((src[x * 4 + 2] * alpha + 127) / 255);
+         }
+     }
+-
+-    auto CAIROSURFACE = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+-    if (!CAIROSURFACE)
+-        return std::unexpected("loading avif: cairo failed");
+-
+-    memcpy(cairo_image_surface_get_data(CAIROSURFACE), rawData.data(), rawData.size());
+-    cairo_surface_mark_dirty(CAIROSURFACE);
+-
+-    heif_image_release(img);
+-    heif_image_handle_release(handle);
+-    return CAIROSURFACE;
+-}
+-
+-std::expected<cairo_surface_t*, std::string> AVIF::createSurfaceFromAvif(const std::string& path) {
+-    if (!std::filesystem::exists(path))
+-        return std::unexpected("loading avif: file doesn't exist");
+-
+-    heif_context*     ctx = heif_context_alloc();
+-    struct heif_error err = heif_context_read_from_file(ctx, path.c_str(), nullptr);
+-
+-    if (err.code != heif_error_Ok)
+-        return std::unexpected("loading avif: failed to load from file");
+-
+-    auto result = loadFromContext(ctx);
+-    heif_context_free(ctx);
+-
+-    return result;
+-}
+-std::expected<cairo_surface_t*, std::string> AVIF::createSurfaceFromAvif(const std::span<const uint8_t> buf) {
+-    heif_context*     ctx = heif_context_alloc();
+-    struct heif_error err = heif_context_read_from_memory(ctx, buf.data(), buf.size(), nullptr);
+-
+-    if (err.code != heif_error_Ok)
+-        return std::unexpected("loading avif: failed to load from memory");
+-
+-    auto result = loadFromContext(ctx);
+-    heif_context_free(ctx);
+-
+-    return result;
++    cairo_surface_mark_dirty(surface);
++    return surface;
+ }
+diff --git c/src/image/formats/Bmp.cpp i/src/image/formats/Bmp.cpp
+index 759cb12ea894ac22233497609d5c3d326c61e336..05c5b9af38fcd9bcb9f3233a917e24d7bff40d78 100644
+--- c/src/image/formats/Bmp.cpp
++++ i/src/image/formats/Bmp.cpp
+@@ -1,126 +1,39 @@
+ #include "Bmp.hpp"
+-
+-#include <sys/stat.h>
+-#include <sys/types.h>
+-#include <unistd.h>
+-#include <cstddef>
+-#include <filesystem>
+-#include <optional>
+-#include <fstream>
+-#include <vector>
+-#include <cstring>
+-
+-class BmpHeader {
+-  public:
+-    unsigned char              format[2];
+-    uint32_t                   sizeOfFile;
+-    uint16_t                   reserved1;
+-    uint16_t                   reserved2;
+-    uint32_t                   dataOffset;
+-    uint32_t                   sizeOfBitmapHeader;
+-    uint32_t                   width;
+-    uint32_t                   height;
+-    uint16_t                   numberOfColors;
+-    uint16_t                   numberOfBitPerPixel;
+-    uint32_t                   compressionMethod;
+-    uint32_t                   imageSize;
+-    uint32_t                   horizontalResolutionPPM;
+-    uint32_t                   verticalResolutionPPM;
+-    uint32_t                   numberOfCollors;
+-    uint32_t                   numberOfImportantCollors;
+-
+-    std::optional<std::string> load(std::ifstream& file) {
+-        file.seekg(0, std::ios::end);
+-        uint32_t streamLength = file.tellg();
+-        file.seekg(0, std::ios::beg);
+-
+-        file.read(reinterpret_cast<char*>(&format), sizeof(format));
+-        if (format[0] != 66 || format[1] != 77)
+-            return "Unable to parse bitmap header: wrong bmp file type";
+-
+-        file.read(reinterpret_cast<char*>(&sizeOfFile), sizeof(sizeOfFile));
+-
+-        if (sizeOfFile != streamLength)
+-            return "Unable to parse bitmap header: wrong value of file size header";
+-
+-        file.read(reinterpret_cast<char*>(&reserved1), sizeof(reserved1));
+-        file.read(reinterpret_cast<char*>(&reserved2), sizeof(reserved2));
+-        file.read(reinterpret_cast<char*>(&dataOffset), sizeof(dataOffset));
+-        file.read(reinterpret_cast<char*>(&sizeOfBitmapHeader), sizeof(sizeOfBitmapHeader));
+-        file.read(reinterpret_cast<char*>(&width), sizeof(width));
+-        file.read(reinterpret_cast<char*>(&height), sizeof(height));
+-        file.read(reinterpret_cast<char*>(&numberOfColors), sizeof(numberOfColors));
+-        file.read(reinterpret_cast<char*>(&numberOfBitPerPixel), sizeof(numberOfBitPerPixel));
+-        file.read(reinterpret_cast<char*>(&compressionMethod), sizeof(compressionMethod));
+-        file.read(reinterpret_cast<char*>(&imageSize), sizeof(imageSize));
+-        file.read(reinterpret_cast<char*>(&horizontalResolutionPPM), sizeof(horizontalResolutionPPM));
+-        file.read(reinterpret_cast<char*>(&verticalResolutionPPM), sizeof(verticalResolutionPPM));
+-        file.read(reinterpret_cast<char*>(&numberOfCollors), sizeof(numberOfCollors));
+-        file.read(reinterpret_cast<char*>(&numberOfImportantCollors), sizeof(numberOfImportantCollors));
+-
+-        if (!imageSize)
+-            imageSize = sizeOfFile - dataOffset;
+-
+-        if (imageSize != (width * height * numberOfBitPerPixel / 8))
+-            return "Unable to parse bitmap header: wrong image size";
+-
+-        file.seekg(dataOffset);
+-
+-        return std::nullopt;
+-    };
+-};
+-
+-static void reflectImage(unsigned char* image, uint32_t numberOfRows, int stride) {
+-    int                        rowStart = 0;
+-    int                        rowEnd   = numberOfRows - 1;
+-    std::vector<unsigned char> temp;
+-    temp.resize(stride);
+-    while (rowStart < rowEnd) {
+-        memcpy(&temp[0], &image[static_cast<size_t>(rowStart * stride)], stride);
+-        memcpy(&image[static_cast<size_t>(rowStart * stride)], &image[static_cast<size_t>(rowEnd * stride)], stride);
+-        memcpy(&image[static_cast<size_t>(rowEnd * stride)], &temp[0], stride);
+-        rowStart++;
+-        rowEnd--;
+-    }
+-};
+-
+-static void convertRgbToArgb(std::ifstream& imageStream, unsigned char* outputImage, uint32_t newImageSize) {
+-    uint8_t       forthBitCounter = 0;
+-    unsigned long imgCursor       = 0;
+-    while (imgCursor < newImageSize) {
+-        imageStream.read(reinterpret_cast<char*>(&outputImage[imgCursor]), 1);
+-        imgCursor++;
+-        forthBitCounter++;
+-        if (forthBitCounter == 3) {
+-            outputImage[imgCursor] = 0;
+-            imgCursor++;
+-            forthBitCounter = 0;
+-        }
+-    }
+-};
++#include "../utils/Format.hpp"
+ 
+ std::expected<cairo_surface_t*, std::string> BMP::createSurfaceFromBMP(const std::string& path) {
+-    if (!std::filesystem::exists(path))
+-        return std::unexpected("loading bmp: file doesn't exist");
+-
+-    std::ifstream bitmapImageStream(path);
+-    BmpHeader     bitmapHeader;
+-    if (const auto RET = bitmapHeader.load(bitmapImageStream); RET.has_value())
+-        return std::unexpected("loading bmp: " + *RET);
+-
+-    cairo_format_t format    = CAIRO_FORMAT_ARGB32;
+-    int            stride    = cairo_format_stride_for_width(format, bitmapHeader.width);
+-    unsigned char* imageData = (unsigned char*)malloc(static_cast<size_t>(bitmapHeader.height * stride));
+-
+-    if (bitmapHeader.numberOfBitPerPixel == 24)
+-        convertRgbToArgb(bitmapImageStream, imageData, bitmapHeader.height * stride);
+-    else if (bitmapHeader.numberOfBitPerPixel == 32)
+-        bitmapImageStream.read(reinterpret_cast<char*>(&imageData), bitmapHeader.imageSize);
+-    else {
+-        bitmapImageStream.close();
+-        return std::unexpected("loading bmp: unsupported bmp stream");
++    const auto data = Hyprgraphics::readImageFile(path);
++    if (!data)
++        return std::unexpected(data.error());
++    if (data->size() < 54 || (*data)[0] != 'B' || (*data)[1] != 'M')
++        return std::unexpected("loading bmp: invalid header");
++    const auto     word   = [&](size_t offset) -> uint32_t { return (*data)[offset] | (uint32_t((*data)[offset + 1]) << 8); };
++    const auto     dword  = [&](size_t offset) -> uint32_t { return word(offset) | (word(offset + 2) << 16); };
++    const uint32_t offset = dword(10), header = dword(14), width = dword(18), bits = word(28);
++    const int64_t  signedHeight = static_cast<int32_t>(dword(22));
++    const uint64_t height       = signedHeight < 0 ? -signedHeight : signedHeight;
++    if (header < 40 || header > data->size() - 14 || offset < 14 + header || word(26) != 1 || dword(30) != 0 || (bits != 24 && bits != 32))
++        return std::unexpected("loading bmp: unsupported bitmap layout");
++    if (!Hyprgraphics::validImageSize(width, height))
++        return std::unexpected("loading bmp: image dimensions exceed limits");
++    const size_t sourceStride = ((size_t(width) * bits + 31) / 32) * 4;
++    if (offset > data->size() || height * sourceStride > data->size() - offset)
++        return std::unexpected("loading bmp: truncated pixels");
++    auto surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24, width, height);
++    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
++        cairo_surface_destroy(surface);
++        return std::unexpected("loading bmp: cairo failed");
+     }
+-    bitmapImageStream.close();
+-    reflectImage(imageData, bitmapHeader.height, stride);
+-    return cairo_image_surface_create_for_data(imageData, format, bitmapHeader.width, bitmapHeader.height, stride);
++    auto*     pixels = cairo_image_surface_get_data(surface);
++    const int stride = cairo_image_surface_get_stride(surface);
++    for (size_t y = 0; y < height; ++y) {
++        const auto* source = data->data() + offset + (signedHeight < 0 ? y : height - y - 1) * sourceStride;
++        auto*       row    = reinterpret_cast<uint32_t*>(pixels + y * stride);
++        for (size_t x = 0; x < width; ++x) {
++            const auto* pixel = source + x * (bits / 8);
++            row[x]            = 0xff000000U | (uint32_t(pixel[2]) << 16) | (uint32_t(pixel[1]) << 8) | pixel[0];
++        }
++    }
++    cairo_surface_mark_dirty(surface);
++    return surface;
+ }
+diff --git c/src/image/formats/Jpeg.cpp i/src/image/formats/Jpeg.cpp
+index 849efacfbc6ed15d98726083be1812daedacd751..fbfa9dd0c6e647b44ed97d7cb1c31d218fcaff36 100644
+--- c/src/image/formats/Jpeg.cpp
++++ i/src/image/formats/Jpeg.cpp
+@@ -1,77 +1,57 @@
+ #include "Jpeg.hpp"
+-
+-#include <cstddef>
+-#include <filesystem>
+-#include <fstream>
+-#include <vector>
++#include "../utils/Format.hpp"
+ #include <csetjmp>
++#include <memory>
++#include <hyprutils/utils/ScopeGuard.hpp>
+ 
+-// TODO: TurboJPEG C API and get rid of this
+-jmp_buf     bailoutBuf = {};
+-static void bailout(j_common_ptr _) {
+-    longjmp(bailoutBuf, 1);
++struct SJpegDecode {
++    jpeg_error_mgr         error{};
++    jmp_buf                jump{};
++    jpeg_decompress_struct decoder{};
++    cairo_surface_t*       surface = nullptr;
++};
++
++static void jpegFailure(j_common_ptr decoder) {
++    longjmp(reinterpret_cast<SJpegDecode*>(decoder->err)->jump, 1);
+ }
+ 
+ std::expected<cairo_surface_t*, std::string> JPEG::createSurfaceFromJPEG(const std::string& path) {
+-
+-    if (!std::filesystem::exists(path))
+-        return std::unexpected("loading jpeg: file doesn't exist");
+-
+-    if (__BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__)
+-        return std::unexpected("loading jpeg: cannot load on big endian");
+-
+-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+-    file.exceptions(std::ifstream::failbit | std::ifstream::badbit | std::ifstream::eofbit);
+-    std::vector<uint8_t> bytes(file.tellg());
+-    file.seekg(0);
+-    file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+-
+-    if (bytes[0] != 0xFF || bytes[1] != 0xD8)
+-        return std::unexpected("loading jpeg: invalid magic bytes");
+-
+-    // now the JPEG is in the memory
+-
+-    jpeg_decompress_struct decompressStruct = {};
+-    jpeg_error_mgr         errorManager     = {};
+-
+-    decompressStruct.err = jpeg_std_error(&errorManager);
+-
+-    errorManager.error_exit = bailout;
+-    if (setjmp(bailoutBuf))
+-        return std::unexpected("loading jpeg: libjpeg encountered a fatal error");
+-
+-    jpeg_create_decompress(&decompressStruct);
+-    jpeg_mem_src(&decompressStruct, bytes.data(), bytes.size());
+-    jpeg_read_header(&decompressStruct, true);
+-
++    const auto bytes = Hyprgraphics::readImageFile(path);
++    if (!bytes)
++        return std::unexpected(bytes.error());
++    // libjpeg may longjmp; mutable cleanup state lives outside the stack frame.
++    auto                          state = std::make_unique<SJpegDecode>();
++    Hyprutils::Utils::CScopeGuard cleanup([&] {
++        jpeg_destroy_decompress(&state->decoder);
++        if (state->surface)
++            cairo_surface_destroy(state->surface);
++    });
++    auto&                         decoder = state->decoder;
++    decoder.err                           = jpeg_std_error(&state->error);
++    state->error.error_exit               = jpegFailure;
++    if (setjmp(state->jump))
++        return std::unexpected("loading jpeg: invalid image");
++    jpeg_create_decompress(&decoder);
++    jpeg_mem_src(&decoder, bytes->data(), bytes->size());
++    jpeg_read_header(&decoder, true);
++    if (!Hyprgraphics::validImageSize(decoder.image_width, decoder.image_height))
++        return std::unexpected("loading jpeg: image dimensions exceed limits");
+ #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+-    decompressStruct.out_color_space = JCS_EXT_BGRA;
++    decoder.out_color_space = JCS_EXT_BGRA;
+ #else
+-    decompressStruct.out_color_space = JCS_EXT_ARGB;
++    decoder.out_color_space = JCS_EXT_ARGB;
+ #endif
+-
+-    // decompress
+-    jpeg_start_decompress(&decompressStruct);
+-
+-    auto cairoSurface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, decompressStruct.output_width, decompressStruct.output_height);
+-
+-    if (cairo_surface_status(cairoSurface) != CAIRO_STATUS_SUCCESS)
+-        return std::unexpected("loading jpeg: cairo failed to create an image surface");
+-
+-    const auto CAIRODATA   = cairo_image_surface_get_data(cairoSurface);
+-    const auto CAIROSTRIDE = cairo_image_surface_get_stride(cairoSurface);
+-    JSAMPROW   rowRead;
+-
+-    while (decompressStruct.output_scanline < decompressStruct.output_height) {
+-        const auto PROW = CAIRODATA + (static_cast<size_t>(decompressStruct.output_scanline * CAIROSTRIDE));
+-        rowRead         = PROW;
+-        jpeg_read_scanlines(&decompressStruct, &rowRead, 1);
++    jpeg_start_decompress(&decoder);
++    state->surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, decoder.output_width, decoder.output_height);
++    if (cairo_surface_status(state->surface) != CAIRO_STATUS_SUCCESS)
++        return std::unexpected("loading jpeg: cairo failed");
++    auto*     pixels = cairo_image_surface_get_data(state->surface);
++    const int stride = cairo_image_surface_get_stride(state->surface);
++    while (decoder.output_scanline < decoder.output_height) {
++        JSAMPROW row = pixels + size_t(decoder.output_scanline) * stride;
++        jpeg_read_scanlines(&decoder, &row, 1);
+     }
+-
+-    cairo_surface_mark_dirty(cairoSurface);
+-    cairo_surface_set_mime_data(cairoSurface, CAIRO_MIME_TYPE_JPEG, bytes.data(), bytes.size(), nullptr, nullptr);
+-    jpeg_finish_decompress(&decompressStruct);
+-    jpeg_destroy_decompress(&decompressStruct);
+-
+-    return cairoSurface;
++    jpeg_finish_decompress(&decoder);
++    cairo_surface_mark_dirty(state->surface);
++    return std::exchange(state->surface, nullptr);
+ }
+diff --git c/src/image/formats/JpegXL.cpp i/src/image/formats/JpegXL.cpp
+index 49ffc99175c668c5a84aa6ea5b33421f5cbddfe0..91c18d73f6e59d7dda48f0bd58c2df9955402220 100644
+--- c/src/image/formats/JpegXL.cpp
++++ i/src/image/formats/JpegXL.cpp
+@@ -1,4 +1,5 @@
+ #include "JpegXL.hpp"
++#include "../utils/Format.hpp"
+ 
+ #include <filesystem>
+ #include <fstream>
+@@ -8,14 +9,10 @@
+ 
+ std::expected<cairo_surface_t*, std::string> JXL::createSurfaceFromJXL(const std::string& path) {
+ 
+-    if (!std::filesystem::exists(path))
+-        return std::unexpected("loading jxl: file doesn't exist");
+-
+-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+-    file.exceptions(std::ifstream::failbit | std::ifstream::badbit | std::ifstream::eofbit);
+-    std::vector<uint8_t> bytes(file.tellg());
+-    file.seekg(0);
+-    file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
++    auto data = Hyprgraphics::readImageFile(path);
++    if (!data)
++        return std::unexpected(data.error());
++    const auto&  bytes = *data;
+ 
+     JxlSignature signature = JxlSignatureCheck(bytes.data(), bytes.size());
+     if (signature != JXL_SIG_CODESTREAM && signature != JXL_SIG_CONTAINER)
+@@ -37,6 +34,8 @@ std::expected<cairo_surface_t*, std::string> JXL::createSurfaceFromJXL(const std
+     JxlBasicInfo basicInfo;
+     if (JXL_DEC_SUCCESS != JxlDecoderGetBasicInfo(dec.get(), &basicInfo))
+         return std::unexpected("loading jxl: JxlDecoderGetBasicInfo failed");
++    if (!Hyprgraphics::validImageSize(basicInfo.xsize, basicInfo.ysize))
++        return std::unexpected("loading jxl: image dimensions exceed limits");
+ 
+     auto cairoSurface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, basicInfo.xsize, basicInfo.ysize);
+     if (cairo_surface_status(cairoSurface) != CAIRO_STATUS_SUCCESS) {
+@@ -79,12 +78,17 @@ std::expected<cairo_surface_t*, std::string> JXL::createSurfaceFromJXL(const std
+                 return std::unexpected("loading jxl: JxlDecoderSetImageOutBuffer failed");
+             }
+         } else if (status == JXL_DEC_FULL_IMAGE) {
+-            for (size_t i = 0; i < OUTPUTSIZE - 2; i += format.num_channels) {
+-                std::swap(CAIRODATA[i + 0], CAIRODATA[i + 2]);
++            for (size_t i = 0; i < OUTPUTSIZE; i += format.num_channels) {
++                const uint32_t alpha = CAIRODATA[i + 3];
++                const uint32_t pixel =
++                    (alpha << 24) | (((CAIRODATA[i] * alpha + 127) / 255) << 16) | (((CAIRODATA[i + 1] * alpha + 127) / 255) << 8) | ((CAIRODATA[i + 2] * alpha + 127) / 255);
++                *reinterpret_cast<uint32_t*>(CAIRODATA + i) = pixel;
+             }
+             cairo_surface_mark_dirty(cairoSurface);
+-            cairo_surface_set_mime_data(cairoSurface, "image/jxl", bytes.data(), bytes.size(), nullptr, nullptr);
+             return cairoSurface;
++        } else {
++            cairo_surface_destroy(cairoSurface);
++            return std::unexpected("loading jxl: unexpected decoder state");
+         }
+     }
+ 
+diff --git c/src/image/formats/Png.cpp i/src/image/formats/Png.cpp
+index c75da29e0cc6c10bb403b791269967e516abfdc3..94c3e6e5a7ef325f117236814ffb6e0795a93183 100644
+--- c/src/image/formats/Png.cpp
++++ i/src/image/formats/Png.cpp
+@@ -1,130 +1,49 @@
+ #include "Png.hpp"
+-#include <cstddef>
+-#include <vector>
+-#include <filesystem>
+-#include <cstdint>
+-#include <cstdlib>
+-#include <cstring>
++#include "../utils/Format.hpp"
+ #include <png.h>
+ #include <hyprutils/utils/ScopeGuard.hpp>
++
+ using namespace Hyprutils::Utils;
+ 
+-static std::expected<cairo_surface_t*, std::string> loadPNG(png_structp, png_infop);
+-
+-std::expected<cairo_surface_t*, std::string>        PNG::createSurfaceFromPNG(const std::string& path) {
+-    if (!std::filesystem::exists(path))
+-        return std::unexpected("loading png: file doesn't exist");
+-
+-    FILE* fp = fopen(path.c_str(), "rb");
+-    if (!fp)
+-        return std::unexpected("loading png: couldn't open file");
+-
+-    png_structp png  = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+-    png_infop   info = png_create_info_struct(png);
+-    if (!png || !info)
+-        return std::unexpected("loading png: couldn't init libpng");
+-
+-    CScopeGuard x([&png, &info, fp] {
+-        png_destroy_read_struct(&png, &info, nullptr);
+-        fclose(fp);
+-    });
+-
+-    if (setjmp(png_jmpbuf(png)))
+-        return std::unexpected("loading png: couldn't setjmp");
+-
+-    png_init_io(png, fp);
+-
+-    return loadPNG(png, info);
++std::expected<cairo_surface_t*, std::string> PNG::createSurfaceFromPNG(const std::string& path) {
++    auto data = Hyprgraphics::readImageFile(path);
++    if (!data)
++        return std::unexpected(data.error());
++    return createSurfaceFromPNG(*data);
+ }
+ 
+-struct SReadState {
+-    const std::span<const uint8_t> data;
+-    size_t                         offset;
+-};
+-
+-static void customReadFunction(png_structp png, png_bytep data, png_size_t length) {
+-    SReadState* state = static_cast<SReadState*>(png_get_io_ptr(png));
+-    if (state->offset + length > state->data.size()) {
+-        png_error(png, "read error");
+-        return;
+-    }
+-
+-    memcpy(data, state->data.data() + state->offset, length);
+-    state->offset += length;
+-}
+-
+-std::expected<cairo_surface_t*, std::string> PNG::createSurfaceFromPNG(const std::span<const uint8_t> data) {
+-    png_structp png  = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+-    png_infop   info = png_create_info_struct(png);
+-    if (!png || !info)
+-        return std::unexpected("loading png: couldn't init libpng");
+-
+-    CScopeGuard x([&png, &info] { png_destroy_read_struct(&png, &info, nullptr); });
+-
+-    if (setjmp(png_jmpbuf(png)))
+-        return std::unexpected("loading png: couldn't setjmp");
+-
+-    SReadState readState = {.data = data, .offset = 0};
+-
+-    png_set_read_fn(png, &readState, customReadFunction);
+-    png_set_sig_bytes(png, 0);
+-
+-    return loadPNG(png, info);
+-}
+-
+-static std::expected<cairo_surface_t*, std::string> loadPNG(png_structp png, png_infop info) {
+-    png_read_info(png, info);
+-
+-    const size_t W          = png_get_image_width(png, info);
+-    const size_t H          = png_get_image_height(png, info);
+-    const auto   COLOR_TYPE = png_get_color_type(png, info);
+-    const auto   BPP        = png_get_bit_depth(png, info);
+-
+-    if (BPP == 16)
+-        png_set_strip_16(png);
+-    if (COLOR_TYPE == PNG_COLOR_TYPE_PALETTE)
+-        png_set_palette_to_rgb(png);
+-    if (COLOR_TYPE == PNG_COLOR_TYPE_GRAY && BPP < 8)
+-        png_set_expand_gray_1_2_4_to_8(png);
+-    if (COLOR_TYPE == PNG_COLOR_TYPE_GRAY || COLOR_TYPE == PNG_COLOR_TYPE_GRAY_ALPHA)
+-        png_set_gray_to_rgb(png);
+-    if (png_get_valid(png, info, PNG_INFO_tRNS))
+-        png_set_tRNS_to_alpha(png);
+-
+-    if (COLOR_TYPE == PNG_COLOR_TYPE_RGB || COLOR_TYPE == PNG_COLOR_TYPE_GRAY || COLOR_TYPE == PNG_COLOR_TYPE_PALETTE)
+-        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+-
+-    png_read_update_info(png, info);
+-
+-    std::vector<uint8_t*> rowPointers;
+-    rowPointers.resize(H);
+-    std::vector<uint8_t> rawData;
+-    rawData.resize(W * H * 4);
+-    for (size_t y = 0; y < H; y++) {
+-        rowPointers[y] = rawData.data() + (y * W * 4);
+-    }
+-
+-    png_read_image(png, rowPointers.data());
+-
+-    for (size_t i = 0; i < W * H * 4; i += 4) {
+-        uint8_t r = rawData[i + 0];
+-        uint8_t g = rawData[i + 1];
+-        uint8_t b = rawData[i + 2];
+-        uint8_t a = rawData[i + 3];
+-
+-        r *= ((float)a) / 255.F;
+-        g *= ((float)a) / 255.F;
+-        b *= ((float)a) / 255.F;
+-        *(uint32_t*)&rawData[i] = (a << 24) | (r << 16) | (g << 8) | b;
+-    }
+-
+-    auto CAIROSURFACE = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+-
+-    if (!CAIROSURFACE)
++std::expected<cairo_surface_t*, std::string> PNG::createSurfaceFromPNG(std::span<const uint8_t> data) {
++    png_image image{};
++    image.version = PNG_IMAGE_VERSION;
++    CScopeGuard cleanup([&] { png_image_free(&image); });
++    if (!png_image_begin_read_from_memory(&image, data.data(), data.size()))
++        return std::unexpected(image.message);
++    if (!Hyprgraphics::validImageSize(image.width, image.height))
++        return std::unexpected("loading png: image dimensions exceed limits");
++    auto surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, image.width, image.height);
++    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
++        cairo_surface_destroy(surface);
+         return std::unexpected("loading png: cairo failed");
+-
+-    memcpy(cairo_image_surface_get_data(CAIROSURFACE), rawData.data(), rawData.size());
+-    cairo_surface_mark_dirty(CAIROSURFACE);
+-
+-    return CAIROSURFACE;
++    }
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++    image.format = PNG_FORMAT_BGRA;
++#else
++    image.format = PNG_FORMAT_ARGB;
++#endif
++    auto*     pixels = cairo_image_surface_get_data(surface);
++    const int stride = cairo_image_surface_get_stride(surface);
++    if (!png_image_finish_read(&image, nullptr, pixels, stride, nullptr)) {
++        cairo_surface_destroy(surface);
++        return std::unexpected(image.message);
++    }
++    for (size_t y = 0; y < image.height; ++y) {
++        auto* row = reinterpret_cast<uint32_t*>(pixels + y * stride);
++        for (size_t x = 0; x < image.width; ++x) {
++            const uint32_t value = row[x], alpha = value >> 24;
++            row[x] =
++                (alpha << 24) | (((((value >> 16) & 255) * alpha + 127) / 255) << 16) | (((((value >> 8) & 255) * alpha + 127) / 255) << 8) | (((value & 255) * alpha + 127) / 255);
++        }
++    }
++    cairo_surface_mark_dirty(surface);
++    return surface;
+ }
+diff --git c/src/image/formats/Svg.cpp i/src/image/formats/Svg.cpp
+index d59bfa9e6c2649d1eb5c4e159e583cb97cd0bdd3..90d3b5c4b2504e708c2120959c7cf26ceff18b15 100644
+--- c/src/image/formats/Svg.cpp
++++ i/src/image/formats/Svg.cpp
+@@ -1,96 +1,35 @@
+ #include "Svg.hpp"
+-#include <filesystem>
+-#include <fstream>
++#include "../utils/Format.hpp"
+ #include <librsvg/rsvg.h>
+ #include <hyprutils/utils/ScopeGuard.hpp>
+-#include <hyprutils/string/String.hpp>
+ 
+ using namespace Hyprutils::Utils;
+ using namespace Hyprutils::Math;
+-using namespace Hyprutils::String;
+-
+-static std::optional<std::string> readFileAsString(const std::string& path) {
+-    std::error_code ec;
+-
+-    if (!std::filesystem::exists(path, ec) || ec)
+-        return std::nullopt;
+-
+-    std::ifstream file(path);
+-    if (!file.good())
+-        return std::nullopt;
+-
+-    return trim(std::string((std::istreambuf_iterator<char>(file)), (std::istreambuf_iterator<char>())));
+-}
+ 
+ std::expected<cairo_surface_t*, std::string> SVG::createSurfaceFromSVG(const std::string& path, const Vector2D& size) {
+-    if (!std::filesystem::exists(path))
+-        return std::unexpected("loading svg: file doesn't exist");
+-
+-    if (size.x < 1 || size.y < 1)
+-        return std::unexpected("loading svg: invalid size");
+-
+-    auto       cairoSurface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, size.x, size.y);
+-
+-    const auto PCAIRO = cairo_create(cairoSurface);
+-
+-    cairo_save(PCAIRO);
+-    cairo_set_operator(PCAIRO, CAIRO_OPERATOR_CLEAR);
+-    cairo_paint(PCAIRO);
+-    cairo_restore(PCAIRO);
+-
+-    GError* error = nullptr;
+-    auto    file  = readFileAsString(path);
+-
+-    if (!file)
+-        return std::unexpected("loading png: file doesn't exist / inaccessible");
+-
+-    RsvgHandle* handle = rsvg_handle_new_from_data((unsigned char*)file->data(), file->size(), &error);
+-
+-    if (!handle)
+-        return std::unexpected("loading svg: rsvg failed to read data");
+-
+-    RsvgRectangle rect = {0, 0, (double)size.x, (double)size.y};
+-
+-    if (!rsvg_handle_render_document(handle, PCAIRO, &rect, &error))
+-        return std::unexpected("loading svg: rsvg failed to render");
+-
+-    // done
+-    cairo_surface_flush(cairoSurface);
+-    cairo_destroy(PCAIRO);
+-    g_object_unref(handle);
+-
+-    return cairoSurface;
++    const auto bytes = Hyprgraphics::readImageFile(path);
++    if (!bytes)
++        return std::unexpected(bytes.error());
++    return createSurfaceFromData(*bytes, size);
+ }
+ 
+ std::expected<cairo_surface_t*, std::string> SVG::createSurfaceFromData(const std::span<const uint8_t>& data, const Vector2D& size) {
+-    if (size.x < 1 || size.y < 1)
+-        return std::unexpected("loading svg: invalid size");
+-
+-    auto       cairoSurface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, size.x, size.y);
+-
+-    const auto PCAIRO = cairo_create(cairoSurface);
+-
+-    cairo_save(PCAIRO);
+-    cairo_set_operator(PCAIRO, CAIRO_OPERATOR_CLEAR);
+-    cairo_paint(PCAIRO);
+-    cairo_restore(PCAIRO);
+-
++    if (!Hyprgraphics::validImageSize(size.x, size.y))
++        return std::unexpected("loading svg: image dimensions exceed limits");
+     GError*     error = nullptr;
+-
+-    RsvgHandle* handle = rsvg_handle_new_from_data((unsigned char*)data.data(), data.size(), &error);
+-
++    CScopeGuard freeError([&] { g_clear_error(&error); });
++    auto*       handle = rsvg_handle_new_from_data(data.data(), data.size(), &error);
+     if (!handle)
+-        return std::unexpected("loading svg: rsvg failed to read data");
+-
+-    RsvgRectangle rect = {0, 0, (double)size.x, (double)size.y};
+-
+-    if (!rsvg_handle_render_document(handle, PCAIRO, &rect, &error))
+-        return std::unexpected("loading svg: rsvg failed to render");
+-
+-    // done
+-    cairo_surface_flush(cairoSurface);
+-    cairo_destroy(PCAIRO);
+-    g_object_unref(handle);
+-
+-    return cairoSurface;
+-}
+\ No newline at end of file
++        return std::unexpected(std::string{"loading svg: "} + error->message);
++    CScopeGuard         freeHandle([&] { g_object_unref(handle); });
++    auto*               surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, size.x, size.y);
++    auto*               context = cairo_create(surface);
++    CScopeGuard         freeContext([&] { cairo_destroy(context); });
++    const RsvgRectangle rect{0, 0, size.x, size.y};
++    if (cairo_status(context) != CAIRO_STATUS_SUCCESS || !rsvg_handle_render_document(handle, context, &rect, &error)) {
++        cairo_surface_destroy(surface);
++        return std::unexpected(error ? error->message : "loading svg: cairo failed");
++    }
++    cairo_surface_flush(surface);
++    return surface;
++}
+diff --git c/src/image/formats/Webp.cpp i/src/image/formats/Webp.cpp
+index e8e946cfdc19b95acfcffd30045ff985b3d4fd58..b2ac81f71277ec977de54e982b78a47ec53eeda9 100644
+--- c/src/image/formats/Webp.cpp
++++ i/src/image/formats/Webp.cpp
+@@ -1,4 +1,5 @@
+ #include "Webp.hpp"
++#include "../utils/Format.hpp"
+ 
+ #include <cstddef>
+ #include <filesystem>
+@@ -8,19 +9,10 @@
+ 
+ std::expected<cairo_surface_t*, std::string> WEBP::createSurfaceFromWEBP(const std::string& path) {
+ 
+-    if (!std::filesystem::exists(path))
+-        return std::unexpected("loading webp: file doesn't exist");
+-
+-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+-    file.exceptions(std::ifstream::failbit | std::ifstream::badbit | std::ifstream::eofbit);
+-    std::vector<uint8_t> bytes(file.tellg());
+-    file.seekg(0);
+-    file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+-
+-    if (bytes[0] != 'R' || bytes[1] != 'I' || bytes[2] != 'F' || bytes[3] != 'F')
+-        return std::unexpected("loading webp: invalid magic bytes");
+-
+-    // now the WebP is in the memory
++    auto data = Hyprgraphics::readImageFile(path);
++    if (!data)
++        return std::unexpected(data.error());
++    const auto&       bytes = *data;
+ 
+     WebPDecoderConfig config;
+     if (!WebPInitDecoderConfig(&config))
+@@ -31,8 +23,10 @@ std::expected<cairo_surface_t*, std::string> WEBP::createSurfaceFromWEBP(const s
+ 
+     const auto HEIGHT = config.input.height;
+     const auto WIDTH  = config.input.width;
++    if (!Hyprgraphics::validImageSize(WIDTH, HEIGHT))
++        return std::unexpected("loading webp: image dimensions exceed limits");
+ 
+-    auto       cairoSurface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, WIDTH, HEIGHT);
++    auto cairoSurface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, WIDTH, HEIGHT);
+     if (cairo_surface_status(cairoSurface) != CAIRO_STATUS_SUCCESS) {
+         cairo_surface_destroy(cairoSurface);
+         return std::unexpected("loading webp: cairo failed");
+@@ -55,11 +49,13 @@ std::expected<cairo_surface_t*, std::string> WEBP::createSurfaceFromWEBP(const s
+     config.output.width                = WIDTH;
+     config.output.height               = HEIGHT;
+ 
+-    if (WebPDecode(bytes.data(), bytes.size(), &config) != VP8_STATUS_OK)
++    if (WebPDecode(bytes.data(), bytes.size(), &config) != VP8_STATUS_OK) {
++        WebPFreeDecBuffer(&config.output);
++        cairo_surface_destroy(cairoSurface);
+         return std::unexpected("loading webp: webp decode failed");
++    }
+ 
+     cairo_surface_mark_dirty(cairoSurface);
+-    cairo_surface_set_mime_data(cairoSurface, "image/webp", bytes.data(), bytes.size(), nullptr, nullptr);
+ 
+     WebPFreeDecBuffer(&config.output);
+ 
+diff --git c/src/image/utils/Format.cpp i/src/image/utils/Format.cpp
+index 312299a4674179c41255a022103bdd2b4c42b214..5e7b1abc2fd041d7496eb34123665f42991f9b21 100644
+--- c/src/image/utils/Format.cpp
++++ i/src/image/utils/Format.cpp
+@@ -1,12 +1,39 @@
+ #include "Format.hpp"
+ 
+ #include <magic.h>
++#include <hyprutils/os/FileDescriptor.hpp>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <cmath>
+ 
+ #include <hyprutils/utils/ScopeGuard.hpp>
+ 
+ using namespace Hyprgraphics;
+ using namespace Hyprutils::Utils;
+ 
++bool Hyprgraphics::validImageSize(double width, double height) {
++    return width >= 1 && height >= 1 && width <= 16384 && height <= 16384 && width * height <= 16 * 1024 * 1024;
++}
++
++std::expected<std::vector<uint8_t>, std::string> Hyprgraphics::readImageFile(const std::string& path) {
++    Hyprutils::OS::CFileDescriptor fd{open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK)};
++    struct stat                    info{};
++    if (!fd.isValid() || fstat(fd.get(), &info) < 0 || !S_ISREG(info.st_mode))
++        return std::unexpected("image must be a readable regular file");
++    if (info.st_size <= 0 || static_cast<uint64_t>(info.st_size) > MAX_IMAGE_BYTES)
++        return std::unexpected("image exceeds 64 MiB or is empty");
++    std::vector<uint8_t> data(info.st_size);
++    size_t               offset = 0;
++    while (offset < data.size()) {
++        const auto count = read(fd.get(), data.data() + offset, data.size() - offset);
++        if (count > 0)
++            offset += count;
++        else if (count == 0 || errno != EINTR)
++            return std::unexpected("image read failed");
++    }
++    return data;
++}
++
+ static eImageFormat formatFromStr(const std::string& r) {
+     if (r == "image/png")
+         return IMAGE_FORMAT_PNG;
+@@ -47,6 +74,10 @@ static eImageFormat formatOf(const std::span<const uint8_t>& data) {
+ }
+ 
+ static eImageFormat formatOf(const std::string& path) {
++    Hyprutils::OS::CFileDescriptor fd{open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK)};
++    struct stat                    info{};
++    if (!fd.isValid() || fstat(fd.get(), &info) < 0 || !S_ISREG(info.st_mode) || info.st_size <= 0 || static_cast<uint64_t>(info.st_size) > MAX_IMAGE_BYTES)
++        return IMAGE_FORMAT_ERROR;
+     magic_t m = magic_open(MAGIC_MIME_TYPE | MAGIC_SYMLINK);
+     if (!m)
+         return IMAGE_FORMAT_ERROR;
+@@ -58,7 +89,7 @@ static eImageFormat formatOf(const std::string& path) {
+     if (magic_load(m, nullptr) != 0)
+         return IMAGE_FORMAT_ERROR;
+ 
+-    const char* result = magic_file(m, path.c_str());
++    const char* result = magic_descriptor(m, fd.get());
+     if (!result)
+         return IMAGE_FORMAT_ERROR;
+ 
+diff --git c/src/image/utils/Format.hpp i/src/image/utils/Format.hpp
+index df13a876c03bf814071f63ed92eb6565b712dd31..3e2c8f975e287583ed4d8406f133283ca329ab23 100644
+--- c/src/image/utils/Format.hpp
++++ i/src/image/utils/Format.hpp
+@@ -1,9 +1,14 @@
+ #pragma once
+ 
+ #include <hyprgraphics/image/Image.hpp>
++#include <expected>
++#include <vector>
+ 
+ namespace Hyprgraphics {
+-    eImageFormat formatFromStream(const std::span<const uint8_t>& data);
+-    eImageFormat formatFromFile(const std::string& path);
+-    const char*  mimeOf(eImageFormat);
++    constexpr size_t                                 MAX_IMAGE_BYTES = 64 * 1024 * 1024;
++    bool                                             validImageSize(double width, double height);
++    std::expected<std::vector<uint8_t>, std::string> readImageFile(const std::string& path);
++    eImageFormat                                     formatFromStream(const std::span<const uint8_t>& data);
++    eImageFormat                                     formatFromFile(const std::string& path);
++    const char*                                      mimeOf(eImageFormat);
+ };
+diff --git c/src/resource/AsyncResourceGatherer.cpp i/src/resource/AsyncResourceGatherer.cpp
+index 7e3e7de3b297c37bde94681d9333d615e73bf9af..9770abb42a680a11bc66db5368aa84974b334ec7 100644
+--- c/src/resource/AsyncResourceGatherer.cpp
++++ i/src/resource/AsyncResourceGatherer.cpp
+@@ -1,75 +1,128 @@
+ #include <hyprgraphics/resource/AsyncResourceGatherer.hpp>
+-#include "resources/AsyncResource.hpp"
++#include <algorithm>
++#include <sys/eventfd.h>
++#include <unistd.h>
++#include <system_error>
+ 
+ using namespace Hyprgraphics;
++using namespace Hyprutils::Memory;
+ 
+-CAsyncResourceGatherer::CAsyncResourceGatherer() {
+-    m_gatherThread = std::thread([this]() { asyncAssetSpinLock(); });
++CAsyncResourceGatherer::CAsyncResourceGatherer() : m_fd(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {
++    if (!m_fd.isValid())
++        throw std::system_error(errno, std::generic_category(), "resource completion descriptor");
++    m_requests.reserve(CAPACITY);
++    m_thread = std::thread([this] { run(); });
+ }
+ 
+ CAsyncResourceGatherer::~CAsyncResourceGatherer() {
+-    m_asyncLoopState.exit = true;
+-    wakeUpMainThread();
+-
+-    if (m_gatherThread.joinable())
+-        m_gatherThread.join();
++    stop();
+ }
+ 
+-void CAsyncResourceGatherer::wakeUpMainThread() {
+-    m_asyncLoopState.needsToProcess = true;
+-    m_asyncLoopState.requestsCV.notify_all();
+-}
+-
+-void CAsyncResourceGatherer::enqueue(Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> resource) {
++void CAsyncResourceGatherer::stop() {
+     {
+-        std::lock_guard<std::mutex> lg(m_targetsToLoadMutex);
+-        m_targetsToLoad.emplace_back(resource);
+-    }
+-
+-    wakeUpMainThread();
+-}
+-
+-void CAsyncResourceGatherer::await(Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> resource) {
+-    resource->m_impl->awaitingCv = Hyprutils::Memory::makeUnique<std::condition_variable>();
+-    std::unique_lock<std::mutex> lk(resource->m_impl->awaitingMtx);
+-    resource->m_impl->awaitingCv->wait(lk, [&resource] { return resource->m_impl->awaitingEvent; });
+-    resource->m_impl->awaitingCv.reset();
+-}
+-
+-void CAsyncResourceGatherer::asyncAssetSpinLock() {
+-    while (!m_asyncLoopState.exit) {
+-
+-        std::unique_lock lk(m_asyncLoopState.requestMutex);
+-        if (!m_asyncLoopState.needsToProcess) // avoid a lock if a thread managed to request something already since we .unlock()ed
+-            m_asyncLoopState.requestsCV.wait_for(lk, std::chrono::seconds(5), [this] { return m_asyncLoopState.needsToProcess; }); // wait for events
+-
+-        if (m_asyncLoopState.exit)
+-            break;
+-
+-        m_asyncLoopState.needsToProcess = false;
+-        lk.unlock();
+-        m_targetsToLoadMutex.lock();
+-
+-        if (m_targetsToLoad.empty()) {
+-            m_targetsToLoadMutex.unlock();
+-            continue;
++        std::lock_guard lock(m_mutex);
++        m_stopping = true;
++        if (m_running) {
++            m_running->m_cancelled = true;
++            m_running->m_cancelled.notify_all();
+         }
+-
+-        auto requests = m_targetsToLoad;
+-        m_targetsToLoad.clear();
+-
+-        m_targetsToLoadMutex.unlock();
+-
+-        // process requests
+-        for (auto& r : requests) {
+-            r->render();
+-
+-            if (r->m_impl->awaitingCv) {
+-                r->m_impl->awaitingEvent = true;
+-                r->m_impl->awaitingCv->notify_all();
++        for (auto& request : m_requests) {
++            request.resource->m_cancelled = true;
++            if (!request.started) {
++                request.resource->m_ready.store(true, std::memory_order_release);
++                request.resource->m_ready.notify_all();
+             }
+-            r->m_ready = true;
+-            r->m_events.finished.emit();
+         }
+     }
+-}
+\ No newline at end of file
++    m_wake.notify_one();
++    if (m_thread.joinable())
++        m_thread.join();
++    std::vector<SRequest> abandoned;
++    abandoned.swap(m_requests);
++}
++
++std::expected<void, std::string> CAsyncResourceGatherer::enqueue(CAtomicSharedPointer<IAsyncResource> resource, std::function<void()> completed) {
++    std::lock_guard lock(m_mutex);
++    if (m_stopping)
++        return std::unexpected("resource queue is stopped");
++    if (m_requests.size() == CAPACITY)
++        return std::unexpected("resource queue is full");
++    if (resource->m_ready || resource->m_submitted.exchange(true))
++        return std::unexpected("resource was already submitted");
++    m_requests.push_back({std::move(resource), std::move(completed)});
++    m_wake.notify_one();
++    return {};
++}
++
++void CAsyncResourceGatherer::cancel(const CAtomicSharedPointer<IAsyncResource>& resource) {
++    std::function<void()> completed;
++    {
++        std::lock_guard lock(m_mutex);
++        resource->m_cancelled = true;
++        resource->m_cancelled.notify_all();
++        const auto request = std::ranges::find_if(m_requests, [&](const auto& item) { return item.resource == resource; });
++        if (request == m_requests.end())
++            return;
++        if (!request->started) {
++            resource->m_ready.store(true, std::memory_order_release);
++            resource->m_ready.notify_all();
++        }
++        completed = std::move(request->completed);
++        m_requests.erase(request);
++    }
++}
++
++int CAsyncResourceGatherer::fd() const {
++    return m_fd.get();
++}
++
++void CAsyncResourceGatherer::dispatch() {
++    uint64_t value = 0;
++    while (read(m_fd.get(), &value, sizeof(value)) < 0 && errno == EINTR) {}
++    // A callback can cancel another completion. Take one request at a time.
++    for (size_t count = 0; count < CAPACITY; ++count) {
++        SRequest completed;
++        {
++            std::lock_guard lock(m_mutex);
++            const auto      request = std::ranges::find_if(m_requests, [](const auto& item) { return item.done; });
++            if (request == m_requests.end())
++                return;
++            completed = std::move(*request);
++            m_requests.erase(request);
++        }
++        if (completed.completed)
++            completed.completed();
++    }
++}
++
++void CAsyncResourceGatherer::await(CAtomicSharedPointer<IAsyncResource> resource) {
++    resource->m_ready.wait(false, std::memory_order_acquire);
++}
++
++void CAsyncResourceGatherer::run() {
++    std::unique_lock lock(m_mutex);
++    for (;;) {
++        m_wake.wait(lock, [this] { return m_stopping || std::ranges::any_of(m_requests, [](const auto& request) { return !request.started; }); });
++        if (m_stopping)
++            return;
++        auto request     = std::ranges::find_if(m_requests, [](const auto& item) { return !item.started; });
++        request->started = true;
++        m_running        = request->resource;
++        lock.unlock();
++        try {
++            m_running->render();
++        } catch (const std::exception& error) { m_running->m_error = error.what(); } catch (...) {
++            m_running->m_error = "resource rendering failed";
++        }
++        lock.lock();
++        request = std::ranges::find_if(m_requests, [this](const auto& item) { return item.resource == m_running; });
++        if (request != m_requests.end()) {
++            request->done        = true;
++            const uint64_t value = 1;
++            while (write(m_fd.get(), &value, sizeof(value)) < 0 && errno == EINTR) {}
++        }
++        m_running->m_ready.store(true, std::memory_order_release);
++        m_running->m_ready.notify_all();
++        m_running.reset();
++    }
++}
+diff --git c/src/resource/resources/AsyncResource.cpp i/src/resource/resources/AsyncResource.cpp
+index f867f838b4036bf3585daf0fae44187528ca0650..7fc6b12d792faa31f3344ef54e7158be558e5cbb 100644
+--- c/src/resource/resources/AsyncResource.cpp
++++ i/src/resource/resources/AsyncResource.cpp
+@@ -1,8 +1,8 @@
+-#include "AsyncResource.hpp"
++#include <hyprgraphics/resource/resources/AsyncResource.hpp>
+ 
+ using namespace Hyprgraphics;
+ using namespace Hyprutils::Memory;
+ 
+-IAsyncResource::IAsyncResource() : m_impl(makeUnique<SAsyncResourceImpl>()) {
++IAsyncResource::IAsyncResource() {
+     ;
+-}
+\ No newline at end of file
++}
+diff --git c/src/resource/resources/AsyncResource.hpp i/src/resource/resources/AsyncResource.hpp
+deleted file mode 100644
+index 8a0c61b931e5fbfba8a675a1fe079c01f0d4116b..0000000000000000000000000000000000000000
+--- c/src/resource/resources/AsyncResource.hpp
++++ /dev/null
+@@ -1,11 +0,0 @@
+-#include <hyprgraphics/resource/resources/AsyncResource.hpp>
+-
+-#include <condition_variable>
+-
+-namespace Hyprgraphics {
+-    struct SAsyncResourceImpl {
+-        Hyprutils::Memory::CUniquePointer<std::condition_variable> awaitingCv;
+-        std::mutex                                                 awaitingMtx;
+-        bool                                                       awaitingEvent = false;
+-    };
+-}
+\ No newline at end of file
+diff --git c/src/resource/resources/ImageResource.cpp i/src/resource/resources/ImageResource.cpp
+index ef4e7f6457c6f4bd07186ae979a5d8c57712b1c3..d97123d09e6aaf4bbc85ffb2c3cbca9987137d8c 100644
+--- c/src/resource/resources/ImageResource.cpp
++++ i/src/resource/resources/ImageResource.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include <cairo/cairo.h>
+ #include <pango/pangocairo.h>
++#include "../../image/utils/Format.hpp"
++#include <stdexcept>
+ 
+ using namespace Hyprgraphics;
+ using namespace Hyprutils::Memory;
+@@ -17,12 +19,17 @@ CImageResource::CImageResource(const std::string& svg, const Hyprutils::Math::Ve
+     ;
+ }
+ 
+-CImageResource::CImageResource(const std::span<const uint8_t>& data, const Hyprutils::Math::Vector2D& size) : m_svgSize(size), m_data(data) {
+-    ;
++CImageResource::CImageResource(const std::span<const uint8_t>& data, const Hyprutils::Math::Vector2D& size) : m_svgSize(size) {
++    if (data.size() > MAX_IMAGE_BYTES)
++        throw std::length_error("image exceeds 64 MiB");
++    m_data.assign(data.begin(), data.end());
+ }
+ 
+ void CImageResource::render() {
++    if (m_cancelled)
++        return;
+     auto image = !m_data.empty() ? CImage(m_data, IMAGE_FORMAT_AUTO, m_svgSize) : CImage(m_path, m_svgSize);
++    m_error    = image.getError();
+ 
+     m_asset.cairoSurface = image.cairoSurface();
+     m_asset.pixelSize    = m_asset.cairoSurface && m_asset.cairoSurface->cairo() ? m_asset.cairoSurface->size() : Hyprutils::Math::Vector2D{};
+diff --git c/src/resource/resources/TextResource.cpp i/src/resource/resources/TextResource.cpp
+index c2e9daf5ad7cf896ac9e0b1092c1d20b89eb133a..7dc4f245039f012a73a0c0cf6156bcd6070e6047 100644
+--- c/src/resource/resources/TextResource.cpp
++++ i/src/resource/resources/TextResource.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <cairo/cairo.h>
+ #include <pango/pangocairo.h>
++#include "../../image/utils/Format.hpp"
++#include <cmath>
+ 
+ using namespace Hyprgraphics;
+ using namespace Hyprutils::Memory;
+@@ -13,6 +15,12 @@ CTextResource::CTextResource(CTextResource::STextResourceData&& data) : m_data(s
+ }
+ 
+ void CTextResource::render() {
++    if (m_cancelled)
++        return;
++    if (m_data.text.size() > 1024 * 1024 || m_data.fontSize > 16384 || (m_data.maxSize && (!std::isfinite(m_data.maxSize->x) || !std::isfinite(m_data.maxSize->y)))) {
++        m_error = "text input exceeds rendering limits";
++        return;
++    }
+     auto                  CAIROSURFACE = makeUnique<CCairoSurface>(cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1 /* dummy value */));
+     auto                  CAIRO        = cairo_create(CAIROSURFACE->cairo());
+ 
+@@ -69,9 +77,9 @@ void CTextResource::render() {
+         if (m_data.ellipsize)
+             pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+         if (m_data.maxSize->x >= 0)
+-            pango_layout_set_width(layout, std::min(logical.width * PANGO_SCALE, sc<int>(m_data.maxSize->x * PANGO_SCALE)));
++            pango_layout_set_width(layout, sc<int>(std::min<double>(logical.width, std::min(16384.0, m_data.maxSize->x)) * PANGO_SCALE));
+         if (m_data.maxSize->y >= 0)
+-            pango_layout_set_height(layout, std::min(logical.height * PANGO_SCALE, sc<int>(m_data.maxSize->y * PANGO_SCALE)));
++            pango_layout_set_height(layout, sc<int>(std::min<double>(logical.height, std::min(16384.0, m_data.maxSize->y)) * PANGO_SCALE));
+         if (m_data.wrap)
+             pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+ 
+@@ -85,6 +93,12 @@ void CTextResource::render() {
+ 
+     CAIROSURFACE.reset();
+ 
++    if (m_cancelled || !validImageSize(std::max(1, logical.width), std::max(1, logical.height))) {
++        g_object_unref(layout);
++        m_error = "text dimensions exceed rendering limits";
++        return;
++    }
++
+     m_asset.cairoSurface = makeShared<CCairoSurface>(cairo_image_surface_create(CAIRO_FORMAT_ARGB32, logical.width, logical.height));
+     CAIRO                = cairo_create(m_asset.cairoSurface->cairo());
+ 
+@@ -108,4 +122,4 @@ void CTextResource::render() {
+     m_asset.pixelSize = {logical.width, logical.height};
+ 
+     cairo_destroy(CAIRO);
+-}
+\ No newline at end of file
++}
