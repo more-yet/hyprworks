@@ -7,6 +7,9 @@ desktop entries.
 Hyprworks supplies native primitives, input handling and system integrations.
 Themes, component composition, desktop layouts and interaction policy belong in Lua configuration.
 
+Version 0.2 introduces a new GUI API and Lua embedding ABI. Update shell
+configurations to the API below and rebuild C++ Lua embedders against v0.2.
+
 ## D-Bus
 
 `hw.dbus {bus = "system"}` (or `"session"`) opens an asynchronous connection.
@@ -80,12 +83,16 @@ Create `~/.config/hyprworks/main.lua`:
 
 ```lua
 local hw = require("hyprworks")
-local bar = hw.ui.layer {
-    height = 32,
-    exclusive_zone = 32,
-    anchors = {top = true, left = true, right = true},
-}
-bar:set_content {kind = "text", text = "Hyprworks", halign = "center", valign = "center"}
+local bar = assert(hw.layer {edge = "top", height = 32, exclusive = true})
+assert(bar:set_content {
+    kind = "row", padding = 6, gap = 12, background = "#20242aff",
+    children = {
+        {kind = "text", id = "clock", text = os.date("%H:%M")},
+        {kind = "button", text = "Exit", on_activate = function() hw.quit() end},
+    },
+})
+local clock = assert(bar:find("clock"))
+hw.timer(1000, function() assert(clock:set {text = os.date("%H:%M")}) end, true)
 ```
 
 Run your shell with `hyprworks`. Changes to `main.lua` automatically reload your shell.
@@ -94,69 +101,129 @@ Keep your Lua modules and themes beside `main.lua`. Hyprworks respects
 `XDG_CONFIG_HOME`; use `hyprworks --config /path/to/main.lua` to select another configuration.
 See `hyprworks --help` for command-line options.
 
-Toolkit logging shows warnings and errors by default. Set `HT_TRACE=1` when
-collecting detailed graphics and input diagnostics.
+## GUI API
 
-## Styling
+Hyprworks owns its Wayland connection, event loop, element trees and buffers.
+Cairo paints shared-memory buffers; Pango shapes and measures text. Dependencies
+are stock system libraries. GUI functions are directly on `hw`.
 
-Use `hw.ui.set_palette(table)` to set colors, fonts, rounding and the icon theme.
-Apply the palette before creating content. When switching themes, apply the new
-palette and rebuild your content.
+- `hw.layer {edge, width, height, output, layer, keyboard, exclusive, exclusive_zone, margin}`
+  creates a panel. Edges are `top`, `bottom`, `left`, `right`; layers are
+  `background`, `bottom`, `top`, `overlay`. Dimensions and margins use logical pixels.
+  A zero length along the edge stretches between its opposite anchors.
+  `edge = "all"` stretches across the output without reserving space.
+- `hw.window {width, height, title, app_id}` creates a toplevel.
+- `hw.popup {parent, x, y, width, height, grab}` creates a parent-owned popup.
+  A grab requires an input callback on the parent. Each parent has at most one
+  active or retiring popup; nested popups are supported.
+- All surfaces accept `on_configure(surface)`, `on_close(surface)` and
+  `on_grab_cleared(surface)`. `on_close` reports compositor-requested closure.
+- `surface:state()` returns `closed`, `configured`, `width`, `height`, `scale`.
+  Creation is asynchronous; use configured dimensions after `on_configure`.
+- `surface:set_content(description)` validates and atomically replaces the tree.
+  Old element handles become stale; focus and scrolling reset.
+- `surface:find(id)` returns an element handle. `element:set(properties)` updates
+  it, `element:state()` returns text, value and geometry, and `element:focus()`
+  selects keyboard focus within its surface.
+- `element:replace_children(descriptions)` atomically replaces a container's
+  children. All existing element handles become stale. Surviving elements retain
+  their text, scrolling and logical focus; active presses and composition reset.
+- `surface:close()` is idempotent and closes popup descendants. Active surfaces
+  belong to the runtime; collecting their Lua handles does not close them.
+- `hw.outputs()` returns output name, description and integer scale.
+  `hw.on_outputs(callback)` observes changes and schedules an initial notification.
+- `hw.capabilities()` reports layer-shell, fractional-scale, text-input,
+  clipboard and focus-grab support.
 
-Hyprworks resolves image icons from XDG icon themes, including inheritance,
-`hicolor` and unthemed fallbacks. Icon images refresh when `icon_theme`, their
-layout size or the output scale changes. The toolkit receives resolved paths.
-Raw RGB/RGBA image sources are converted to PNG in memory and use the toolkit's
-encoded-image API.
+Constructors/mutations return a handle or `true` on success, or `nil, error` for
+operational failure. Invalid argument types/values raise Lua errors. Callbacks
+run serially after native dispatch; uncaught callback errors stop the runtime.
+Programmatic element updates do not emit interaction callbacks.
 
-`checkbox_size` (8–64) and `checkbox_radius` (0–32, capped at size / 4) control
-selection indicators; radio indicators stay circular. Selected indicators use
-`accent` for the fill and `bright_text` for the mark. `focus` sets the keyboard-focus
-color (default: accent), and `focus_width` (1–4) sets its width. Focus rings follow
-control rounding and appear during keyboard use. Clicking retains keyboard focus
-without a ring.
+### Elements
 
-`textbox_padding_x` and `textbox_padding_y` set native text insets in logical
-pixels (0–256, default: 3). Text, selection and caret share the inset area;
-the caret follows the text line height and password fields reserve eye-button space.
+Kinds are `row`, `column`, `overlay`, `scroll`, `box`, `text`, `image`, `button`,
+`toggle`, `slider`, and single-line `input`. Containers and buttons accept a `children` array.
+Lua functions compose menus, radio groups and other shell-specific controls.
 
-Buttons accept `children` for icon and text layouts. Update a container with
-`surface:set_children(id, children)`.
+Common properties: `id`, `width`, `height`, `grow`, `padding`, `gap`, `radius`,
+`background`, `color`, `accent`, `enabled`, `border_width`, `border_color`.
+`x`/`y` offset the arranged position. `halign` accepts `stretch` (default),
+`left`, `center`, `right`; `valign` accepts `stretch`, `top`, `center`, `bottom`.
+Alignment applies outside the parent's row/column flow axis.
+Dimensions default to natural size
+(`-1`); `grow` shares remaining space along a row/column. Overflow clips.
+Scroll containers arrange their children vertically; wheel input scrolls them.
+Their `scroll` property and element state expose the vertical offset.
+Use `horizontal = true` for horizontal arrangement and scrolling.
+Text uses `text`, a Pango `font` description (default `"Sans 12"`), `wrap`,
+and `align` (`left`, `center`, `right`).
+Font sizes are capped at 256. Colors use `#RRGGBB` or `#RRGGBBAA`.
+
+Buttons call `on_activate(element, event)`. Toggles, sliders and inputs call
+`on_change(element, event)` with `{kind = "change", text, value}`. Toggle values
+are 0/1; slider values are in 0..1. IDs are immutable and unique within a tree.
+
+Images accept one `source`:
+
+```lua
+{kind = "image", width = 24, height = 24,
+ source = {icon = "audio-volume-high", theme = "hicolor"}}
+{kind = "image", source = {path = "/path/to/image.png"}}
+{kind = "image", source = {data = encoded_png_or_svg}}
+{kind = "image", source = {data = rgba_bytes, width = 2, height = 1, channels = 4}}
+```
+
+RGB/RGBA data is tightly packed and converted directly to premultiplied pixels.
+PNG and SVG decode asynchronously; SVG `source.pixels` selects raster width
+(default 64). Icon resolution follows XDG theme inheritance and refreshes at
+layout/scale changes. Change the theme by setting a new source. Images call
+`on_loaded(element, event)` with `kind = "loaded"` and an optional `error`.
+Replacing a source/tree or closing its surface suppresses obsolete completions.
+
+Limits: 32 active/retiring surfaces, 2048 elements and depth 32 per tree,
+16 KiB per text, 1 MiB tree strings, 8 MiB encoded/raw input per image, image
+dimensions up to 4096, 128 MiB accounted image storage and 256 MiB presentation
+storage. Image jobs wait behind a bounded worker queue; busy buffers are reused
+only after compositor release. Presentation-budget exhaustion reclaims idle
+buffers and reports an error if capacity is still insufficient.
 
 ## Focus and input
 
-The GUI chooses focus and dismissal per surface. `hw.ui.window` creates a regular
-compositor-managed window. `hw.ui.layer` accepts `keyboard = "none"` (default),
+The GUI chooses focus and dismissal per surface. `hw.layer` accepts
+`keyboard = "none"` (default),
 `"on_demand"` (compositor-controlled focus), or `"exclusive"` (keyboard priority).
 The compositor controls how on-demand layers receive focus.
 
 `surface:grab_focus()` explicitly restricts input to that surface through
-Hyprland's focus-grab protocol. This also prevents background scrolling.
-`surface:release_focus()` removes the grab; `on_focus_cleared(surface)` reports
+Hyprland's focus-grab protocol.
+`surface:release_focus()` removes the grab; `on_grab_cleared(surface)` reports
 compositor cancellation. Configure focus grabs and surface dismissal in Lua.
 
-In GUI invocations, `hw.hyprland.shortcuts` shares the GUI's Wayland connection
-and ordered, bounded input queue. Its events include `pointer_surface` (the
-surface under the pointer when the event arrived, or nil), `pointer_x` and
-`pointer_y` in that surface's logical coordinates, and `surfaces`, a set
-keyed by surface handles. Membership means the surface was visible at receipt
-and has stayed visible through delivery. Use these event-time snapshots when
-handling presses. GUI shortcuts use the GUI display; `display` is only
-available to headless invocations, which own an independent connection.
+`surface:set_input_region(rectangles)` accepts `{x, y, width, height}` rectangles;
+an empty list makes the surface input-transparent, and `nil` restores the default.
 
-The GUI can use non-consuming compositor mouse bindings and these snapshots to
-choose outside-press dismissal. Bind the buttons used by your dismissal policy.
-Control and shortcut callbacks retain input order. Hiding a surface invalidates
-its queued control callbacks. The shared input queue holds at most 256 events;
-exhaustion terminates the invocation with an error.
+Keyboard input supports tab navigation, key repeat, compose sequences, selection,
+grapheme deletion, visual cursor movement and text-input-v3 IME transactions.
+Each surface has one logical focus and one active press. A new press takes
+ownership; motions, releases and cancellation from other seats or pointer/touch
+sources cannot complete or alter it.
+Surface `on_input(surface, event)` callbacks observe `motion`, `leave`, `button`,
+`axis`, `key`, `focus`, and `blur` before element dispatch. Events carry `seat`,
+`x`, `y`, `delta`, `touch`, `pressed`, `ctrl`, `alt`, `shift`, the XKB `key` name,
+and the Linux `button` code for pointer buttons. Returning true consumes a key
+event; pointer events still complete native press/cancellation handling.
+Inputs support Ctrl+A/C/X/V. `hw.clipboard_read(function(text, error) ... end)`
+starts a bounded asynchronous read; `hw.clipboard_write(text)` requires an input
+callback. Transfers have a five-second deadline and a 1 MiB limit.
+Inputs with `password = true` mask text and disable copying/cutting and IME
+surrounding-text exchange. Keyboard composition and paste remain available.
+`placeholder` displays a hint while an input is empty.
 
-Surfaces accept `on_pointer_enter(surface)` and `on_pointer_leave(surface)`.
-These observe entry into or exit from the surface's input region, including
-movement across child controls. `surface:status().pointer_inside` reports the
-current state, with `pointer_x` and `pointer_y` in surface-local logical coordinates
-while the pointer is inside. Transitions are coalesced before Lua dispatch;
-pointer state survives content replacement. Hiding or closing a surface clears
-it and cancels pending pointer callbacks.
+In GUI invocations, `hw.hyprland.shortcuts` shares the runtime's Wayland connection.
+Its events contain `id`, `pressed`, `seconds`, and `nanoseconds`. Headless shortcuts
+own their connection. Unrelated integration sources have no global event ordering.
+Ordered GUI input is bounded to 256 queued events; exhaustion reports an error.
 
 ## Starting with your session
 
@@ -186,58 +253,43 @@ Requires a C++23 compiler, CMake 4.5+, Ninja, pkg-config and these dependencies:
 | Component | Dependency |
 |---|---|
 | Core | json-c 0.19+, Lua 5.5.1+ |
-| GUI | Patched hyprtoolkit/hyprgraphics 0.6.0, xkbcommon 1.13.2+, Cairo, GLib |
+| GUI | wayland-client/scanner 1.26+, wayland-protocols 1.45+, xkbcommon 1.13.2+, Cairo, Pango, libpng, librsvg |
 | D-Bus integrations | libsystemd 262+ |
 | Audio | libpulse 17+ |
 | Global shortcuts | wayland-client and wayland-scanner 1.26+ |
 | Desktop entries | gio-unix-2.0 2.90.1+ |
 
-### Dependency patches
-
-Use the `v0.6.0` tags of hyprgraphics and hyprtoolkit. Each patch applies directly
-to its upstream tag:
-
-- hyprgraphics: `patches/hyprgraphics-0.6.0-resource-lifetime.patch`
-- hyprtoolkit: `patches/hyprtoolkit-0.6.0-shell.patch`
-
-Place the patched source trees in `build/deps/hyprgraphics` and
-`build/deps/hyprtoolkit`. From the Hyprworks directory, build and install them into
-a private prefix:
-
-```sh
-for library in hyprgraphics hyprtoolkit; do
-  PKG_CONFIG_PATH="$PWD/build/deps/prefix/lib/pkgconfig" \
-    cmake -S "build/deps/$library" -B "build/deps/$library/build" -G Ninja \
-      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
-      -DCMAKE_INSTALL_PREFIX="$PWD/build/deps/prefix" -DCMAKE_INSTALL_LIBDIR=lib \
-      '-DCMAKE_INSTALL_RPATH=$ORIGIN' || break
-  cmake --build "build/deps/$library/build" --target "$library" || break
-  cmake --install "build/deps/$library/build" || break
-done
-```
-
-These dependencies also require a C++26-capable compiler, hyprwayland-scanner and
-wayland-protocols.
-
 ### Build and run
 
 ```sh
-PKG_CONFIG_PATH="$PWD/build/deps/prefix/lib/pkgconfig" cmake -S . -B build/local -G Ninja \
+cmake -S . -B build/local -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib
 cmake --build build/local
 build/local/hyprworks
 ```
 
-For packaging, stage the installation with `DESTDIR="$pkgdir" cmake --install build/local`.
-The installation includes the patched graphics libraries under `lib/hyprworks`
-(`/usr/lib/hyprworks` with the prefix above), using their normal filenames.
-Hyprworks finds them through embedded runtime paths; keep the dependency build's
-`$ORIGIN` setting so hyprtoolkit also finds its adjacent hyprgraphics copy.
-Dependency headers and pkg-config files stay in the development prefix.
+For packaging, stage with `DESTDIR="$pkgdir" cmake --install build/local`.
+`HYPRWORKS_BUILD_GUI=OFF` omits GUI dependencies. No private dependency libraries
+or patches are installed.
+
+Core ownership/concurrency checks: configure with `HYPRWORKS_BUILD_TESTS=ON`,
+build, then `ctest --test-dir build/local --output-on-failure`.
+`ctest --test-dir build/local -R image-worker --output-on-failure` runs the
+worker checks independently of font initialization, including under ThreadSanitizer.
+`build/local/hyprworks --config tests/gui.lua` exercises lifecycle behavior against
+a running compositor, creating temporary windows and a layer surface.
 
 ### C++ embedding
 
 Use `find_package(hyprworks CONFIG REQUIRED)` and link `hyprworks::hyprworks`.
 For Lua embedding, request `COMPONENTS lua` and link `hyprworks::lua`.
 Both targets also support `add_subdirectory`.
+`hyprworks::lua::Invocation` owns load/run/close and supports
+`EventLoop::headless` or `EventLoop::gui`. Only quit/reload requests are
+cross-thread operations; the caller must keep the invocation alive until all
+requesting threads have stopped. The GUI wait/read protocol is private.
+Embedders may pass a borrowed `SignalSource` with a nonblocking wake-pipe read
+descriptor. Producers atomically set its `quit`/`reload` pending bits before
+writing a wake byte; the source and pipe must outlive the invocation.
+The CLI uses this mechanism without blocking signals inherited by launched apps.

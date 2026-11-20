@@ -35,16 +35,15 @@
 #include "binding.hpp"
 #include <array>
 #include <atomic>
-#ifdef HYPRWORKS_HAS_TOOLKIT
-#include "gui/icons.hpp"
-#include <hyprtoolkit/core/Backend.hpp>
-#include <hyprtoolkit/core/Output.hpp>
-#endif
 
 namespace hyprworks::lua {
 
 namespace native = hyprworks::hyprland;
-struct Surface;
+struct Gui;
+struct WaitSet {
+    std::vector<pollfd> fds;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+};
 
 struct TimerBinding {
     host::Timer timer;
@@ -202,11 +201,11 @@ struct InvocationState {
     std::atomic<bool> quit_requested{false};
     std::atomic<bool> reload_requested{false};
     int wake_fd = -1;
+    SignalSource* signals = nullptr;
     bool loaded = false;
     bool closing = false;
     int exit_code = 0;
-    std::uint64_t generation = 0;
-    std::size_t prepared_fd_count = 0;
+    WaitSet wait;
     std::vector<std::unique_ptr<WorkspaceBinding>> workspaces;
     std::vector<std::unique_ptr<TimerBinding>> timers;
     std::vector<std::unique_ptr<ProcessBinding>> processes;
@@ -249,36 +248,8 @@ struct InvocationState {
 #ifdef HYPRWORKS_HAS_UPOWER
     std::optional<PowerBinding> power;
 #endif
-#ifdef HYPRWORKS_HAS_TOOLKIT
-    Hyprutils::Memory::CSharedPointer<Hyprtoolkit::IBackend> backend;
-    std::optional<IconTheme> icons;
-    std::vector<std::unique_ptr<Surface>> surfaces;
-    struct OutputSubscription {
-        Hyprutils::Memory::CSharedPointer<Hyprtoolkit::IOutput> output;
-        Hyprutils::Signal::CHyprSignalListener changed, removed;
-    };
-    Hyprutils::Signal::CHyprSignalListener output_added, backend_destroying;
-    std::vector<OutputSubscription> outputs;
-    int on_outputs = LUA_NOREF;
-    bool outputs_pending = false;
-    struct InputEvent {
-        enum class Kind { control, global_shortcut } kind = Kind::control;
-        Surface* surface = nullptr;
-        std::uint64_t generation = 0;
-        std::size_t element = 0;
-        std::uint64_t source = 0;
-        std::uint64_t epoch = 0;
-        float value = 0;
-        std::string text;
-#ifdef HYPRWORKS_HAS_SHORTCUTS
-        shortcuts::Event shortcut;
-        double pointer_x = 0, pointer_y = 0;
-        std::vector<std::pair<Surface*, std::uint64_t>> visible_surfaces;
-#endif
-    };
-    std::array<InputEvent, 256> events{};
-    std::size_t event_count = 0;
-    const char* gui_error = nullptr;
+#ifdef HYPRWORKS_HAS_GUI
+    std::unique_ptr<Gui> gui;
 #endif
 };
 
@@ -287,13 +258,6 @@ inline InvocationState& invocation(lua_State* lua) {
 }
 
 void wake(InvocationState& state) noexcept;
-
-#ifdef HYPRWORKS_HAS_TOOLKIT
-Hyprutils::Memory::CSharedPointer<Hyprtoolkit::IBackend> gui_backend(InvocationState& state);
-void open_gui(lua_State* lua);
-int dispatch_gui(InvocationState& state);
-void close_gui(InvocationState& state) noexcept;
-#endif
 
 bool active(const WorkspaceBinding& binding);
 bool pending(const WorkspaceBinding& binding);

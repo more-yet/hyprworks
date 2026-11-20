@@ -1,70 +1,56 @@
 #include <hyprworks/lua.hpp>
-#include <atomic>
-
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
 #include <iostream>
 #include <string_view>
 #include <system_error>
+#include <unistd.h>
+#include <vector>
 
 namespace {
-std::atomic<hyprworks::lua::Invocation*> active_invocation{nullptr};
-static_assert(decltype(active_invocation)::is_always_lock_free);
+// Signal handlers and GLib threads can outlive an invocation; these endpoints
+// stay open until process exit.
+hyprworks::lua::SignalSource signals;
+int signal_write_fd = -1;
 
-void interrupt(int signal) {
-    if (auto* invocation = active_invocation.load(std::memory_order_relaxed)) {
-        if (signal == SIGHUP) invocation->request_reload();
-        else invocation->request_quit();
-    }
+void receive_signal(int signal) {
+    const int saved = errno;
+    signals.pending.fetch_or(signal == SIGHUP ? hyprworks::lua::SignalSource::reload :
+        hyprworks::lua::SignalSource::quit, std::memory_order_relaxed);
+    const char wake = 0;
+    while (write(signal_write_fd, &wake, 1) < 0 && errno == EINTR) {}
+    errno = saved;
 }
 
-struct SignalHandlers {
-    struct sigaction previous_int{}, previous_term{}, previous_hup{};
-
-    explicit SignalHandlers(hyprworks::lua::Invocation& invocation) {
-        struct sigaction action{};
-        action.sa_handler = interrupt;
-        sigemptyset(&action.sa_mask);
-        active_invocation.store(&invocation, std::memory_order_relaxed);
-        if (sigaction(SIGINT, &action, &previous_int) < 0) {
-            active_invocation.store(nullptr, std::memory_order_relaxed);
-            throw std::system_error(errno, std::generic_category(), "SIGINT handler");
-        }
-        if (sigaction(SIGTERM, &action, &previous_term) < 0) {
-            const int error = errno;
-            active_invocation.store(nullptr, std::memory_order_relaxed);
-            sigaction(SIGINT, &previous_int, nullptr);
-            throw std::system_error(error, std::generic_category(), "SIGTERM handler");
-        }
-        if (sigaction(SIGHUP, &action, &previous_hup) < 0) {
-            const int error = errno;
-            active_invocation.store(nullptr, std::memory_order_relaxed);
-            sigaction(SIGINT, &previous_int, nullptr); sigaction(SIGTERM, &previous_term, nullptr);
-            throw std::system_error(error, std::generic_category(), "SIGHUP handler");
-        }
-    }
-
-    ~SignalHandlers() {
-        active_invocation.store(nullptr, std::memory_order_relaxed);
-        sigaction(SIGTERM, &previous_term, nullptr);
-        sigaction(SIGHUP, &previous_hup, nullptr);
-        sigaction(SIGINT, &previous_int, nullptr);
-    }
-    SignalHandlers(const SignalHandlers&) = delete;
-    SignalHandlers& operator=(const SignalHandlers&) = delete;
-};
+void start_signals() {
+    static_assert(std::atomic<unsigned>::is_always_lock_free);
+    int pipe[2];
+    if (pipe2(pipe, O_CLOEXEC | O_NONBLOCK) < 0)
+        throw std::system_error(errno, std::generic_category(), "create signal pipe");
+    signals.fd = pipe[0]; signal_write_fd = pipe[1];
+    struct sigaction action{};
+    action.sa_handler = receive_signal;
+    sigemptyset(&action.sa_mask);
+    for (const int signal : {SIGINT, SIGTERM, SIGHUP}) sigaddset(&action.sa_mask, signal);
+    for (const int signal : {SIGINT, SIGTERM, SIGHUP})
+        if (sigaction(signal, &action, nullptr) < 0)
+            throw std::system_error(errno, std::generic_category(), "install runtime signal handler");
+    if (sigprocmask(SIG_UNBLOCK, &action.sa_mask, nullptr) < 0)
+        throw std::system_error(errno, std::generic_category(), "unblock runtime signals");
+}
 
 }
 
 int main(int argc, char** argv) {
-    bool toolkit = HYPRWORKS_DEFAULT_TOOLKIT;
+    bool gui = HYPRWORKS_DEFAULT_GUI;
     const char* config_file = nullptr;
     int entry = 1;
     while (entry < argc) {
         const std::string_view option(argv[entry]);
-        if (option == "--headless") toolkit = false;
+        if (option == "--headless") gui = false;
         else if (option == "--config" || option == "-c") {
             if (++entry == argc || !*argv[entry]) {
                 std::cerr << option << " requires a Lua configuration file\n";
@@ -110,9 +96,9 @@ int main(int argc, char** argv) {
         }
         const auto filename = std::filesystem::absolute(entry_file).lexically_normal().string();
         std::vector<std::string> arguments(argv + entry, argv + argc);
+        start_signals();
         for (;;) {
-            hyprworks::lua::Invocation invocation(toolkit ? hyprworks::lua::EventLoop::toolkit : hyprworks::lua::EventLoop::headless);
-            SignalHandlers signals(invocation);
+            hyprworks::lua::Invocation invocation(gui ? hyprworks::lua::EventLoop::gui : hyprworks::lua::EventLoop::headless, &signals);
             if (auto loaded = invocation.load(filename, arguments); !loaded) {
                 std::cerr << loaded.error() << '\n';
                 return 1;
@@ -121,7 +107,8 @@ int main(int argc, char** argv) {
                 std::cerr << result.error() << '\n';
                 return 1;
             }
-            if (!invocation.reload_requested()) return invocation.exit_code();
+            if (!invocation.reload_requested() || (signals.pending.load(std::memory_order_relaxed) & hyprworks::lua::SignalSource::quit))
+                return invocation.exit_code();
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

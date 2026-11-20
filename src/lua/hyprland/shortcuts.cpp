@@ -1,6 +1,6 @@
 #include "../invocation.hpp"
-#ifdef HYPRWORKS_HAS_TOOLKIT
-#include "../gui/surface.hpp"
+#ifdef HYPRWORKS_HAS_GUI
+#include "../gui/gui.hpp"
 #endif
 
 #include <utility>
@@ -12,33 +12,14 @@ constexpr char shortcut_metatable[] = "hyprworks.hyprland.shortcuts";
 
 std::expected<void, std::string> start_shortcuts(InvocationState& state) {
     auto& binding = *state.shortcuts;
-#ifdef HYPRWORKS_HAS_TOOLKIT
-    if (state.loop == EventLoop::toolkit) {
+#ifdef HYPRWORKS_HAS_GUI
+    if (state.gui) {
         if (!binding.display.empty())
             return std::unexpected("GUI shortcuts use the GUI display");
-        auto* display = gui_backend(state)->waylandDisplay();
-        if (!display) return std::unexpected("GUI shortcuts require a Wayland backend");
+        auto* display = state.gui->display;
         return binding.connection.attach(display, binding.app_id, binding.shortcuts, [&state, &binding](shortcuts::Event native) {
-            if (state.event_count == state.events.size()) {
-                state.gui_error = "GUI input event queue limit reached";
-                return;
-            }
-            InvocationState::InputEvent event;
-            event.kind = InvocationState::InputEvent::Kind::global_shortcut;
-            event.generation = binding.generation;
-            event.shortcut = std::move(native);
-            for (const auto& surface : state.surfaces) {
-                if (!surface->closed && surface->visible) {
-                    event.visible_surfaces.emplace_back(surface.get(), surface->epoch);
-                    if (surface->pointer_inside) {
-                        event.surface = surface.get();
-                        const auto position = surface->window->cursorPos();
-                        event.pointer_x = position.x;
-                        event.pointer_y = position.y;
-                    }
-                }
-            }
-            state.events[state.event_count++] = std::move(event);
+            if (binding.events.size() == 256) throw std::runtime_error("shortcut event queue limit reached");
+            binding.events.push_back(std::move(native));
         }, [&state]() noexcept { wake(state); });
     }
 #endif

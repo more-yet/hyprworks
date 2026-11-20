@@ -1,40 +1,33 @@
 #pragma once
 
-#include <chrono>
-#include <cstdint>
 #include <expected>
+#include <atomic>
 #include <memory>
-#include <optional>
 #include <span>
 #include <string>
-#include <vector>
-#include <poll.h>
 
 namespace hyprworks::lua {
 
 struct InvocationState;
-enum class EventLoop { headless, toolkit };
+enum class EventLoop { headless, gui };
 
-struct WaitSet {
-    std::vector<pollfd> fds;
-    std::optional<std::chrono::steady_clock::time_point> deadline;
-
-private:
-    friend class Invocation;
-    std::uint64_t generation = 0;
+struct SignalSource {
+    enum : unsigned { quit = 1, reload = 2 };
+    int fd = -1;
+    std::atomic<unsigned> pending{0};
 };
 
 class Invocation {
 public:
-    explicit Invocation(EventLoop loop = EventLoop::headless);
+    // The optional source must outlive the invocation. Its fd is a borrowed nonblocking
+    // wake pipe; producers set pending bits before writing a byte to the pipe.
+    explicit Invocation(EventLoop loop = EventLoop::headless, SignalSource* signals = nullptr);
     ~Invocation();
     Invocation(const Invocation&) = delete;
     Invocation& operator=(const Invocation&) = delete;
 
     std::expected<void, std::string> load(const std::string& entry_file, std::span<const std::string> arguments = {});
     std::expected<void, std::string> run();
-    WaitSet prepare_wait();
-    std::expected<void, std::string> dispatch(const WaitSet& ready);
     bool running() const noexcept;
     int exit_code() const noexcept;
     void request_quit() noexcept;
@@ -43,6 +36,8 @@ public:
     void close() noexcept;
 
 private:
+    void prepare_wait();
+    void dispatch();
     std::unique_ptr<InvocationState> state_;
 };
 
