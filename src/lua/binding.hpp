@@ -23,7 +23,7 @@ int operation_call(lua_State* lua) {
     return result < 0 ? lua_error(lua) : result;
 }
 
-inline void string_field(lua_State* lua, const char* name, const std::string& value) {
+inline void string_field(lua_State* lua, const char* name, std::string_view value) {
     lua_pushlstring(lua, value.data(), value.size());
     lua_setfield(lua, -2, name);
 }
@@ -85,17 +85,20 @@ inline bool boolean_field(lua_State* lua, int table, const char* name, bool fall
     return value;
 }
 
-inline void text_field(lua_State* lua, int table, const char* name, std::string& value, std::size_t limit = 16384) {
+inline bool text_field(lua_State* lua, int table, const char* name, std::string& value, std::size_t limit = 16384) {
     field(lua, table, name);
+    bool changed = false;
     if (!lua_isnil(lua, -1)) {
         luaL_checktype(lua, -1, LUA_TSTRING);
         std::size_t size;
         const char* text = lua_tolstring(lua, -1, &size);
         if (size > limit || std::string_view(text, size).contains('\0'))
             luaL_error(lua, "%s is too long or contains NUL", name);
-        value.assign(text, size);
+        changed = value != std::string_view(text, size);
+        if (changed) value.assign(text, size);
     }
     lua_pop(lua, 1);
+    return changed;
 }
 
 inline int enum_field(lua_State* lua, int table, const char* name, const char* fallback, const char* const* choices) {

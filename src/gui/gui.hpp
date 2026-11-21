@@ -37,6 +37,7 @@ struct Gui;
 struct Box {
     double x = 0, y = 0, w = 0, h = 0;
     bool contains(double px, double py) const { return px >= x && py >= y && px < x + w && py < y + h; }
+    bool operator==(const Box&) const = default;
 };
 
 enum class Kind { row, column, scroll, box, text, image, button, toggle, slider, input };
@@ -46,15 +47,20 @@ struct Element {
     Kind kind = Kind::box;
     int parent = -1, end = 0;
     std::string id, text, placeholder, font = "Sans 12";
+    std::string accessible_role, accessible_name, accessible_description;
+    bool accessible_hidden = false;
     double width = -1, height = -1, grow = 0, padding = 0, gap = 0, radius = 0;
     double x = 0, y = 0, border_width = 0;
     int halign = 0, valign = 0, align = 0;
-    double value = 0, scroll = 0, scroll_limit = 0, natural_w = 0, natural_h = 0;
+    double value = 0, scroll = 0, scroll_limit = 0;
     std::optional<double> scroll_origin;
     std::uint32_t background = 0, color = 0xffffffff, accent = 0x8ab4f8ff, border_color = 0;
     bool enabled = true, wrap = false, password = false, horizontal = false;
     int callback = -2;
     Box box, clip;
+    double intrinsic_w = 0, intrinsic_h = 0, measured_width = -1, measured_height = 0;
+    int text_width = -1;
+    bool measure_dirty = true, arrange_dirty = true, text_dirty = true;
     PangoLayout* layout = nullptr;
     std::shared_ptr<Image> image;
     bool image_notified = false;
@@ -101,6 +107,8 @@ struct Surface {
     SurfaceFocus reported_focus;
     double scale = 1;
     int focused = -1, pressed = -1;
+    int key_pressed = -1;
+    std::uint32_t key_seat = 0, key_code = 0, key_serial = 0;
     bool focus_visible = false;
     std::uint32_t press_serial = 0, press_seat = 0;
     bool press_touch = false;
@@ -122,6 +130,7 @@ struct Buffer {
     std::size_t bytes = 0;
     int width = 0, height = 0;
     bool busy = false;
+    Box damage;
     ~Buffer();
 };
 
@@ -185,9 +194,9 @@ struct Seat {
 struct Input {
     enum class Type { motion, leave, button, axis, key, focus, blur, ime, ime_leave } type = Type::motion;
     std::uint64_t surface = 0, revision = 0, generation = 0, keyboard_generation = 0;
-    std::uint32_t seat = 0, serial = 0, key = 0;
+    std::uint32_t seat = 0, serial = 0, key = 0, code = 0;
     double x = 0, y = 0, delta = 0;
-    bool pressed = false, shift = false, ctrl = false, alt = false, touch = false, horizontal = false;
+    bool pressed = false, shift = false, ctrl = false, alt = false, touch = false, horizontal = false, repeated = false;
     std::string text{}, preedit{};
     int element = -1, preedit_cursor = 0, preedit_end = 0;
     bool commit_set = false, preedit_set = false;
@@ -258,7 +267,9 @@ void protocol(Gui& gui, Function&& function) noexcept {
     catch (...) { gui.error = "cannot retain Wayland event"; }
 }
 
-inline void dirty(Surface& surface) { surface.dirty = surface.layout_dirty = true; }
+void dirty(Surface& surface);
+void damage(Surface& surface, Box box);
+void invalidate_element(Surface& surface, int index, bool geometry = false);
 
 inline bool focusable(const Element& element) {
     return element.enabled && (element.kind == Kind::button || element.kind == Kind::toggle ||
@@ -292,6 +303,7 @@ void reveal_focus(Surface& surface, bool native);
 int layout_index(const Element& element, int index);
 PangoRectangle input_cursor(Element& element, bool focused);
 void render(Surface& surface);
+Box paint_buffer(Surface& surface, Buffer& buffer);
 
 extern const wl_seat_listener seat_listener;
 extern const wl_keyboard_listener keyboard_listener;

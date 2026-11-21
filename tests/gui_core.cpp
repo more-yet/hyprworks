@@ -402,6 +402,102 @@ int main(int argc, char**) {
     script("assert(activations == 0)");
 
     script(R"(
+        assert(surface:set_content {kind = "row", children = {
+            {kind = "button", id = "key", text = "Activate", on_activate = function() activations = activations + 1 end},
+            {kind = "toggle", id = "toggle"},
+        }})
+        assert(surface:find("key"):focus())
+    )");
+    Input key_press{.type = Input::Type::key, .surface = 1, .seat = 7, .serial = 50,
+        .key = XKB_KEY_Return, .code = KEY_ENTER, .pressed = true};
+    Input key_repeat = key_press; key_repeat.serial = 0; key_repeat.repeated = true;
+    Input key_release = key_press; key_release.pressed = false;
+    assert(process_input(gui, key_press) == -1 && surface.key_pressed == index_of("key"));
+    assert(process_input(gui, key_repeat) == -1);
+    key_release.seat = 12;
+    assert(process_input(gui, key_release) == -1 && surface.key_pressed == index_of("key"));
+    key_release.seat = 7; key_release.code = KEY_SPACE;
+    assert(process_input(gui, key_release) == -1 && surface.key_pressed == index_of("key"));
+    key_release.code = KEY_ENTER; key_release.key = XKB_KEY_space;
+    assert(process_input(gui, key_release) == index_of("key") && surface.key_pressed == -1);
+    assert(process_input(gui, key_release) == -1);
+    assert(process_input(gui, key_repeat) == -1 && surface.key_pressed == -1);
+    process_input(gui, key_press);
+    focus(surface, index_of("toggle")); focus(surface, index_of("key"));
+    assert(process_input(gui, key_release) == -1);
+    process_input(gui, key_press);
+    script("assert(surface:find('key'):set {enabled = false}); assert(surface:find('key'):set {enabled = true}); assert(surface:find('key'):focus())");
+    assert(process_input(gui, key_release) == -1);
+    process_input(gui, key_press);
+    Input key_blur{.type = Input::Type::blur, .surface = 1, .seat = 7};
+    process_input(gui, key_blur);
+    assert(process_input(gui, key_release) == -1);
+    process_input(gui, key_press);
+    script(R"(
+        assert(surface:set_content({kind = "button", id = "key",
+            on_activate = function() activations = activations + 1 end}, {preserve_state = true}))
+    )");
+    assert(surface.focused == 0 && process_input(gui, key_release) == -1);
+    script(R"(
+        function consume_release(_, event) return event.kind == "key" and not event.pressed end
+    )");
+    lua_getglobal(state.lua, "consume_release"); surface.on_input = luaL_ref(state.lua, LUA_REGISTRYINDEX);
+    enqueue(*keyboard, key_press); enqueue(*keyboard, key_repeat); enqueue(*keyboard, key_release);
+    assert(dispatch_input(gui) == 0 && surface.key_pressed == -1);
+    script("assert(activations == 0)");
+    unref(state.lua, surface.on_input);
+    enqueue(*keyboard, key_press); enqueue(*keyboard, key_repeat); enqueue(*keyboard, key_release);
+    assert(dispatch_input(gui) == 0);
+    script(R"(
+        assert(activations == 1)
+        assert(surface:set_content {kind = "row", children = {
+            {kind = "button", id = "key", on_activate = function() activations = activations + 1 end},
+            {kind = "button", id = "other"},
+        }})
+        assert(surface:find("key"):focus())
+        function redirect_key(_, event)
+            if event.pressed then
+                assert(surface:find("other"):focus())
+                assert(surface:find("key"):focus())
+            end
+        end
+    )");
+    key_press.key = key_repeat.key = key_release.key = XKB_KEY_space;
+    key_press.code = key_repeat.code = key_release.code = KEY_SPACE;
+    lua_getglobal(state.lua, "redirect_key"); surface.on_input = luaL_ref(state.lua, LUA_REGISTRYINDEX);
+    enqueue(*keyboard, key_press); enqueue(*keyboard, key_release);
+    assert(dispatch_input(gui) == 0);
+    script("assert(activations == 1)");
+    unref(state.lua, surface.on_input);
+    key_press.serial = 0;
+    enqueue(*keyboard, key_press); enqueue(*keyboard, key_repeat); enqueue(*keyboard, key_release);
+    assert(dispatch_input(gui) == 0);
+    script("assert(activations == 2)");
+
+    script(R"(
+        nested_events = 0
+        local function changed() nested_events = nested_events + 1 end
+        assert(surface:set_content {kind = "box", children = {
+            {kind = "scroll", id = "outer", width = 100, height = 100, on_change = changed, children = {
+                {kind = "column", height = 300, children = {
+                    {kind = "scroll", id = "inner", width = 100, height = 80, on_change = changed,
+                        children = {{kind = "box", height = 100}}},
+                    {kind = "box", height = 220},
+                }},
+            }},
+            {kind = "scroll", id = "sibling", x = 150, width = 100, height = 100,
+                children = {{kind = "box", height = 300}}},
+        }})
+    )");
+    Input nested_wheel{.type = Input::Type::axis, .surface = 1, .seat = 7, .x = 10, .y = 10, .delta = 35};
+    process_input(gui, nested_wheel);
+    assert(surface.elements[static_cast<std::size_t>(index_of("inner"))].scroll == 20);
+    assert(surface.elements[static_cast<std::size_t>(index_of("outer"))].scroll == 15);
+    assert(surface.elements[static_cast<std::size_t>(index_of("sibling"))].scroll == 0);
+    assert(dispatch_scroll(surface) == 0);
+    script("assert(nested_events == 2)");
+
+    script(R"(
         scroll_events = {}
         function scroller(horizontal)
             return {kind = "scroll", id = "scroll", width = 100, height = 100, horizontal = horizontal,
@@ -468,6 +564,84 @@ int main(int argc, char**) {
     wheel.x = 110; process_input(gui, wheel);
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 3)");
+    {
+        surface.width = 480; surface.height = 160; surface.scale = 1.25;
+        script(R"(
+            assert(surface:set_content {kind = "box", background = "#203040", children = {
+                {kind = "column", width = 120, children = {
+                    {kind = "text", id = "paint", text = "Paint", width = 100, wrap = true},
+                    {kind = "button", id = "below", text = "Below"},
+                }},
+                {kind = "text", id = "stable", text = "Unchanged shaping", x = 200, width = 220},
+                {kind = "box", x = 30, y = 10, width = 40, height = 40, background = "#ff000060"},
+            }})
+        )");
+        const auto buffer = [&] {
+            auto value = std::make_unique<Buffer>();
+            value->gui = &gui; value->surface = surface.id;
+            value->width = static_cast<int>(std::ceil(surface.width * surface.scale));
+            value->height = static_cast<int>(std::ceil(surface.height * surface.scale));
+            value->cairo = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, value->width, value->height);
+            assert(cairo_surface_status(value->cairo) == CAIRO_STATUS_SUCCESS);
+            value->damage = {0, 0, double(surface.width), double(surface.height)};
+            return value;
+        };
+        gui.buffers.push_back(buffer()); gui.buffers.push_back(buffer());
+        auto& first = *gui.buffers[0]; auto& delayed = *gui.buffers[1];
+        auto reference = buffer();
+        paint_buffer(surface, first); paint_buffer(surface, delayed);
+        delayed.busy = true;
+        const auto size = static_cast<std::size_t>(cairo_image_surface_get_stride(delayed.cairo) * delayed.height);
+        const auto* pixels = cairo_image_surface_get_data(delayed.cairo);
+        const std::vector<unsigned char> submitted(pixels, pixels + size);
+        const auto compare = [&](Buffer& repaired) {
+            reference->damage = {0, 0, double(surface.width), double(surface.height)};
+            paint_buffer(surface, *reference);
+            assert(std::memcmp(cairo_image_surface_get_data(repaired.cairo),
+                cairo_image_surface_get_data(reference->cairo), size) == 0);
+        };
+        auto& stable = surface.elements[static_cast<std::size_t>(index_of("stable"))];
+        const auto shaping = pango_layout_get_serial(stable.layout);
+        script("assert(surface:find('paint'):set {color = '#00ff00'})");
+        assert(!surface.layout_dirty);
+        const auto repaired = paint_buffer(surface, first);
+        assert(repaired.w * repaired.h < first.width * first.height / 2);
+        compare(first);
+        script(R"(
+            assert(surface:find("paint"):set {text = "Text that wraps across several lines"})
+            assert(surface:find("below"):set {background = "#0055ff80"})
+        )");
+        paint_buffer(surface, first); compare(first);
+        assert(pango_layout_get_serial(stable.layout) == shaping);
+        script("assert(surface:find('paint'):set {text = 'Small', x = 5, y = 3})");
+        paint_buffer(surface, first); compare(first);
+        assert(std::memcmp(cairo_image_surface_get_data(delayed.cairo), submitted.data(), size) == 0);
+        delayed.busy = false;
+        paint_buffer(surface, delayed); compare(delayed);
+        std::vector<Box> boxes;
+        for (const auto& element : surface.elements) boxes.push_back(element.box);
+        dirty(surface); layout(surface);
+        for (std::size_t i = 0; i < boxes.size(); ++i) assert(surface.elements[i].box == boxes[i]);
+        paint_buffer(surface, first); compare(first);
+        script(R"(
+            assert(surface:set_content {kind = "scroll", id = "viewport", background = "#203040", children = {
+                {kind = "column", children = {
+                    {kind = "text", id = "moving", text = "Scroll contents", height = 100},
+                    {kind = "input", id = "edit", text = "Editor", height = 100},
+                    {kind = "box", height = 100, background = "#ff000080"},
+                }},
+            }})
+        )");
+        paint_buffer(surface, first);
+        const auto scroll_shaping = pango_layout_get_serial(surface.elements[static_cast<std::size_t>(index_of("moving"))].layout);
+        script("assert(surface:find('viewport'):set {scroll = 55}); assert(surface:find('edit'):focus())");
+        paint_buffer(surface, first); compare(first);
+        assert(pango_layout_get_serial(surface.elements[static_cast<std::size_t>(index_of("moving"))].layout) == scroll_shaping);
+        script("assert(surface:find('edit'):set {text = 'Changed editor', font = 'Sans 16'})");
+        paint_buffer(surface, first); compare(first);
+        gui.buffers.clear();
+        surface.scale = 1;
+    }
     {
         WindowCatalog catalog;
         int wayland[2];

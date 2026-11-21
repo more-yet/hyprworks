@@ -42,7 +42,7 @@ void enqueue(Seat& seat, Input event) {
 
 static Input key_event(Seat& seat, std::uint32_t key, bool pressed, std::uint32_t serial) {
     Input event;
-    event.type = Input::Type::key; event.surface = seat.keyboard_surface;
+    event.type = Input::Type::key; event.surface = seat.keyboard_surface; event.code = key;
     event.serial = serial; event.pressed = pressed;
     if (!seat.keys) return event;
     event.key = xkb_state_key_get_one_sym(seat.keys, key + 8);
@@ -70,6 +70,9 @@ static Input key_event(Seat& seat, std::uint32_t key, bool pressed, std::uint32_
 const wl_keyboard_listener keyboard_listener{
     .keymap = [](void* data, wl_keyboard*, std::uint32_t format, int fd, std::uint32_t size) {
         auto& seat = *static_cast<Seat*>(data);
+        ++seat.keyboard_generation;
+        if (auto* surface = find_surface(*seat.gui, seat.keyboard_surface);
+            surface && surface->key_seat == seat.id) surface->key_pressed = -1;
         if (format == WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP) {
             close(fd);
             if (seat.keys) xkb_state_unref(std::exchange(seat.keys, nullptr));
@@ -468,7 +471,9 @@ bool replace_text(Surface& surface, Element& element, int begin, int end, const 
     element.text.replace(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin), inserted);
     surface.content_bytes = surface.content_bytes - previous + size;
     element.cursor = element.anchor = begin + static_cast<int>(inserted.size());
-    element.preedit.clear(); ++element.edit_revision; dirty(surface); return true;
+    element.preedit.clear(); ++element.edit_revision; element.text_dirty = true;
+    invalidate_element(surface, static_cast<int>(&element - surface.elements.data()), true);
+    return true;
 }
 
 static int adjacent_cursor(Element& element, int position, int direction) {
@@ -591,7 +596,11 @@ void transfer_io(Transfer& transfer, short events) {
 }
 
 static void position_input_cursor(Surface& surface, Element& element, double x, double y, bool select) {
-    if (!element.preedit.empty()) { element.preedit.clear(); dirty(surface); layout(surface); }
+    const int target = static_cast<int>(&element - surface.elements.data());
+    if (!element.preedit.empty()) {
+        element.preedit.clear(); element.text_dirty = true;
+        invalidate_element(surface, target, true); layout(surface);
+    }
     int index = 0, trailing = 0;
     const auto units = [](double value) {
         return static_cast<int>(std::clamp(value * PANGO_SCALE,
@@ -605,7 +614,7 @@ static void position_input_cursor(Surface& surface, Element& element, double x, 
     while (trailing-- > 0 && *point) point = g_utf8_next_char(point);
     element.cursor = static_cast<int>(point - element.text.c_str());
     if (!select) element.anchor = element.cursor;
-    ++element.edit_revision; surface.dirty = true;
+    ++element.edit_revision; invalidate_element(surface, target);
 }
 
 int process_input(Gui& gui, Input& event) {
@@ -615,10 +624,13 @@ int process_input(Gui& gui, Input& event) {
     const bool owns_press = s.press_seat == event.seat && s.press_touch == event.touch;
     if (event.type == Input::Type::blur) {
         if (s.press_seat == event.seat) s.pressed = -1;
+        if (s.key_seat == event.seat) s.key_pressed = -1;
         if (s.focused >= 0) {
             auto& element = s.elements[static_cast<std::size_t>(s.focused)];
             if (element.preedit.empty() || element.preedit_seat == event.seat) {
-                element.preedit.clear(); ++element.edit_revision; dirty(s);
+                const bool composing = !element.preedit.empty();
+                element.preedit.clear(); ++element.edit_revision; element.text_dirty |= composing;
+                invalidate_element(s, s.focused, composing);
             }
         }
         return -1;
@@ -629,10 +641,10 @@ int process_input(Gui& gui, Input& event) {
     }
     if (event.type == Input::Type::focus) {
         if (s.focused >= 0) reveal_focus(s, true);
-        s.dirty = true; return -1;
+        invalidate_element(s, s.focused); return -1;
     }
     if (event.generation != s.input_generation) return -1;
-    if (event.type == Input::Type::key && event.pressed && event.serial && event.key == XKB_KEY_Escape) {
+    if (event.type == Input::Type::key && event.pressed && !event.repeated && event.key == XKB_KEY_Escape) {
         for (auto* current = &s; current; current = find_surface(gui, current->parent)) {
             if (!current->dismiss_escape) continue;
             request_surface_close(*current, "escape");
@@ -641,27 +653,34 @@ int process_input(Gui& gui, Input& event) {
     }
     layout(s);
     if (event.type == Input::Type::axis) {
-        auto* seat = find_seat(gui, event.seat);
-        if (!seat) return -1;
+        int target = -1;
         for (int i = static_cast<int>(s.elements.size()) - 1; i >= 0; --i) {
-            auto& element = s.elements[static_cast<std::size_t>(i)];
-            if (element.kind == Kind::scroll && element.enabled && (!event.horizontal || element.horizontal) &&
-                element.clip.contains(event.x, event.y)) {
-                if (!element.scroll_origin) element.scroll_origin = element.scroll;
-                element.scroll = std::max(0.0, element.scroll + event.delta);
-                dirty(s); layout(s); break;
+            if (s.elements[static_cast<std::size_t>(i)].clip.contains(event.x, event.y)) {
+                target = i; break;
             }
         }
+        double remaining = event.delta;
+        for (int i = target; i >= 0 && remaining != 0; i = s.elements[static_cast<std::size_t>(i)].parent) {
+            auto& element = s.elements[static_cast<std::size_t>(i)];
+            if (element.kind != Kind::scroll || !element.enabled || element.horizontal != event.horizontal) continue;
+            const double next = std::clamp(element.scroll + remaining, 0.0, element.scroll_limit);
+            if (next == element.scroll) continue;
+            if (!element.scroll_origin) element.scroll_origin = element.scroll;
+            remaining -= next - element.scroll;
+            element.scroll = next;
+            invalidate_element(s, i, true);
+        }
+        layout(s);
         return -1;
     }
-    int target = -1;
-    for (int i = static_cast<int>(s.elements.size()) - 1; i >= 0; --i)
-        if (focusable(s.elements[static_cast<std::size_t>(i)]) && s.elements[static_cast<std::size_t>(i)].clip.contains(event.x, event.y)) { target = i; break; }
     if (event.type == Input::Type::button && event.key == BTN_LEFT) {
+        int target = -1;
+        for (int i = static_cast<int>(s.elements.size()) - 1; i >= 0; --i)
+            if (focusable(s.elements[static_cast<std::size_t>(i)]) && s.elements[static_cast<std::size_t>(i)].clip.contains(event.x, event.y)) { target = i; break; }
         if (event.pressed) {
             if (s.pressed >= 0 && !owns_press) return -1;
             s.pressed = target; s.press_seat = event.seat; s.press_touch = event.touch;
-            focus(s, target); s.press_serial = event.serial; s.dirty = true;
+            focus(s, target); s.press_serial = event.serial;
             if (target >= 0) {
                 auto& element = s.elements[static_cast<std::size_t>(target)];
                 if (element.kind == Kind::input) position_input_cursor(s, element, event.x, event.y, false);
@@ -673,7 +692,7 @@ int process_input(Gui& gui, Input& event) {
             auto& element = s.elements[static_cast<std::size_t>(target)];
             gui.event_serial = s.press_serial;
             if (element.kind == Kind::button) return target;
-            if (element.kind == Kind::toggle) { element.value = element.value == 0 ? 1 : 0; s.dirty = true; return target; }
+            if (element.kind == Kind::toggle) { element.value = element.value == 0 ? 1 : 0; invalidate_element(s, target); return target; }
         }
     }
     if (((event.type == Input::Type::motion && owns_press) ||
@@ -681,7 +700,7 @@ int process_input(Gui& gui, Input& event) {
         auto& element = s.elements[static_cast<std::size_t>(s.pressed)];
         if (element.kind == Kind::slider) {
             const double value = std::clamp((event.x - element.box.x - 4) / std::max(1.0, element.box.w - 8), 0.0, 1.0);
-            if (value != element.value) { element.value = value; s.dirty = true; return s.pressed; }
+            if (value != element.value) { element.value = value; invalidate_element(s, s.pressed); return s.pressed; }
         } else if (element.kind == Kind::input && event.type == Input::Type::motion) {
             position_input_cursor(s, element, event.x, event.y, true);
         }
@@ -705,7 +724,7 @@ int process_input(Gui& gui, Input& event) {
     if (event.type == Input::Type::ime_leave) {
         if (event.revision == s.revision && event.element == s.focused &&
             !element.preedit.empty() && element.preedit_seat == event.seat) {
-            element.preedit.clear(); dirty(s);
+            element.preedit.clear(); element.text_dirty = true; invalidate_element(s, s.focused, true);
         }
         return -1;
     }
@@ -740,25 +759,45 @@ int process_input(Gui& gui, Input& event) {
         }
         element.preedit = event.preedit_set ? event.preedit : "";
         element.preedit_seat = event.seat;
-        element.preedit_cursor = event.preedit_cursor; element.preedit_end = event.preedit_end; dirty(s);
+        element.preedit_cursor = event.preedit_cursor; element.preedit_end = event.preedit_end;
+        element.text_dirty = true; invalidate_element(s, s.focused, true);
         if (changed && seat) seat->ime_applied_edit = element.edit_revision;
         return changed ? s.focused : -1;
     }
-    if (event.type != Input::Type::key || !event.pressed) return -1;
-    if (element.kind == Kind::button && (event.key == XKB_KEY_space || event.key == XKB_KEY_Return)) return s.focused;
-    if (element.kind == Kind::toggle && event.key == XKB_KEY_space) {
-        element.value = element.value == 0 ? 1 : 0; s.dirty = true; return s.focused;
+    if (event.type != Input::Type::key) return -1;
+    if (!event.pressed) {
+        if (s.key_pressed < 0 || s.key_seat != event.seat || s.key_code != event.code) return -1;
+        const int pressed = std::exchange(s.key_pressed, -1);
+        if (pressed != s.focused) return -1;
+        gui.event_serial = s.key_serial;
+        if (element.kind == Kind::button) return pressed;
+        if (element.kind == Kind::toggle) {
+            element.value = element.value == 0 ? 1 : 0;
+            invalidate_element(s, pressed);
+            return pressed;
+        }
+        return -1;
+    }
+    if ((element.kind == Kind::button && (event.key == XKB_KEY_space || event.key == XKB_KEY_Return)) ||
+        (element.kind == Kind::toggle && event.key == XKB_KEY_space)) {
+        if (!event.repeated && s.key_pressed < 0) {
+            s.key_pressed = s.focused; s.key_seat = event.seat;
+            s.key_code = event.code; s.key_serial = event.serial;
+        }
+        return -1;
     }
     if (element.kind == Kind::slider && (event.key == XKB_KEY_Left || event.key == XKB_KEY_Right)) {
         element.value = std::clamp(element.value + (event.key == XKB_KEY_Left ? -0.01 : 0.01), 0.0, 1.0);
-        s.dirty = true; return s.focused;
+        invalidate_element(s, s.focused); return s.focused;
     }
     if (element.kind != Kind::input) return -1;
     const int begin = std::min(element.cursor, element.anchor), end = std::max(element.cursor, element.anchor);
     auto* seat = find_seat(gui, event.seat);
     if (event.ctrl && (event.key == XKB_KEY_a || event.key == XKB_KEY_A)) {
-        element.preedit.clear();
-        element.anchor = 0; element.cursor = static_cast<int>(element.text.size()); ++element.edit_revision; dirty(s); return -1;
+        const bool composing = !element.preedit.empty();
+        element.preedit.clear(); element.text_dirty |= composing;
+        element.anchor = 0; element.cursor = static_cast<int>(element.text.size()); ++element.edit_revision;
+        invalidate_element(s, s.focused, composing); return -1;
     }
     if (event.ctrl && seat) {
         if (event.key == XKB_KEY_c || event.key == XKB_KEY_C || event.key == XKB_KEY_x || event.key == XKB_KEY_X) {
@@ -794,7 +833,7 @@ int process_input(Gui& gui, Input& event) {
             element.cursor = static_cast<int>(point - element.text.c_str());
         }
         if (!event.shift) element.anchor = element.cursor;
-        ++element.edit_revision; s.dirty = true; return -1;
+        ++element.edit_revision; invalidate_element(s, s.focused); return -1;
     }
     return !event.text.empty() && replace_text(s, element, begin, end, event.text) ? s.focused : -1;
 }
@@ -803,7 +842,9 @@ int dispatch_input(Gui& gui) {
     auto& state = gui.owner;
     for (auto& seat : gui.seats) {
         if (seat->repeat_at && Clock::now() >= *seat->repeat_at) {
-            enqueue(*seat, key_event(*seat, seat->repeat_key, true, 0));
+            auto event = key_event(*seat, seat->repeat_key, true, 0);
+            event.repeated = true;
+            enqueue(*seat, std::move(event));
             seat->repeat_at = Clock::now() + std::chrono::milliseconds(1000 / std::max(1, seat->repeat_rate));
         }
     }
@@ -819,13 +860,16 @@ int dispatch_input(Gui& gui) {
         gui.event_seat = event_seat;
         gui.event_serial = event.type == Input::Type::key || event.type == Input::Type::button ? event.serial : 0;
         gui.event_surface = event.surface;
+        const auto revision = recipient->revision;
+        const auto focused = recipient->focused;
+        const auto focus_edit = focused < 0 ? 0 : recipient->elements[static_cast<std::size_t>(focused)].edit_revision;
         if (lifecycle) process_input(gui, event);
         bool consumed = false;
         if (event.pressed && (event.type == Input::Type::key || event.type == Input::Type::button)) {
             const bool visible = event.type == Input::Type::key;
             if (recipient->focus_visible != visible) {
                 recipient->focus_visible = visible;
-                recipient->dirty = true;
+                invalidate_element(*recipient, recipient->focused);
             }
         }
         if (recipient->on_input >= 0 && event.type <= Input::Type::blur) {
@@ -846,6 +890,7 @@ int dispatch_input(Gui& gui) {
                 lua_pushnumber(lua, event.y); lua_setfield(lua, -2, "y");
                 lua_pushnumber(lua, event.delta); lua_setfield(lua, -2, "delta");
                 lua_pushboolean(lua, event.pressed); lua_setfield(lua, -2, "pressed");
+                lua_pushboolean(lua, event.repeated); lua_setfield(lua, -2, "repeated");
                 lua_pushboolean(lua, event.ctrl); lua_setfield(lua, -2, "ctrl");
                 lua_pushboolean(lua, event.alt); lua_setfield(lua, -2, "alt");
                 lua_pushboolean(lua, event.shift); lua_setfield(lua, -2, "shift");
@@ -863,16 +908,24 @@ int dispatch_input(Gui& gui) {
             }
             lua_settop(state.lua, 0);
         }
-        if (consumed && (event.type == Input::Type::motion ||
-            (event.type == Input::Type::button && event.key == BTN_LEFT))) {
-            auto* surface = find_surface(gui, event.surface);
-            if (surface && surface->press_seat == event.seat && surface->press_touch == event.touch)
-                surface->pressed = -1;
-        }
-        const int target = lifecycle || consumed || state.requests.load(std::memory_order_relaxed) ?
-            -1 : process_input(gui, event);
         auto* surface = find_surface(gui, event.surface);
-        if (surface && target >= 0 && notify(gui, surface->id, target, surface->elements[static_cast<std::size_t>(target)].callback,
+        if (surface && consumed) {
+            if ((event.type == Input::Type::motion || (event.type == Input::Type::button && event.key == BTN_LEFT)) &&
+                surface->press_seat == event.seat && surface->press_touch == event.touch)
+                surface->pressed = -1;
+            if (event.type == Input::Type::key && surface->key_seat == event.seat && surface->key_code == event.code)
+                surface->key_pressed = -1;
+        }
+        if (surface && event.type == Input::Type::key && surface->focused >= 0 &&
+            (event.key == XKB_KEY_space || event.key == XKB_KEY_Return)) {
+            const auto& control = surface->elements[static_cast<std::size_t>(surface->focused)];
+            if ((control.kind == Kind::button || control.kind == Kind::toggle) &&
+                (surface->revision != revision || surface->focused != focused || control.edit_revision != focus_edit))
+                consumed = true;
+        }
+        const int target = !surface || lifecycle || consumed || state.requests.load(std::memory_order_relaxed) ?
+            -1 : process_input(gui, event);
+        if (target >= 0 && notify(gui, surface->id, target, surface->elements[static_cast<std::size_t>(target)].callback,
             surface->elements[static_cast<std::size_t>(target)].kind == Kind::button ? "activate" : "change") < 0) {
             gui.event_seat = nullptr; gui.event_serial = 0; gui.event_surface = 0; return -1;
         }

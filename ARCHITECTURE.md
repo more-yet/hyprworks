@@ -162,6 +162,15 @@ and pointer/touch source. Delayed IME and paste work carries tree and editing
 revisions. Pointer and keyboard modality determine focus-ring visibility while
 logical focus continues to identify the editor.
 
+Keyboard activation retains its physical key, seat, original serial and element
+until release. Repeats leave that transaction intact; consumption, focus changes,
+tree commits and keyboard retirement cancel it. Native scrolling walks the hit
+element's ancestry, applying each matching-axis container's available range.
+
+Accessibility metadata belongs to each element and participates in tree parsing,
+validation and commit. Effective roles, labels and interaction states are derived
+when queried; input contents remain distinct from accessible names.
+
 Popup role creation follows the parent's first buffer commit. Tree roots own
 Hyprland focus grabs and configured descendants join the root's grab. A tree
 uses either a Hyprland focus grab or XDG popup grabs. Seat-owned keyboard ancestry
@@ -178,10 +187,20 @@ callbacks describe native input changes.
 
 ## Layout, images and presentation
 
-Layout measures intrinsic sizes, measures text under available width, then
-arranges boxes. Hit testing, painting, caret geometry and IME cursor rectangles
-use that arrangement. Pango owns text shaping and measurement. Cairo paints
-complete frames into owned shared-memory buffers.
+Layout caches intrinsic sizes and width-dependent measurements, then arranges
+boxes. Geometry changes invalidate the affected ancestry; unchanged subtrees
+retain measurements and arrangement. Text configuration and width are tracked
+with the retained Pango layout. Paint-only changes retain geometry and shaping.
+Hit testing, painting, caret geometry and IME cursor rectangles use that same
+arrangement.
+
+Each presentation buffer accumulates a bounding damage rectangle until it is
+painted again. Invalidating a busy buffer updates only its repair rectangle.
+After release, Cairo clears and composites that region in tree order, including
+overlapping translucent elements. Physical damage rounds outward at fractional
+scales. New buffers and structural changes receive complete damage; localized
+updates skip unrelated text and image painting. Buffer-local repair state keeps
+each reusable buffer current.
 
 Submitted presentation buffers stay immutable until compositor release.
 Resizing and closing can retire busy buffers; their storage remains accounted

@@ -1,6 +1,7 @@
 #include "gui.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <fcntl.h>
 #include <stdexcept>
@@ -24,6 +25,14 @@ void text_layout(Gui& gui, Element& element, double width) {
         element.layout = pango_layout_new(gui.text_context);
         auto* font = pango_font_description_from_string(element.font.c_str());
         pango_layout_set_font_description(element.layout, font); pango_font_description_free(font);
+        element.text_dirty = true;
+    }
+    const int text_width = width < 0 || element.kind == Kind::input ? -1 :
+        static_cast<int>(std::clamp(width, 0.0, 16384.0) * PANGO_SCALE);
+    if (!element.text_dirty) {
+        if (element.text_width != text_width) pango_layout_set_width(element.layout, text_width);
+        element.text_width = text_width;
+        return;
     }
     std::string display;
     if (element.kind == Kind::input && element.text.empty() && element.preedit.empty()) {
@@ -40,21 +49,22 @@ void text_layout(Gui& gui, Element& element, double width) {
     pango_layout_set_wrap(element.layout, PANGO_WRAP_WORD_CHAR);
     pango_layout_set_alignment(element.layout, static_cast<PangoAlignment>(element.align));
     pango_layout_set_ellipsize(element.layout, element.wrap || element.kind == Kind::input ? PANGO_ELLIPSIZE_NONE : PANGO_ELLIPSIZE_END);
-    pango_layout_set_width(element.layout, width < 0 || element.kind == Kind::input ? -1 :
-        static_cast<int>(std::clamp(width, 0.0, 16384.0) * PANGO_SCALE));
+    pango_layout_set_width(element.layout, text_width);
+    element.text_width = text_width; element.text_dirty = false;
 }
 
 void measure(Surface& surface, int index, double width) {
     auto& elements = surface.elements;
     auto& element = elements[static_cast<std::size_t>(index)];
-    element.box.w = std::max(0.0, width);
+    if (!element.measure_dirty && element.measured_width == width) return;
+    element.measure_dirty = false; element.measured_width = width; element.arrange_dirty = true;
     const double inner = std::max(0.0, width - element.padding * 2);
     double height = 0;
     if (element.layout) {
         text_layout(*surface.gui, element, inner);
         int w, h; pango_layout_get_pixel_size(element.layout, &w, &h);
         height = h;
-    } else if (element.kind == Kind::image) height = element.natural_h;
+    } else if (element.kind == Kind::image) height = element.intrinsic_h - element.padding * 2;
     else if (element.kind == Kind::slider) height = 24;
     double used = 0, growth = 0; int count = 0;
     const bool horizontal = element.kind == Kind::row || (element.kind == Kind::scroll && element.horizontal);
@@ -63,30 +73,37 @@ void measure(Surface& surface, int index, double width) {
         const auto& item = elements[static_cast<std::size_t>(child)];
         if (element.kind == Kind::row) {
             if (item.grow > 0) growth += item.grow;
-            else used += item.natural_w;
+            else used += item.intrinsic_w;
         }
         ++count;
     }
     const double gaps = element.gap * std::max(0, count - 1);
     for (int child = index + 1; child < element.end; child = elements[static_cast<std::size_t>(child)].end) {
         auto& item = elements[static_cast<std::size_t>(child)];
-        double child_width = item.width >= 0 ? item.width : item.halign ? item.natural_w : inner;
+        double child_width = item.width >= 0 ? item.width : item.halign ? item.intrinsic_w : inner;
         if (element.kind == Kind::row)
-            child_width = item.grow > 0 && growth > 0 ? std::max(0.0, inner - used - gaps) * item.grow / growth : item.natural_w;
-        else if (horizontal) child_width = item.natural_w;
+            child_width = item.grow > 0 && growth > 0 ? std::max(0.0, inner - used - gaps) * item.grow / growth : item.intrinsic_w;
+        else if (horizontal) child_width = item.intrinsic_w;
         measure(surface, child, child_width);
-        if (vertical) height += item.natural_h;
-        else height = std::max(height, item.natural_h);
+        if (vertical) height += item.measured_height;
+        else height = std::max(height, item.measured_height);
     }
     if (vertical) height += gaps;
-    element.natural_h = element.height >= 0 ? element.height : height + 2 * element.padding;
-    if (element.kind == Kind::scroll && element.height < 0) element.natural_h = std::min(element.natural_h, 240.0);
+    element.measured_height = element.height >= 0 ? element.height : height + 2 * element.padding;
+    if (element.kind == Kind::scroll && element.height < 0) element.measured_height = std::min(element.measured_height, 240.0);
 }
 
 void arrange(Surface& surface, int index, Box box, Box clip) {
     auto& elements = surface.elements;
     auto& element = elements[static_cast<std::size_t>(index)];
-    element.box = box; element.clip = intersect(box, clip);
+    const auto next_clip = intersect(box, clip);
+    if (!element.arrange_dirty && element.box == box && element.clip == next_clip) return;
+    if (element.box != box || element.clip != next_clip) {
+        damage(surface, element.clip);
+        damage(surface, next_clip);
+    }
+    element.arrange_dirty = false;
+    element.box = box; element.clip = next_clip;
     const Box inner{box.x + element.padding, box.y + element.padding,
         std::max(0.0, box.w - element.padding * 2), std::max(0.0, box.h - element.padding * 2)};
     double used = 0, growth = 0; int count = 0;
@@ -95,7 +112,7 @@ void arrange(Surface& surface, int index, Box box, Box clip) {
     for (int child = index + 1; child < element.end; child = elements[static_cast<std::size_t>(child)].end) {
         const auto& item = elements[static_cast<std::size_t>(child)];
         if (item.grow > 0 && element.kind == Kind::column) growth += item.grow;
-        else used += horizontal ? item.box.w : item.natural_h;
+        else used += horizontal ? item.measured_width : item.measured_height;
         ++count;
     }
     used += element.gap * std::max(0, count - 1);
@@ -106,11 +123,11 @@ void arrange(Surface& surface, int index, Box box, Box clip) {
     double offset = element.kind == Kind::scroll ? -element.scroll : 0;
     for (int child = index + 1; child < element.end; child = elements[static_cast<std::size_t>(child)].end) {
         auto& item = elements[static_cast<std::size_t>(child)];
-        Box child_box{inner.x, inner.y, item.box.w, item.height >= 0 ? item.height : item.valign ? item.natural_h : inner.h};
+        Box child_box{inner.x, inner.y, item.measured_width, item.height >= 0 ? item.height : item.valign ? item.measured_height : inner.h};
         if (horizontal) { child_box.x += offset; offset += child_box.w + element.gap; }
         else if (vertical) {
             child_box.y += offset;
-            child_box.h = item.grow > 0 && growth > 0 ? std::max(0.0, inner.h - used) * item.grow / growth : item.natural_h;
+            child_box.h = item.grow > 0 && growth > 0 ? std::max(0.0, inner.h - used) * item.grow / growth : item.measured_height;
             offset += child_box.h + element.gap;
         }
         if (!horizontal && item.halign >= 2) child_box.x += (inner.w - child_box.w) * (item.halign == 2 ? 0.5 : 1);
@@ -135,11 +152,12 @@ void rounded(cairo_t* cr, Box box, double radius) {
     cairo_close_path(cr);
 }
 
-void paint(Surface& surface, cairo_t* cr) {
+void paint(Surface& surface, cairo_t* cr, Box damaged) {
     for (std::size_t index = 0; index < surface.elements.size(); ++index) {
         auto& element = surface.elements[index];
         const auto box = element.box;
-        if (element.clip.w <= 0 || element.clip.h <= 0) continue;
+        const auto visible = intersect(element.clip, damaged);
+        if (visible.w <= 0 || visible.h <= 0) continue;
         cairo_save(cr);
         cairo_rectangle(cr, element.clip.x, element.clip.y, element.clip.w, element.clip.h); cairo_clip(cr);
         color(cr, element.kind == Kind::toggle && element.value != 0 ? element.accent : element.background);
@@ -233,11 +251,46 @@ const wl_callback_listener frame_listener{
 
 }
 
+void damage(Surface& surface, Box box) {
+    if (box.w <= 0 || box.h <= 0) return;
+    surface.dirty = true;
+    // Compositor-owned buffers accumulate repair metadata until release.
+    for (auto& buffer : surface.gui->buffers) {
+        if (buffer->surface != surface.id) continue;
+        auto& pending = buffer->damage;
+        if (pending.w <= 0 || pending.h <= 0) pending = box;
+        else {
+            const double x = std::min(pending.x, box.x), y = std::min(pending.y, box.y);
+            pending = {x, y, std::max(pending.x + pending.w, box.x + box.w) - x,
+                std::max(pending.y + pending.h, box.y + box.h) - y};
+        }
+    }
+}
+
+void invalidate_element(Surface& surface, int index, bool geometry) {
+    if (index < 0) return;
+    damage(surface, surface.elements[static_cast<std::size_t>(index)].clip);
+    if (!geometry) return;
+    surface.dirty = surface.layout_dirty = true;
+    for (int i = index; i >= 0; i = surface.elements[static_cast<std::size_t>(i)].parent) {
+        auto& element = surface.elements[static_cast<std::size_t>(i)];
+        element.measure_dirty = true;
+    }
+}
+
+void dirty(Surface& surface) {
+    surface.dirty = surface.layout_dirty = true;
+    for (auto& element : surface.elements)
+        element.measure_dirty = element.text_dirty = true;
+    damage(surface, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)});
+}
+
 void layout(Surface& surface) {
     if (!surface.layout_dirty || surface.elements.empty()) return;
     auto& elements = surface.elements;
     for (int index = static_cast<int>(elements.size()) - 1; index >= 0; --index) {
         auto& element = elements[static_cast<std::size_t>(index)];
+        if (!element.measure_dirty) continue;
         double width = 0, height = 0; int count = 0;
         const bool horizontal = element.kind == Kind::row || (element.kind == Kind::scroll && element.horizontal);
         const bool vertical = element.kind == Kind::column || (element.kind == Kind::scroll && !element.horizontal);
@@ -253,14 +306,14 @@ void layout(Surface& surface) {
         } else if (element.kind == Kind::slider) { width = 120; height = 24; }
         for (int child = index + 1; child < element.end; child = elements[static_cast<std::size_t>(child)].end) {
             const auto& item = elements[static_cast<std::size_t>(child)];
-            if (horizontal) width += item.natural_w; else width = std::max(width, item.natural_w);
-            if (vertical) height += item.natural_h; else height = std::max(height, item.natural_h);
+            if (horizontal) width += item.intrinsic_w; else width = std::max(width, item.intrinsic_w);
+            if (vertical) height += item.intrinsic_h; else height = std::max(height, item.intrinsic_h);
             ++count;
         }
         if (horizontal) width += std::max(0, count - 1) * element.gap;
         if (vertical) height += std::max(0, count - 1) * element.gap;
-        element.natural_w = element.width >= 0 ? element.width : width + element.padding * 2;
-        element.natural_h = element.height >= 0 ? element.height : height + element.padding * 2;
+        element.intrinsic_w = element.width >= 0 ? element.width : width + element.padding * 2;
+        element.intrinsic_h = element.height >= 0 ? element.height : height + element.padding * 2;
     }
     measure(surface, 0, surface.width);
     arrange(surface, 0, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)},
@@ -300,15 +353,13 @@ void reveal_focus(Surface& surface, bool native) {
                 if (element.horizontal) target.x -= next - element.scroll;
                 else target.y -= next - element.scroll;
                 element.scroll = next;
+                invalidate_element(surface, index, true);
                 changed = true;
             }
         }
         target = intersect(target, viewport);
     }
-    if (changed) {
-        arrange(surface, 0, elements.front().box, elements.front().box);
-        surface.dirty = true;
-    }
+    if (changed) layout(surface);
 }
 
 int layout_index(const Element& element, int index) {
@@ -325,6 +376,28 @@ PangoRectangle input_cursor(Element& element, bool focused) {
         element.scroll = std::clamp(element.scroll, std::max(0.0, x - visible), x);
     }
     return cursor;
+}
+
+Box paint_buffer(Surface& surface, Buffer& buffer) {
+    assert(!buffer.busy);
+    layout(surface);
+    const double sx = static_cast<double>(buffer.width) / surface.width, sy = static_cast<double>(buffer.height) / surface.height;
+    const auto pending = buffer.damage;
+    if (pending.w <= 0 || pending.h <= 0) return {};
+    const int left = std::clamp(static_cast<int>(std::floor(pending.x * sx)) - 1, 0, buffer.width);
+    const int top = std::clamp(static_cast<int>(std::floor(pending.y * sy)) - 1, 0, buffer.height);
+    const int right = std::clamp(static_cast<int>(std::ceil((pending.x + pending.w) * sx)) + 1, 0, buffer.width);
+    const int bottom = std::clamp(static_cast<int>(std::ceil((pending.y + pending.h) * sy)) + 1, 0, buffer.height);
+    const std::unique_ptr<cairo_t, decltype(&cairo_destroy)> cr(cairo_create(buffer.cairo), cairo_destroy);
+    cairo_rectangle(cr.get(), left, top, right - left, bottom - top); cairo_clip(cr.get());
+    cairo_set_operator(cr.get(), CAIRO_OPERATOR_SOURCE); cairo_set_source_rgba(cr.get(), 0, 0, 0, 0); cairo_paint(cr.get());
+    cairo_set_operator(cr.get(), CAIRO_OPERATOR_OVER);
+    cairo_scale(cr.get(), sx, sy);
+    paint(surface, cr.get(), {left / sx, top / sy, (right - left) / sx, (bottom - top) / sy});
+    if (cairo_status(cr.get()) != CAIRO_STATUS_SUCCESS) throw std::runtime_error(cairo_status_to_string(cairo_status(cr.get())));
+    cairo_surface_flush(buffer.cairo);
+    buffer.damage = {};
+    return {static_cast<double>(left), static_cast<double>(top), static_cast<double>(right - left), static_cast<double>(bottom - top)};
 }
 
 void render(Surface& surface) {
@@ -344,7 +417,8 @@ void render(Surface& surface) {
     for (auto& item : gui.buffers) {
         if (item->surface != surface.id) continue;
         ++count;
-        if (!item->busy && item->width == width && item->height == height) buffer = item.get();
+        if (!item->busy && item->width == width && item->height == height &&
+            (!buffer || item->damage.w * item->damage.h < buffer->damage.w * buffer->damage.h)) buffer = item.get();
     }
     if (!buffer) {
         if (count >= 3) { surface.waiting_buffer = true; return; }
@@ -355,6 +429,7 @@ void render(Surface& surface) {
         auto replacement = std::make_unique<Buffer>();
         replacement->gui = &gui; replacement->surface = surface.id;
         replacement->width = width; replacement->height = height;
+        replacement->damage = {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)};
         const int fd = memfd_create("hyprworks-buffer", MFD_CLOEXEC | MFD_ALLOW_SEALING);
         if (fd < 0) throw std::runtime_error("cannot create presentation buffer");
         if (ftruncate(fd, static_cast<off_t>(bytes)) < 0) { close(fd); throw std::runtime_error("cannot size presentation buffer"); }
@@ -373,14 +448,7 @@ void render(Surface& surface) {
         if (cairo_surface_status(replacement->cairo) != CAIRO_STATUS_SUCCESS) throw std::runtime_error("cannot create Cairo buffer");
         buffer = replacement.get(); gui.buffers.push_back(std::move(replacement));
     }
-    layout(surface);
-    const std::unique_ptr<cairo_t, decltype(&cairo_destroy)> cr(cairo_create(buffer->cairo), cairo_destroy);
-    cairo_set_operator(cr.get(), CAIRO_OPERATOR_SOURCE); cairo_set_source_rgba(cr.get(), 0, 0, 0, 0); cairo_paint(cr.get());
-    cairo_set_operator(cr.get(), CAIRO_OPERATOR_OVER);
-    cairo_scale(cr.get(), static_cast<double>(width) / surface.width, static_cast<double>(height) / surface.height);
-    paint(surface, cr.get());
-    if (cairo_status(cr.get()) != CAIRO_STATUS_SUCCESS) throw std::runtime_error(cairo_status_to_string(cairo_status(cr.get())));
-    cairo_surface_flush(buffer->cairo);
+    const auto repaired = paint_buffer(surface, *buffer);
     if (surface.viewport) {
         wl_surface_set_buffer_scale(surface.native, 1);
         wp_viewport_set_destination(surface.viewport, surface.width, surface.height);
@@ -390,7 +458,9 @@ void render(Surface& surface) {
     if (!surface.frame) throw std::runtime_error("cannot create frame callback");
     wl_callback_add_listener(surface.frame, &frame_listener, &surface);
     wl_surface_attach(surface.native, buffer->native, 0, 0);
-    wl_surface_damage_buffer(surface.native, 0, 0, width, height);
+    if (repaired.w > 0 && repaired.h > 0)
+        wl_surface_damage_buffer(surface.native, static_cast<int>(repaired.x), static_cast<int>(repaired.y),
+            static_cast<int>(repaired.w), static_cast<int>(repaired.h));
     buffer->busy = true; surface.dirty = false;
     wl_surface_commit(surface.native);
     surface.mapped = true;

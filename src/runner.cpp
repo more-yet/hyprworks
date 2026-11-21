@@ -63,9 +63,9 @@ int main(int argc, char** argv) {
             std::cout << "usage: hyprworks [OPTIONS] [-- ARGUMENT ...]\n"
                       << "Load $XDG_CONFIG_HOME/hyprworks/main.lua\n"
                       << "(default: $HOME/.config/hyprworks/main.lua).\n"
-                       << "Reload automatically when the entry file or a required local Lua module changes.\n\n"
+                      << "Reload automatically when the entry file or a required local Lua module changes.\n\n"
                       << "  -c, --config FILE  Use another Lua configuration file\n"
-                      << "      --headless     Run without the GUI event loop\n"
+                      << "      --headless     Run the headless event loop\n"
                       << "  -v, --version      Print the version\n"
                       << "  -h, --help         Show this help\n";
             return 0;

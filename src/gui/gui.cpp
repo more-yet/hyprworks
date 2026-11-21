@@ -422,7 +422,7 @@ int dispatch_gui(InvocationState& state) {
             }
             if (element.image && !element.image->submitted) gui.images.submit(element.image);
             if (!element.image || element.image_notified || !element.image->ready.load(std::memory_order_acquire)) continue;
-            element.image_notified = true; dirty(*surface);
+            element.image_notified = true; invalidate_element(*surface, static_cast<int>(i), true);
             const auto image = element.image;
             if (notify(gui, id, static_cast<int>(i), element.callback, "loaded", &image->error) < 0) return -1;
         }

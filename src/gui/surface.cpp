@@ -5,6 +5,7 @@
 #include <cassert>
 #include <charconv>
 #include <cmath>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 namespace hyprworks::lua {
 
@@ -20,7 +21,7 @@ SurfaceFocus surface_focus(const Surface& surface) {
     auto& gui = *surface.gui;
     for (const auto& seat : gui.seats) {
         result.focused |= seat->keyboard_surface == surface.id;
-        // Retiring a popup does not move native focus; retain ancestry until keyboard leave.
+        // Native keyboard leave ends the ancestry lifetime, including retired popups.
         result.within |= seat->keyboard_surface == surface.id ||
             std::ranges::find(seat->keyboard_tree, surface.id) != seat->keyboard_tree.end();
     }
@@ -29,15 +30,19 @@ SurfaceFocus surface_focus(const Surface& surface) {
 
 void focus(Surface& surface, int index) {
     if (surface.focused == index) return;
+    surface.key_pressed = -1;
     if (surface.focused >= 0) {
         auto& previous = surface.elements[static_cast<std::size_t>(surface.focused)];
+        const bool composing = !previous.preedit.empty();
         previous.preedit.clear(); ++previous.edit_revision;
+        previous.text_dirty |= composing;
+        invalidate_element(surface, surface.focused, composing);
     }
     surface.focused = index;
     if (index >= 0) ++surface.elements[static_cast<std::size_t>(index)].edit_revision;
     for (auto& seat : surface.gui->seats)
         if (seat->keyboard_surface == surface.id && seat->compose) xkb_compose_state_reset(seat->compose);
-    dirty(surface);
+    invalidate_element(surface, index);
 }
 
 namespace {
@@ -128,8 +133,12 @@ void close_surface(Surface& surface) {
 void cancel_surface_input(Surface& surface, bool descendants) {
     ++surface.input_generation;
     surface.pressed = -1;
+    surface.key_pressed = -1;
     for (auto& element : surface.elements) if (element.kind == Kind::input) {
+        const bool composing = !element.preedit.empty();
         element.preedit.clear(); ++element.edit_revision;
+        element.text_dirty |= composing;
+        invalidate_element(surface, static_cast<int>(&element - surface.elements.data()), composing);
     }
     for (auto& seat : surface.gui->seats) if (seat->keyboard_surface == surface.id) {
         seat->repeat_at.reset();
@@ -137,7 +146,6 @@ void cancel_surface_input(Surface& surface, bool descendants) {
     }
     if (descendants) for (auto& child : surface.gui->surfaces)
         if (child && child->parent == surface.id && !child->closed) cancel_surface_input(*child, true);
-    surface.dirty = true;
 }
 
 int dispatch_close(Surface& surface) {
@@ -329,6 +337,21 @@ std::uint32_t read_color(lua_State* lua, int table, const char* name, std::uint3
 void properties(lua_State* lua, int table, Element& element, Gui& gui) {
     table = lua_absindex(lua, table);
     text_field(lua, table, "id", element.id, 128);
+    field(lua, table, "accessibility");
+    if (!lua_isnil(lua, -1)) {
+        luaL_checktype(lua, -1, LUA_TTABLE);
+        static const char* roles[] = {"auto", "group", "label", "image", "button", "checkbox", "slider",
+            "textbox", "heading", "link", "list", "list_item", "menu", "menu_item", nullptr};
+        const int role = enum_field(lua, -1, "role",
+            element.accessible_role.empty() ? "auto" : element.accessible_role.c_str(), roles);
+        element.accessible_role = role ? roles[role] : "";
+        text_field(lua, -1, "name", element.accessible_name, max_text);
+        text_field(lua, -1, "description", element.accessible_description, max_text);
+        if (!valid_text(element.accessible_name) || !valid_text(element.accessible_description))
+            luaL_error(lua, "accessibility text must be valid UTF-8 without NUL");
+        element.accessible_hidden = boolean_field(lua, -1, "hidden", element.accessible_hidden);
+    }
+    lua_pop(lua, 1);
     field(lua, table, "text");
     bool text_changed = false;
     if (!lua_isnil(lua, -1)) {
@@ -343,11 +366,12 @@ void properties(lua_State* lua, int table, Element& element, Gui& gui) {
         text_field(lua, table, "placeholder", element.placeholder, max_text);
         if (!valid_text(element.placeholder)) luaL_error(lua, "placeholder must be valid UTF-8 without NUL");
     }
-    text_field(lua, table, "font", element.font, 256);
-    auto* font = pango_font_description_from_string(element.font.c_str());
-    const int font_size = pango_font_description_get_size(font);
-    pango_font_description_free(font);
-    if (font_size < 0 || font_size > 256 * PANGO_SCALE) luaL_error(lua, "font size exceeds 256");
+    if (text_field(lua, table, "font", element.font, 256)) {
+        auto* font = pango_font_description_from_string(element.font.c_str());
+        const int font_size = pango_font_description_get_size(font);
+        pango_font_description_free(font);
+        if (font_size < 0 || font_size > 256 * PANGO_SCALE) luaL_error(lua, "font size exceeds 256");
+    }
     element.width = number(lua, table, "width", element.width, -1, 16384);
     element.height = number(lua, table, "height", element.height, -1, 16384);
     element.x = number(lua, table, "x", element.x, -16384, 16384);
@@ -434,7 +458,7 @@ struct ParsedTree {
 
 constexpr unsigned text_specified = 1, value_specified = 2, scroll_specified = 4;
 
-int parse_tree(lua_State* lua, int table, ParsedTree& tree, Gui& gui, int parent, unsigned depth) {
+void parse_tree(lua_State* lua, int table, ParsedTree& tree, Gui& gui, int parent, unsigned depth) {
     if (!lua_checkstack(lua, 12)) luaL_error(lua, "cannot grow Lua parsing stack");
     if (depth > 32 || tree.elements.size() == 2048) luaL_error(lua, "tree limit reached (2048 elements, depth 32)");
     luaL_checktype(lua, table, LUA_TTABLE);
@@ -469,11 +493,11 @@ int parse_tree(lua_State* lua, int table, ParsedTree& tree, Gui& gui, int parent
     }
     lua_pop(lua, 1);
     tree.elements[static_cast<std::size_t>(index)].end = static_cast<int>(tree.elements.size());
-    return index;
 }
 
 std::size_t element_text_bytes(const Element& element) {
     return element.id.size() + element.text.size() + element.placeholder.size() + element.font.size() +
+        element.accessible_role.size() + element.accessible_name.size() + element.accessible_description.size() +
         (element.image ? element.image->icon.size() + element.image->path.size() + element.image->theme.size() : 0);
 }
 
@@ -582,12 +606,16 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
     }
     parsed.elements.clear();
     old = std::move(combined);
-    ++surface.revision; surface.pressed = -1; surface.content_bytes = bytes;
+    ++surface.revision; surface.pressed = surface.key_pressed = -1; surface.content_bytes = bytes;
     surface.focused = next_focus;
+    const bool activation_target = next_focus >= 0 &&
+        (surface.elements[static_cast<std::size_t>(next_focus)].kind == Kind::button ||
+         surface.elements[static_cast<std::size_t>(next_focus)].kind == Kind::toggle);
     for (std::size_t i = 0; i < gui.event_count; ++i) {
         auto& event = gui.events[i];
         if (event.surface != surface.id) continue;
-        if (event.type == Input::Type::button || (event.type == Input::Type::key && next_focus < 0))
+        if (event.type == Input::Type::button || (event.type == Input::Type::key &&
+            (next_focus < 0 || (activation_target && (event.key == XKB_KEY_space || event.key == XKB_KEY_Return)))))
             event.surface = 0;
         else if (same_editor && (event.type == Input::Type::ime || event.type == Input::Type::ime_leave) &&
                  event.revision == surface.revision - 1 && event.element == previous_focus) {
@@ -691,13 +719,26 @@ int set_element(lua_State* lua) {
     if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
     replacement.edit_revision = element.edit_revision +
         (replacement.text != element.text || replacement.password != element.password ? 1 : 0);
+    const bool text_changed = replacement.font != element.font || replacement.text != element.text ||
+        replacement.placeholder != element.placeholder || replacement.password != element.password ||
+        replacement.preedit != element.preedit || replacement.wrap != element.wrap || replacement.align != element.align;
+    const bool geometry = text_changed || replacement.width != element.width || replacement.height != element.height ||
+        replacement.x != element.x || replacement.y != element.y || replacement.grow != element.grow ||
+        replacement.padding != element.padding || replacement.gap != element.gap ||
+        replacement.halign != element.halign || replacement.valign != element.valign ||
+        replacement.horizontal != element.horizontal || replacement.scroll != element.scroll || replacement.image != element.image;
+    const bool repaint = geometry || replacement.background != element.background || replacement.color != element.color ||
+        replacement.accent != element.accent || replacement.border_color != element.border_color ||
+        replacement.border_width != element.border_width || replacement.radius != element.radius ||
+        replacement.value != element.value || replacement.enabled != element.enabled;
+    replacement.text_dirty |= text_changed;
     if (replacement.font == element.font) std::swap(replacement.layout, element.layout);
     std::swap(replacement, element); live.content_bytes = bytes;
     if (!element.enabled) {
         if (live.focused == identity.element) focus(live, -1);
         if (live.pressed == identity.element) live.pressed = -1;
     }
-    dirty(live);
+    if (repaint) invalidate_element(live, identity.element, geometry);
     if (element.image && !element.image->submitted) wake(gui.owner);
     lua_pushboolean(lua, true); return 1;
 }
@@ -708,13 +749,42 @@ int element_state(lua_State* lua) {
     const auto& element = surface.elements[static_cast<std::size_t>(identity.element)];
     const auto text = element.text; const auto box = element.box; const auto value = element.value; const auto scroll = element.scroll;
     return protected_call(lua, [&](lua_State* lua) {
-        lua_createtable(lua, 0, 6); string_field(lua, "text", text);
+        lua_createtable(lua, 0, 7); string_field(lua, "text", text);
         lua_pushnumber(lua, value); lua_setfield(lua, -2, "value");
         lua_pushnumber(lua, box.x); lua_setfield(lua, -2, "x");
         lua_pushnumber(lua, box.y); lua_setfield(lua, -2, "y");
         lua_pushnumber(lua, box.w); lua_setfield(lua, -2, "width");
         lua_pushnumber(lua, box.h); lua_setfield(lua, -2, "height");
         lua_pushnumber(lua, scroll); lua_setfield(lua, -2, "scroll");
+        return 1;
+    }, 1);
+}
+
+int element_accessibility(lua_State* lua) {
+    auto& gui = gui_state(lua); const auto identity = handle(lua, 1, element_type);
+    const auto& surface = live_surface(gui, identity);
+    const auto& element = surface.elements[static_cast<std::size_t>(identity.element)];
+    static const char* roles[] = {"group", "group", "group", "group", "label", "image", "button", "checkbox", "slider", "textbox"};
+    const std::string role = element.accessible_role.empty() ? roles[static_cast<unsigned>(element.kind)] : element.accessible_role;
+    const std::string name = !element.accessible_name.empty() ? element.accessible_name :
+        element.kind == Kind::input ? element.placeholder :
+        element.kind == Kind::text || element.kind == Kind::button || element.kind == Kind::toggle ? element.text : "";
+    const auto description = element.accessible_description;
+    bool hidden = element.accessible_hidden;
+    for (int parent = element.parent; parent >= 0; parent = surface.elements[static_cast<std::size_t>(parent)].parent)
+        hidden |= surface.elements[static_cast<std::size_t>(parent)].accessible_hidden;
+    const bool enabled = element.enabled, can_focus = focusable(element), focused = surface.focused == identity.element;
+    const auto kind = element.kind;
+    const auto value = element.value;
+    return protected_call(lua, [&](lua_State* lua) {
+        lua_createtable(lua, 0, 9);
+        string_field(lua, "role", role); string_field(lua, "name", name); string_field(lua, "description", description);
+        lua_pushboolean(lua, hidden); lua_setfield(lua, -2, "hidden");
+        lua_pushboolean(lua, enabled); lua_setfield(lua, -2, "enabled");
+        lua_pushboolean(lua, can_focus); lua_setfield(lua, -2, "focusable");
+        lua_pushboolean(lua, focused); lua_setfield(lua, -2, "focused");
+        if (kind == Kind::toggle) { lua_pushboolean(lua, value != 0); lua_setfield(lua, -2, "checked"); }
+        if (kind == Kind::slider) { lua_pushnumber(lua, value); lua_setfield(lua, -2, "value"); }
         return 1;
     }, 1);
 }
@@ -1090,6 +1160,7 @@ void register_surfaces(lua_State* lua) {
     luaL_newmetatable(lua, element_type);
     const luaL_Reg elements[] = {
         {"set", operation_call<set_element>}, {"state", operation_call<element_state>}, {"focus", operation_call<focus_element>},
+        {"accessibility", operation_call<element_accessibility>},
         {"replace_children", operation_call<replace_children>}, {nullptr, nullptr}
     };
     luaL_setfuncs(lua, elements, 0); lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");

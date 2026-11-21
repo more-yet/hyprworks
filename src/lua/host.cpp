@@ -25,7 +25,6 @@ void arm_clock_change(int fd) {
 int on_clock_change(lua_State* lua) {
     auto& state = invocation(lua);
     if (state.closing) return luaL_error(lua, "invocation is shutting down");
-    if (!lua_isnoneornil(lua, 1)) luaL_checktype(lua, 1, LUA_TFUNCTION);
     state.clock_pending = replace_callback(lua, 1, state.on_clock_change, state.closing);
     ++state.clock_generation;
     if (state.on_clock_change < 0) {

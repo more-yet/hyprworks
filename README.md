@@ -57,6 +57,29 @@ validated replacements; `{preserve_state = true}` retains matching explicit-ID
 and kind focus, selection and scrolling. Explicit property values take
 precedence. Reacquire element handles after structural changes.
 
+Buttons activate on release of Space or Enter; toggles change on release of
+Space. The originating seat, physical key and focused element own the press.
+Focus changes, tree replacement, disabling and consumed key events cancel it.
+`on_input` key events expose `repeated` for author-defined keyboard behavior.
+Nested scroll containers consume movement on their axis and pass the remainder
+to their ancestors. Their `on_change` callbacks report the final clamped offsets.
+
+Elements accept accessibility metadata:
+
+```lua
+{kind = "button", text = "×",
+ accessibility = {name = "Close panel", description = "Close the active panel"}}
+```
+
+`accessibility` supports `name`, `description`, `hidden` and `role`. Roles are
+`auto`, `group`, `label`, `image`, `button`, `checkbox`, `slider`, `textbox`,
+`heading`, `link`, `list`, `list_item`, `menu` and `menu_item`. `auto` derives the
+role from the element kind. Names default to control labels or input placeholders.
+`element:accessibility()` returns effective metadata, ancestor-inherited
+hidden state, enabled/focus state, and a toggle's checked or slider's value state.
+Metadata updates use the same validated transactions and content budgets as
+visual properties. Native AT-SPI exposure is a subsequent integration step.
+
 Observers such as `hw.audio()`, `hw.upower()` and `hw.hyprland.workspaces()`
 publish snapshots. Read them in `on_change`; use `on_status` for connection
 lifecycle and `on_result` for action completion. Each setter replaces one
