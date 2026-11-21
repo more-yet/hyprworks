@@ -191,7 +191,9 @@ struct InvocationState {
     lua_State* lua = nullptr;
     EventLoop loop = EventLoop::headless;
     std::atomic<bool> quit_requested{false};
-    std::atomic<bool> reload_requested{false};
+    std::atomic<unsigned> requests{0};
+    std::string entry_file;
+    std::optional<std::string> reload_source;
     int wake_fd = -1;
     int clock_fd = -1, on_clock_change = LUA_NOREF;
     bool clock_pending = false;

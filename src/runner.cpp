@@ -1,4 +1,5 @@
 #include <hyprworks/lua.hpp>
+#include <hyprworks/host.hpp>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <string_view>
 #include <system_error>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -39,6 +41,49 @@ void start_signals() {
             throw std::system_error(errno, std::generic_category(), "install runtime signal handler");
     if (sigprocmask(SIG_UNBLOCK, &action.sa_mask, nullptr) < 0)
         throw std::system_error(errno, std::generic_category(), "unblock runtime signals");
+}
+
+bool wait_for_correction(hyprworks::host::FileWatch& watch, const std::string& filename) {
+    using Clock = std::chrono::steady_clock;
+    std::optional<Clock::time_point> retry_at;
+    std::cerr << (watch.running() ? "Hyprworks: waiting for an entry-file edit or SIGHUP\n" :
+        "Hyprworks: waiting for SIGHUP\n");
+    for (;;) {
+        for (unsigned i = 0; i < 16; ++i) {
+            char bytes[256];
+            const auto count = read(signals.fd, bytes, sizeof(bytes));
+            if (count > 0) continue;
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            throw std::system_error(count < 0 ? errno : EPIPE, std::generic_category(), "read runtime signals");
+        }
+        const auto pending = signals.pending.exchange(0, std::memory_order_acq_rel);
+        if (pending & hyprworks::lua::SignalSource::quit) return false;
+        if (pending & hyprworks::lua::SignalSource::reload) return true;
+        const auto now = Clock::now();
+        if (retry_at && now >= *retry_at) return true;
+        pollfd fds[]{{signals.fd, POLLIN, 0}, watch.prepare_wait()};
+        timespec timeout{};
+        if (retry_at) {
+            const auto ns = std::chrono::ceil<std::chrono::nanoseconds>(*retry_at - now);
+            const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(ns);
+            timeout = {seconds.count(), (ns - seconds).count()};
+        }
+        if (ppoll(fds, 2, retry_at ? &timeout : nullptr, nullptr) < 0) {
+            if (errno == EINTR) continue;
+            throw std::system_error(errno, std::generic_category(), "wait for configuration correction");
+        }
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+            throw std::runtime_error("runtime signal descriptor failed");
+        if (fds[1].revents) {
+            const auto update = watch.dispatch();
+            if (update.changed) retry_at = Clock::now() + std::chrono::milliseconds(50);
+            if (update.invalidated) {
+                if (auto resumed = watch.start(filename); !resumed)
+                    std::cerr << "Hyprworks: configuration watch: " << resumed.error() << '\n';
+            }
+        }
+    }
 }
 
 }
@@ -96,18 +141,25 @@ int main(int argc, char** argv) {
         const auto filename = std::filesystem::absolute(entry_file).lexically_normal().string();
         std::vector<std::string> arguments(argv + entry, argv + argc);
         start_signals();
+        hyprworks::host::FileWatch recovery_watch;
+        std::optional<std::string> source;
         for (;;) {
+            if (auto watched = recovery_watch.start(filename); !watched)
+                std::cerr << "Hyprworks: configuration watch: " << watched.error() << '\n';
             hyprworks::lua::Invocation invocation(gui ? hyprworks::lua::EventLoop::gui : hyprworks::lua::EventLoop::headless, &signals);
-            if (auto loaded = invocation.load(filename, arguments); !loaded) {
+            if (auto loaded = invocation.load(filename, arguments, std::exchange(source, {})); !loaded) {
                 std::cerr << loaded.error() << '\n';
-                return 1;
+                if (!wait_for_correction(recovery_watch, filename)) return 0;
+                continue;
             }
+            recovery_watch.stop();
             if (auto result = invocation.run(); !result) {
                 std::cerr << result.error() << '\n';
                 return 1;
             }
             if (!invocation.reload_requested() || (signals.pending.load(std::memory_order_relaxed) & hyprworks::lua::SignalSource::quit))
                 return invocation.exit_code();
+            source = invocation.take_reload_source();
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

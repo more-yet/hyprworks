@@ -64,6 +64,15 @@ struct Element {
     int preedit_cursor = 0, preedit_end = 0;
 };
 
+struct PopupPlacement {
+    int x = 0, y = 0, width = 640, height = 480;
+};
+
+struct SurfaceFocus {
+    bool focused = false, within = false;
+    bool operator==(const SurfaceFocus&) const = default;
+};
+
 /// Owns the element tree and interaction state. Lua handles resolve identity
 /// and revision; closed slots are reclaimed after callback delivery.
 struct Surface {
@@ -83,6 +92,11 @@ struct Surface {
     std::vector<std::uint32_t> outputs;
     std::vector<Element> elements;
     int width = 640, height = 480, pending_width = 640, pending_height = 480;
+    PopupPlacement popup_placement;
+    int popup_x = 0, popup_y = 0, pending_popup_x = 0, pending_popup_y = 0;
+    std::uint32_t configure_serial = 0;
+    std::uint32_t output = 0;
+    SurfaceFocus reported_focus;
     double scale = 1;
     int focused = -1, pressed = -1;
     bool focus_visible = false;
@@ -90,7 +104,8 @@ struct Surface {
     bool press_touch = false;
     bool closed = false, configured = false, dirty = true, layout_dirty = true, waiting_buffer = false;
     bool configure_pending = false, close_pending = false, grab_pending = false;
-    int on_configure = -2, on_close = -2, on_grab_cleared = -2, on_input = -2;
+    bool mapped = false, popup_reposition_pending = false;
+    int on_configure = -2, on_close = -2, on_grab_cleared = -2, on_input = -2, on_focus_change = -2;
     std::size_t content_bytes = 0;
 };
 
@@ -201,7 +216,7 @@ struct Gui {
     std::size_t event_count = 0, buffer_bytes = 0, wait_offset = static_cast<std::size_t>(-1);
     std::size_t transfer_wait_count = 0;
     std::uint64_t next_surface = 0;
-    bool read_prepared = false, outputs_pending = true, stopping = false;
+    bool read_prepared = false, outputs_pending = true, focus_pending = false, stopping = false;
     const char* error = nullptr;
     int on_outputs = -2;
     Seat* event_seat = nullptr;
@@ -243,8 +258,11 @@ Gui& gui_state(lua_State* lua);
 void push_handle(lua_State* lua, Handle value, const char* type);
 void focus(Surface& surface, int index);
 void close_surface(Surface& surface);
+void request_surface_close(Surface& surface);
+SurfaceFocus surface_focus(const Surface& surface);
 int dispatch_close(Surface& surface);
 void destroy_surface(Surface& surface);
+void reposition_popup(Surface& surface);
 void update_scale(Surface& surface);
 int notify(Gui& gui, std::uint64_t id, int element_index, int reference,
     const char* kind = nullptr, const std::string* error = nullptr);

@@ -599,7 +599,6 @@ int process_input(Gui& gui, Input& event) {
     auto* surface = find_surface(gui, event.surface);
     if (!surface) return -1;
     auto& s = *surface;
-    layout(s);
     const bool owns_press = s.press_seat == event.seat && s.press_touch == event.touch;
     if (event.type == Input::Type::blur) {
         if (s.press_seat == event.seat) s.pressed = -1;
@@ -616,6 +615,7 @@ int process_input(Gui& gui, Input& event) {
         return -1;
     }
     if (event.type == Input::Type::focus) { s.dirty = true; return -1; }
+    layout(s);
     if (event.type == Input::Type::axis) {
         auto* seat = find_seat(gui, event.seat);
         if (!seat) return -1;
@@ -635,6 +635,7 @@ int process_input(Gui& gui, Input& event) {
         if (focusable(s.elements[static_cast<std::size_t>(i)]) && s.elements[static_cast<std::size_t>(i)].clip.contains(event.x, event.y)) { target = i; break; }
     if (event.type == Input::Type::button && event.key == BTN_LEFT) {
         if (event.pressed) {
+            if (s.pressed >= 0 && !owns_press) return -1;
             s.pressed = target; s.press_seat = event.seat; s.press_touch = event.touch;
             focus(s, target); s.press_serial = event.serial; s.dirty = true;
             if (target >= 0) {
@@ -787,6 +788,9 @@ int dispatch_input(Gui& gui) {
         gui.event_seat = find_seat(gui, event.seat);
         gui.event_serial = event.type == Input::Type::key || event.type == Input::Type::button ? event.serial : 0;
         gui.event_surface = event.surface;
+        const bool lifecycle = event.type == Input::Type::leave ||
+            event.type == Input::Type::focus || event.type == Input::Type::blur;
+        if (lifecycle) process_input(gui, event);
         bool consumed = false;
         auto* recipient = find_surface(gui, event.surface);
         if (recipient && event.pressed && (event.type == Input::Type::key || event.type == Input::Type::button)) {
@@ -821,7 +825,7 @@ int dispatch_input(Gui& gui) {
                 lua_pushboolean(lua, event.horizontal); lua_setfield(lua, -2, "horizontal");
                 if (!find_surface(gui, event.surface) || state.quit_requested.load(std::memory_order_relaxed)) return 0;
                 lua_call(lua, 2, 1);
-                consumed = event.type == Input::Type::key && lua_toboolean(lua, -1);
+                consumed = lua_toboolean(lua, -1);
                 return 0;
             }, 0, 1);
             if (result < 0) {
@@ -829,7 +833,14 @@ int dispatch_input(Gui& gui) {
             }
             lua_settop(state.lua, 0);
         }
-        const int target = consumed || state.quit_requested.load(std::memory_order_relaxed) ? -1 : process_input(gui, event);
+        if (consumed && (event.type == Input::Type::motion ||
+            (event.type == Input::Type::button && event.key == BTN_LEFT))) {
+            auto* surface = find_surface(gui, event.surface);
+            if (surface && surface->press_seat == event.seat && surface->press_touch == event.touch)
+                surface->pressed = -1;
+        }
+        const int target = lifecycle || consumed || state.quit_requested.load(std::memory_order_relaxed) ?
+            -1 : process_input(gui, event);
         auto* surface = find_surface(gui, event.surface);
         if (surface && target >= 0 && notify(gui, surface->id, target, surface->elements[static_cast<std::size_t>(target)].callback,
             surface->elements[static_cast<std::size_t>(target)].kind == Kind::button ? "activate" : "change") < 0) {

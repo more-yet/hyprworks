@@ -14,6 +14,23 @@ Surface* find_surface(Gui& gui, std::uint64_t id) {
     return nullptr;
 }
 
+SurfaceFocus surface_focus(const Surface& surface) {
+    SurfaceFocus result;
+    if (surface.closed || surface.close_pending) return result;
+    auto& gui = *surface.gui;
+    for (const auto& seat : gui.seats) {
+        auto* entered = find_surface(gui, seat->keyboard_surface);
+        if (!entered || entered->close_pending) continue;
+        result.focused |= entered->id == surface.id;
+        for (auto* current = entered; current; current = find_surface(gui, current->parent)) {
+            if (current->id != surface.id) continue;
+            result.within = true;
+            break;
+        }
+    }
+    return result;
+}
+
 void focus(Surface& surface, int index) {
     if (surface.focused == index) return;
     if (surface.focused >= 0) {
@@ -28,6 +45,24 @@ void focus(Surface& surface, int index) {
 }
 
 namespace {
+
+xdg_positioner* popup_positioner(const Surface& parent, const PopupPlacement& placement) {
+    auto* position = xdg_wm_base_create_positioner(parent.gui->shell);
+    if (!position) throw std::runtime_error("cannot create popup positioner");
+    xdg_positioner_set_size(position, placement.width, placement.height);
+    xdg_positioner_set_anchor_rect(position, std::clamp(placement.x, 0, parent.width - 1),
+        std::clamp(placement.y, 0, parent.height - 1), 1, 1);
+    xdg_positioner_set_anchor(position, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+    xdg_positioner_set_gravity(position, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    xdg_positioner_set_constraint_adjustment(position,
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y |
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y);
+    xdg_positioner_set_reactive(position);
+    xdg_positioner_set_parent_size(position, parent.width, parent.height);
+    if (parent.xdg) xdg_positioner_set_parent_configure(position, parent.configure_serial);
+    return position;
+}
 
 Surface& root_surface(Surface& surface) {
     auto* root = &surface;
@@ -65,6 +100,8 @@ void destroy_surface(Surface& surface) {
     }
     surface.parent = 0;
     surface.closed = true;
+    surface.mapped = false;
+    surface.popup_reposition_pending = false;
     if (surface.frame) wl_callback_destroy(std::exchange(surface.frame, nullptr));
     if (surface.popup) xdg_popup_destroy(std::exchange(surface.popup, nullptr));
     if (surface.toplevel) xdg_toplevel_destroy(std::exchange(surface.toplevel, nullptr));
@@ -78,10 +115,12 @@ void destroy_surface(Surface& surface) {
     unref(gui.owner.lua, surface.on_close);
     unref(gui.owner.lua, surface.on_grab_cleared);
     unref(gui.owner.lua, surface.on_input);
+    unref(gui.owner.lua, surface.on_focus_change);
 }
 
 void close_surface(Surface& surface) {
     surface.closed = true;
+    surface.gui->focus_pending = true;
     surface.pressed = -1;
     if (surface.grab) hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
     surface.grab_pending = false;
@@ -99,6 +138,16 @@ int dispatch_close(Surface& surface) {
     if (notify(gui, surface.id, -1, surface.on_close) < 0) return -1;
     close_surface(surface);
     return 0;
+}
+
+void reposition_popup(Surface& surface) {
+    if (!surface.popup_reposition_pending || !surface.mapped || surface.closed || surface.close_pending) return;
+    auto* parent = find_surface(*surface.gui, surface.parent);
+    assert(parent && surface.popup);
+    auto* position = popup_positioner(*parent, surface.popup_placement);
+    xdg_popup_reposition(surface.popup, position, 0);
+    xdg_positioner_destroy(position);
+    surface.popup_reposition_pending = false;
 }
 
 void update_scale(Surface& surface) {
@@ -133,14 +182,14 @@ void push_handle(lua_State* lua, Handle value, const char* type) {
     luaL_setmetatable(lua, type);
 }
 
-namespace {
-
-void request_close(Surface& surface) {
+void request_surface_close(Surface& surface) {
     if (surface.closed) return;
     surface.close_pending = true;
     for (auto& child : surface.gui->surfaces)
-        if (child && child->parent == surface.id) request_close(*child);
+        if (child && child->parent == surface.id) request_surface_close(*child);
 }
+
+namespace {
 
 void set_configure(Surface& surface, int width, int height) {
     if (surface.closed || surface.close_pending) return;
@@ -149,8 +198,18 @@ void set_configure(Surface& surface, int width, int height) {
         return;
     }
     const bool initial = !surface.configured;
+    const bool resized = surface.width != width || surface.height != height;
     surface.width = width; surface.height = height;
     surface.configured = true; surface.configure_pending = true;
+    if (surface.popup) {
+        surface.popup_x = surface.pending_popup_x;
+        surface.popup_y = surface.pending_popup_y;
+    }
+    if (resized) {
+        for (auto& child : surface.gui->surfaces)
+            if (child && child->parent == surface.id && !child->closed && !child->close_pending)
+                child->popup_reposition_pending = true;
+    }
     if (initial && surface.parent) {
         auto& root = root_surface(surface);
         if (root.grab) {
@@ -165,6 +224,7 @@ const xdg_surface_listener xdg_listener{
     .configure = [](void* data, xdg_surface* xdg, std::uint32_t serial) {
         auto& surface = *static_cast<Surface*>(data);
         xdg_surface_ack_configure(xdg, serial);
+        surface.configure_serial = serial;
         set_configure(surface, surface.pending_width, surface.pending_height);
     }
 };
@@ -174,16 +234,17 @@ const xdg_toplevel_listener toplevel_listener{
         if (width > 0) surface.pending_width = width;
         if (height > 0) surface.pending_height = height;
     },
-    .close = [](void* data, xdg_toplevel*) { request_close(*static_cast<Surface*>(data)); },
+    .close = [](void* data, xdg_toplevel*) { request_surface_close(*static_cast<Surface*>(data)); },
     .configure_bounds = [](void*, xdg_toplevel*, int, int) {},
     .wm_capabilities = [](void*, xdg_toplevel*, wl_array*) {},
 };
 const xdg_popup_listener popup_listener{
-    .configure = [](void* data, xdg_popup*, int, int, int width, int height) {
+    .configure = [](void* data, xdg_popup*, int x, int y, int width, int height) {
         auto& surface = *static_cast<Surface*>(data);
+        surface.pending_popup_x = x; surface.pending_popup_y = y;
         surface.pending_width = width; surface.pending_height = height;
     },
-    .popup_done = [](void* data, xdg_popup*) { request_close(*static_cast<Surface*>(data)); },
+    .popup_done = [](void* data, xdg_popup*) { request_surface_close(*static_cast<Surface*>(data)); },
     .repositioned = [](void*, xdg_popup*, std::uint32_t) {},
 };
 const zwlr_layer_surface_v1_listener layer_listener{
@@ -194,7 +255,7 @@ const zwlr_layer_surface_v1_listener layer_listener{
         set_configure(surface, width ? static_cast<int>(width) : surface.pending_width,
             height ? static_cast<int>(height) : surface.pending_height);
     },
-    .closed = [](void* data, zwlr_layer_surface_v1*) { request_close(*static_cast<Surface*>(data)); }
+    .closed = [](void* data, zwlr_layer_surface_v1*) { request_surface_close(*static_cast<Surface*>(data)); }
 };
 
 const wl_surface_listener surface_listener{
@@ -675,6 +736,7 @@ int create_surface(lua_State* lua) {
         callback_field(lua, 2, "on_close", surface->on_close);
         callback_field(lua, 2, "on_grab_cleared", surface->on_grab_cleared);
         callback_field(lua, 2, "on_input", surface->on_input);
+        callback_field(lua, 2, "on_focus_change", surface->on_focus_change);
         if constexpr (Role == 1) {
             static const char* edges[] = {"top", "bottom", "left", "right", "all", nullptr};
             static const char* layers[] = {"background", "bottom", "top", "overlay", nullptr};
@@ -722,7 +784,10 @@ int create_surface(lua_State* lua) {
     }
     wl_output* native_output = nullptr;
     if (!output.empty()) {
-        for (const auto& item : gui.outputs) if (item->name == output) native_output = item->native;
+        for (const auto& item : gui.outputs) if (item->name == output) {
+            native_output = item->native;
+            if constexpr (Role == 1) surface->output = item->id;
+        }
         if (!native_output) throw std::runtime_error("output not found: " + output);
     }
     surface->pending_width = surface->width = width ? width : 640;
@@ -759,13 +824,8 @@ int create_surface(lua_State* lua) {
             xdg_toplevel_add_listener(surface->toplevel, &toplevel_listener, surface.get());
             xdg_toplevel_set_title(surface->toplevel, title.c_str()); xdg_toplevel_set_app_id(surface->toplevel, app_id.c_str());
         } else {
-            auto* position = xdg_wm_base_create_positioner(gui.shell);
-            if (!position) throw std::runtime_error("cannot create popup positioner");
-            xdg_positioner_set_size(position, width, height);
-            xdg_positioner_set_anchor_rect(position, std::clamp(x, 0, parent->width - 1), std::clamp(y, 0, parent->height - 1), 1, 1);
-            xdg_positioner_set_anchor(position, XDG_POSITIONER_ANCHOR_TOP_LEFT);
-            xdg_positioner_set_gravity(position, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
-            xdg_positioner_set_constraint_adjustment(position, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
+            surface->popup_placement = {x, y, width, height};
+            auto* position = popup_positioner(*parent, surface->popup_placement);
             surface->popup = xdg_surface_get_popup(surface->xdg, parent->xdg, position);
             xdg_positioner_destroy(position);
             if (!surface->popup) throw std::runtime_error("cannot create popup");
@@ -799,12 +859,40 @@ int surface_state(lua_State* lua) {
     const auto* surface = find_surface(gui, identity.surface);
     const int width = surface ? surface->width : 0, height = surface ? surface->height : 0;
     const double scale = surface ? surface->scale : 1; const bool configured = surface && surface->configured;
-    lua_createtable(lua, 0, 5);
+    const bool positioned = surface && surface->popup && configured;
+    const int x = positioned ? surface->popup_x : 0, y = positioned ? surface->popup_y : 0;
+    const auto focus = surface ? surface_focus(*surface) : SurfaceFocus{};
+    lua_createtable(lua, 0, positioned ? 9 : 7);
     lua_pushboolean(lua, !surface); lua_setfield(lua, -2, "closed");
     lua_pushboolean(lua, configured); lua_setfield(lua, -2, "configured");
     lua_pushinteger(lua, width); lua_setfield(lua, -2, "width");
     lua_pushinteger(lua, height); lua_setfield(lua, -2, "height");
-    lua_pushnumber(lua, scale); lua_setfield(lua, -2, "scale"); return 1;
+    lua_pushnumber(lua, scale); lua_setfield(lua, -2, "scale");
+    lua_pushboolean(lua, focus.focused); lua_setfield(lua, -2, "focused");
+    lua_pushboolean(lua, focus.within); lua_setfield(lua, -2, "focus_within");
+    if (positioned) {
+        lua_pushinteger(lua, x); lua_setfield(lua, -2, "x");
+        lua_pushinteger(lua, y); lua_setfield(lua, -2, "y");
+    }
+    return 1;
+}
+
+int popup_reposition(lua_State* lua) {
+    auto& gui = gui_state(lua);
+    const auto identity = handle(lua, 1, surface_type);
+    const auto& initial = live_surface(gui, identity);
+    if (!initial.popup) throw std::runtime_error("only popups can be repositioned");
+    luaL_checktype(lua, 2, LUA_TTABLE);
+    auto placement = initial.popup_placement;
+    placement.x = static_cast<int>(integer_field(lua, 2, "x", placement.x, -16384));
+    placement.y = static_cast<int>(integer_field(lua, 2, "y", placement.y, -16384));
+    placement.width = static_cast<int>(integer_field(lua, 2, "width", placement.width, 1));
+    placement.height = static_cast<int>(integer_field(lua, 2, "height", placement.height, 1));
+    auto& surface = live_surface(gui, identity);
+    if (surface.close_pending) throw std::runtime_error("popup is closing");
+    surface.popup_placement = placement;
+    surface.popup_reposition_pending = true;
+    lua_pushboolean(lua, true); return 1;
 }
 
 int grab_focus(lua_State* lua) {
@@ -884,6 +972,7 @@ int notify(Gui& gui, std::uint64_t id, int element_index, int reference, const c
     if (id && !surface) return 0;
     const auto revision = surface ? surface->revision : 0;
     const bool grab_cleared = surface && reference == surface->on_grab_cleared;
+    const bool focus_change = surface && reference == surface->on_focus_change;
     const auto grab_generation = grab_cleared ? surface->grab_generation : 0;
     std::string text, message = error ? *error : "";
     double value = 0, scroll = 0;
@@ -909,6 +998,11 @@ int notify(Gui& gui, std::uint64_t id, int element_index, int reference, const c
             if (!live || (element_index >= 0 && (live->revision != revision ||
                 live->elements[static_cast<std::size_t>(element_index)].callback != reference))) return 0;
             if (grab_cleared && live->grab_generation != grab_generation) return 0;
+            if (focus_change) {
+                const auto current = surface_focus(*live);
+                if (current == live->reported_focus) return 0;
+                live->reported_focus = current;
+            }
         }
         lua_call(lua, id ? (element_index >= 0 ? 2 : 1) : 0, 0); return 0;
     }, 0, 1);
@@ -921,6 +1015,7 @@ void register_surfaces(lua_State* lua) {
     const luaL_Reg surfaces[] = {
         {"close", operation_call<surface_close>}, {"state", operation_call<surface_state>},
         {"set_content", operation_call<set_content>}, {"find", operation_call<find_element>},
+        {"reposition", operation_call<popup_reposition>},
         {"grab_focus", operation_call<grab_focus>}, {"release_focus", operation_call<release_focus>},
         {"set_input_region", operation_call<input_region>}, {nullptr, nullptr}
     };

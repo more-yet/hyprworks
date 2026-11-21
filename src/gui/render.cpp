@@ -393,6 +393,7 @@ void render(Surface& surface) {
     wl_surface_damage_buffer(surface.native, 0, 0, width, height);
     buffer->busy = true; surface.dirty = false;
     wl_surface_commit(surface.native);
+    surface.mapped = true;
     surface.waiting_buffer = false;
 }
 

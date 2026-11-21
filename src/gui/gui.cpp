@@ -52,7 +52,7 @@ const wl_registry_listener registry_listener{
             };
             bind(gui.compositor, wl_compositor_interface, 6, 4);
             bind(gui.shm, wl_shm_interface, 1);
-            if (bind(gui.shell, xdg_wm_base_interface, 6))
+            if (bind(gui.shell, xdg_wm_base_interface, 6, 3))
                 xdg_wm_base_add_listener(gui.shell, &shell_listener, &gui);
             bind(gui.layers, zwlr_layer_shell_v1_interface, 4, 4);
             bind(gui.viewporter, wp_viewporter_interface, 1);
@@ -85,7 +85,10 @@ const wl_registry_listener registry_listener{
         auto& gui = *static_cast<Gui*>(data);
         std::erase_if(gui.outputs, [&](auto& output) {
             if (output->id != name) return false;
-            for (auto& surface : gui.surfaces) if (surface) std::erase(surface->outputs, name);
+            for (auto& surface : gui.surfaces) if (surface) {
+                if (surface->layer && surface->output == name) request_surface_close(*surface);
+                std::erase(surface->outputs, name);
+            }
             wl_output_release(output->native); gui.outputs_pending = true; return true;
         });
         for (auto& surface : gui.surfaces) if (surface) update_scale(*surface);
@@ -203,7 +206,7 @@ void start_gui(InvocationState& state) {
     if (!gui.registry) throw std::runtime_error("cannot create Wayland registry");
     wl_registry_add_listener(gui.registry, &registry_listener, &gui);
     synchronize(gui); synchronize(gui);
-    if (!gui.compositor || !gui.shm || !gui.shell) throw std::runtime_error("compositor requires wl_compositor v4, wl_shm and xdg-shell");
+    if (!gui.compositor || !gui.shm || !gui.shell) throw std::runtime_error("compositor requires wl_compositor v4, wl_shm and xdg-shell v3");
     gui.images.start(state.wake_fd);
 }
 
@@ -266,10 +269,11 @@ void prepare_gui(InvocationState& state, WaitSet& wait) {
         deadline(transfer.deadline);
         if (transfer.fd < 0) deadline(Clock::time_point::min());
     }
-    if (gui.event_count || gui.outputs_pending) deadline(Clock::time_point::min());
+    if (gui.event_count || gui.outputs_pending || gui.focus_pending) deadline(Clock::time_point::min());
     for (const auto& seat : gui.seats) if (seat->repeat_at) deadline(*seat->repeat_at);
     for (const auto& surface : gui.surfaces) if (surface) {
         if (surface->closed || surface->close_pending || surface->configure_pending || surface->grab_pending ||
+            (surface->mapped && surface->popup_reposition_pending) ||
             (surface->dirty && surface->configured && !surface->frame && !surface->waiting_buffer))
             deadline(Clock::time_point::min());
         for (const auto& element : surface->elements)
@@ -349,12 +353,22 @@ int dispatch_gui(InvocationState& state) {
     }
     for (auto& surface : gui.surfaces)
         if (surface && !surface->closed && dispatch_scroll(*surface) < 0) return -1;
+    gui.focus_pending = false;
+    for (auto& surface : gui.surfaces) {
+        if (!surface || surface->closed || surface->close_pending) continue;
+        const auto current = surface_focus(*surface);
+        if (surface->on_focus_change < 0) surface->reported_focus = current;
+        else if (current != surface->reported_focus &&
+            notify(gui, surface->id, -1, surface->on_focus_change) < 0) return -1;
+    }
     for (auto& seat : gui.seats) update_ime(*seat);
     for (auto& surface : gui.surfaces) if (surface && surface->closed) destroy_surface(*surface);
     for (auto& surface : gui.surfaces) if (surface && surface->closed) surface.reset();
     std::erase_if(gui.buffers, [&](const auto& buffer) { return !buffer->busy && !find_surface(gui, buffer->surface); });
     for (auto& surface : gui.surfaces)
         if (surface && !state.quit_requested.load(std::memory_order_relaxed)) render(*surface);
+    for (auto& surface : gui.surfaces)
+        if (surface && !state.quit_requested.load(std::memory_order_relaxed)) reposition_popup(*surface);
     return 0;
 }
 

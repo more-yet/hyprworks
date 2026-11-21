@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <cstdio>
 #include <filesystem>
 #include <fcntl.h>
 #include <system_error>
@@ -16,11 +17,51 @@
 namespace hyprworks::lua {
 namespace {
 
+constexpr std::size_t max_entry_bytes = 4 * 1024 * 1024;
+
+void normalize_entry(std::string& source) {
+    if (source.starts_with("\xef\xbb\xbf")) source.erase(0, 3);
+    if (source.starts_with('#')) {
+        const auto end = source.find('\n');
+        std::fill_n(source.begin(), end == std::string::npos ? source.size() : end, ' ');
+    }
+}
+
+void prepare_reload(InvocationState& state) noexcept {
+    const auto requests = state.requests.fetch_and(~SignalSource::reload, std::memory_order_acq_rel);
+    if (requests & SignalSource::quit) state.quit_requested.store(true, std::memory_order_release);
+    if (!(requests & SignalSource::reload) || state.closing || state.quit_requested.load(std::memory_order_acquire)) return;
+    try {
+        auto source = host::read_file(state.entry_file, max_entry_bytes);
+        if (!source) {
+            std::fprintf(stderr, "Hyprworks: reload rejected for %s: %s\n", state.entry_file.c_str(), source.error().c_str());
+            return;
+        }
+        normalize_entry(*source);
+        const std::unique_ptr<lua_State, decltype(&lua_close)> compiler(luaL_newstate(), lua_close);
+        if (!compiler) {
+            std::fprintf(stderr, "Hyprworks: reload rejected: cannot allocate Lua compiler\n");
+            return;
+        }
+        const auto name = "@" + state.entry_file;
+        if (luaL_loadbufferx(compiler.get(), source->data(), source->size(), name.c_str(), "t") != LUA_OK) {
+            std::fprintf(stderr, "Hyprworks: reload rejected: %s\n", lua_tostring(compiler.get(), -1));
+            return;
+        }
+        if (state.requests.load(std::memory_order_acquire) & SignalSource::quit) return;
+        state.reload_source = std::move(*source);
+        state.quit_requested.store(true, std::memory_order_release);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "Hyprworks: reload rejected: %s\n", error.what());
+    }
+}
+
 int quit(lua_State* lua) {
     const auto code = luaL_optinteger(lua, 1, 0);
     luaL_argcheck(lua, code >= 0 && code <= 255, 1, "exit code must be between 0 and 255");
     auto& state = invocation(lua);
     state.exit_code = static_cast<int>(code);
+    state.requests.fetch_or(SignalSource::quit, std::memory_order_release);
     state.quit_requested.store(true, std::memory_order_relaxed);
     return 0;
 }
@@ -28,8 +69,8 @@ int quit(lua_State* lua) {
 int reload(lua_State* lua) {
     auto& state = invocation(lua);
     if (state.closing) return luaL_error(lua, "invocation is shutting down");
-    state.reload_requested.store(true, std::memory_order_relaxed);
-    state.quit_requested.store(true, std::memory_order_relaxed);
+    state.requests.fetch_or(SignalSource::reload, std::memory_order_release);
+    prepare_reload(state);
     wake(state);
     return 0;
 }
@@ -92,11 +133,8 @@ int read_signals(InvocationState& state) noexcept {
         if (!bytes) return EPIPE;
     }
     const auto pending = state.signals->pending.exchange(0, std::memory_order_relaxed);
+    state.requests.fetch_or(pending, std::memory_order_release);
     if (pending & SignalSource::quit)
-        state.reload_requested.store(false, std::memory_order_relaxed);
-    else if ((pending & SignalSource::reload) && !state.quit_requested.load(std::memory_order_relaxed))
-        state.reload_requested.store(true, std::memory_order_relaxed);
-    if (pending & (SignalSource::quit | SignalSource::reload))
         state.quit_requested.store(true, std::memory_order_relaxed);
     return 0;
 }
@@ -104,13 +142,15 @@ int read_signals(InvocationState& state) noexcept {
 void interrupt_hook(lua_State* lua, lua_Debug*) {
     auto& state = invocation(lua);
     if (read_signals(state)) luaL_error(lua, "cannot read runtime signal descriptor");
+    prepare_reload(state);
     if (state.closing || state.quit_requested.load(std::memory_order_relaxed)) {
         lua_pushlightuserdata(lua, &interrupted);
         lua_error(lua);
     }
 }
 
-int execute_entry(lua_State* lua, const std::string& path, const std::string& module_path, std::span<const std::string> arguments) {
+int execute_entry(lua_State* lua, const std::string& path, const std::string& module_path,
+    const std::string& source, const std::string& chunk_name, std::span<const std::string> arguments) {
     luaL_openlibs(lua);
     lua_getglobal(lua, "package");
     lua_getfield(lua, -1, "preload");
@@ -131,7 +171,7 @@ int execute_entry(lua_State* lua, const std::string& path, const std::string& mo
         lua_rawseti(lua, -2, index++);
     }
     lua_setglobal(lua, "arg");
-    if (luaL_loadfilex(lua, path.c_str(), "t") != LUA_OK)
+    if (luaL_loadbufferx(lua, source.data(), source.size(), chunk_name.c_str(), "t") != LUA_OK)
         return lua_error(lua);
     lua_call(lua, 0, 0);
     return 0;
@@ -180,19 +220,27 @@ Invocation::~Invocation() {
 }
 
 void Invocation::request_quit() noexcept {
+    state_->requests.fetch_or(SignalSource::quit, std::memory_order_release);
     state_->quit_requested.store(true, std::memory_order_release);
     wake(*state_);
 }
 
 void Invocation::request_reload() noexcept {
-    state_->reload_requested.store(true, std::memory_order_relaxed);
-    request_quit();
+    state_->requests.fetch_or(SignalSource::reload, std::memory_order_release);
+    wake(*state_);
 }
 
-bool Invocation::reload_requested() const noexcept { return state_->reload_requested.load(std::memory_order_relaxed); }
+bool Invocation::reload_requested() const noexcept {
+    return state_->reload_source.has_value() && !(state_->requests.load(std::memory_order_acquire) & SignalSource::quit);
+}
+
+std::optional<std::string> Invocation::take_reload_source() noexcept {
+    return std::exchange(state_->reload_source, {});
+}
 
 void Invocation::close() noexcept {
-    request_quit();
+    state_->quit_requested.store(true, std::memory_order_release);
+    wake(*state_);
     auto& state = *state_;
     state.closing = true;
     state.reload_watch.stop();
@@ -281,18 +329,28 @@ void Invocation::close() noexcept {
     state.loaded = false;
 }
 
-std::expected<void, std::string> Invocation::load(const std::string& entry_file, std::span<const std::string> arguments) {
+std::expected<void, std::string> Invocation::load(const std::string& entry_file, std::span<const std::string> arguments,
+    std::optional<std::string> source) {
     auto& state = *state_;
     if (state.loaded || state.closing)
         return std::unexpected("an invocation can load only one entry script");
     if (entry_file.empty() || entry_file.contains('\0') || arguments.size() > 4096)
         return std::unexpected("invalid entry path or too many script arguments");
     try {
+        const auto path = std::filesystem::absolute(entry_file).lexically_normal();
+        const auto filename = path.string();
+        state.entry_file = filename;
+        if (!source) {
+            auto read = host::read_file(filename, max_entry_bytes);
+            if (!read) { close(); return std::unexpected(filename + ": " + read.error()); }
+            source = std::move(*read);
+        }
+        if (source->size() > max_entry_bytes) { close(); return std::unexpected("entry script exceeds 4 MiB"); }
+        normalize_entry(*source);
+        const auto chunk_name = "@" + filename;
 #ifdef HYPRWORKS_HAS_GUI
         if (state.loop == EventLoop::gui) start_gui(state);
 #endif
-        const auto path = std::filesystem::absolute(entry_file).lexically_normal();
-        const auto filename = path.string();
         const auto watched = state.reload_watch.start(filename);
         if (!watched) { close(); return std::unexpected(watched.error()); }
         const auto module_path = path.parent_path().string() + "/?.lua;" + path.parent_path().string() + "/?/init.lua;";
@@ -305,7 +363,7 @@ std::expected<void, std::string> Invocation::load(const std::string& entry_file,
         lua_sethook(state.lua, interrupt_hook, LUA_MASKCOUNT, 10000);
         lua_pushcfunction(state.lua, traceback);
         const int status = protected_call(state.lua, [&](lua_State* lua) {
-            return execute_entry(lua, filename, module_path, arguments);
+            return execute_entry(lua, filename, module_path, *source, chunk_name, arguments);
         }, 0, 1);
         if (status < 0 && lua_touserdata(state.lua, -1) != &interrupted) {
             auto message = error_message(state.lua);
@@ -330,6 +388,8 @@ int Invocation::exit_code() const noexcept { return state_->exit_code; }
 std::expected<void, std::string> Invocation::run() {
     try {
         while (running()) {
+            prepare_reload(*state_);
+            if (!running()) break;
             prepare_wait();
             auto& wait = state_->wait;
             timespec timeout{};
@@ -486,6 +546,7 @@ void Invocation::dispatch() {
         if (const int error = read_signals(state))
             throw std::system_error(error, std::generic_category(), "read runtime signals");
     }
+    prepare_reload(state);
     if (!running()) return;
     const auto now = native::Clock::now();
     std::size_t offset = state.signals ? 2 : 1;
@@ -612,9 +673,21 @@ void Invocation::dispatch() {
     }
     if (state.reload_watch.running()) {
         auto fd = state.reload_watch.prepare_wait();
-        if (consume_fd(fd) && state.reload_watch.dispatch().changed) state.reload_at = now + std::chrono::milliseconds(50);
+        if (consume_fd(fd)) {
+            const auto update = state.reload_watch.dispatch();
+            if (update.changed) state.reload_at = now + std::chrono::milliseconds(50);
+            if (update.invalidated) {
+                if (auto watched = state.reload_watch.start(state.entry_file); !watched)
+                    std::fprintf(stderr, "Hyprworks: configuration watch: %s; use SIGHUP to retry\n", watched.error().c_str());
+            }
+        }
     }
-    if (state.reload_at && now >= *state.reload_at) { request_reload(); return; }
+    if (state.reload_at && now >= *state.reload_at) {
+        state.reload_at.reset();
+        request_reload();
+        prepare_reload(state);
+        if (!running()) return;
+    }
 
     int status = dispatch_workspaces(state.lua, state);
 #ifdef HYPRWORKS_HAS_DBUS
