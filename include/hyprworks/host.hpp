@@ -84,15 +84,20 @@ public:
     FileWatch(const FileWatch&) = delete;
     FileWatch& operator=(const FileWatch&) = delete;
     /// File watches follow the parent directory across atomic replacement.
-    /// An invalidated watch needs start() on an existing directory to resume.
+    /// An invalidated watch needs its targets registered again on existing directories.
     std::expected<void, std::string> start(const std::string& path, bool directory = false);
+    std::expected<void, std::string> add(const std::string& path, bool directory = false);
     void stop() noexcept;
     pollfd prepare_wait() const noexcept;
     FileUpdate dispatch();
     bool running() const noexcept;
 private:
     int fd_ = -1;
-    std::string filename_;
+    struct Target {
+        int descriptor = -1;
+        std::string filename;
+    };
+    std::vector<Target> targets_;
 };
 
 }

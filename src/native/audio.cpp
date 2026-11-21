@@ -405,7 +405,7 @@ WaitSet AudioConnection::prepare_wait() {
 Update AudioConnection::dispatch(const WaitSet& ready) {
     auto& state = *state_;
     if (ready.generation != state.generation)
-        throw std::logic_error("dispatch requires the current audio wait set");
+        return {};
     ++state.generation;
     const auto before = state.status;
     const auto revision = state.snapshot ? state.snapshot->revision : 0;

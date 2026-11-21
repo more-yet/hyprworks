@@ -56,7 +56,7 @@ The split adds compilation boundaries while retaining direct calls and shared
 owned storage.
 
 Lua configuration owns component composition, themes, shell-level selection,
-overlay dismissal and retry policy. Native surfaces own logical focus, active
+dismissal policy and retries. Native surfaces own logical focus, active
 presses, editing and scrolling. Keeping these states with their resources lets
 layout, input and rendering observe the same values.
 
@@ -92,7 +92,10 @@ termination takes precedence over reload.
 A native connection owns its transport, subscriptions, in-flight requests and
 deadlines. Poll readiness belongs to the generation that prepared it. Drive a
 connection on one thread and dispatch a prepared wait set before mutating it.
-Borrowed-display callbacks queue work for delivery after native dispatch returns.
+Dispatch discards stale wait sets, preserving the current generation and its
+pending work. Borrowed-display callbacks queue work for delivery after native
+dispatch returns. Both borrowed and owned shortcut displays feed the connection's
+bounded event queue; the invocation drains it after Wayland dispatch each turn.
 
 Observers subscribe before obtaining state, coalesce invalidations and publish
 complete snapshots. A `shared_ptr<const Snapshot>` retains a publication across
@@ -127,6 +130,11 @@ identity before delivery or commit. Resolve element handles again after a Lua
 call that can replace their tree. Registry roots keep active handles reachable;
 native ownership stays with the invocation or GUI.
 
+`dispatch_callback` in `invocation.hpp` owns the common connection-callback
+boundary: protected argument conversion, revalidation and delivery. Bindings
+retain event ordering and payload conversion. Command replies and GUI input
+retain their return-value and target-identity handling.
+
 Operational failures return `nil, error`. Invalid Lua arguments raise errors,
 and an uncaught callback error stops the invocation. Protocol failures are
 reported by the connection that owns recovery state.
@@ -154,6 +162,15 @@ and pointer/touch source. Delayed IME and paste work carries tree and editing
 revisions. Pointer and keyboard modality determine focus-ring visibility while
 logical focus continues to identify the editor.
 
+Popup role creation follows the parent's first buffer commit. Tree roots own
+Hyprland focus grabs and configured descendants join the root's grab. A tree
+uses either a Hyprland focus grab or XDG popup grabs. Seat-owned keyboard ancestry
+survives popup retirement until native keyboard leave.
+
+Surfaces opt into dismissal on Escape, grab clearance or focus loss. Focus-loss
+dismissal arms after the tree receives native keyboard focus. Cancellation
+invalidates queued interaction and editor work before close callbacks run.
+
 Native scroll input remembers the starting offset. After input and configure
 callbacks, layout clamps the final offset and dispatch delivers a coalesced
 change. Programmatic mutation owns its explicit state update; interaction
@@ -169,7 +186,12 @@ complete frames into owned shared-memory buffers.
 Submitted presentation buffers stay immutable until compositor release.
 Resizing and closing can retire busy buffers; their storage remains accounted
 until release. Frame readiness and reusable storage jointly determine when a
-dirty surface can render.
+dirty surface can render. Per-surface buffer counts and a GUI-wide byte budget
+bound storage; compositor release resumes surfaces waiting for capacity.
+
+Outputs publish complete pending state at `wl_output.done`. XDG-output v3 adds
+logical geometry to the same publication; surfaces retain entered-output IDs
+and use native fractional scale or the highest entered integer scale.
 
 Each image request owns its source and accounted storage. The worker borrows
 the image-work owner, resolves icons and decodes pixels. Release/acquire
@@ -233,7 +255,10 @@ Close marks owners closed, stops native work and cancels pending delivery.
 The GUI joins its image worker, destroys popup roles before parents, releases
 buffers and protocol objects, then disconnects the display. Lua closes while
 binding and GUI storage still exist for finalizers. Storage is reclaimed last.
-A reload repeats construction with a fresh invocation.
+A reload closes the invocation and repeats construction from disk. The standard
+Lua file searcher supplies local module paths to the invocation's file watch.
+Edits are debounced into a restart request; SIGHUP and `hw.reload()` request one
+directly. Configuration errors follow normal teardown and process failure.
 
 Core checks in `tests/invocation_core.cpp` and `tests/gui_core.cpp` exercise
 cross-thread requests, teardown, reentrant mutation, transaction integrity,

@@ -16,11 +16,7 @@ std::expected<void, std::string> start_shortcuts(InvocationState& state) {
     if (state.gui) {
         if (!binding.display.empty())
             return std::unexpected("GUI shortcuts use the GUI display");
-        auto* display = state.gui->display;
-        return binding.connection.attach(display, binding.app_id, binding.shortcuts, [&state, &binding](shortcuts::Event native) {
-            if (binding.events.size() == 256) throw std::runtime_error("shortcut event queue limit reached");
-            binding.events.push_back(std::move(native));
-        }, [&state]() noexcept { wake(state); });
+        return binding.connection.attach(state.gui->display, binding.app_id, binding.shortcuts, [&state]() noexcept { wake(state); });
     }
 #endif
     return binding.connection.start(binding.app_id, binding.shortcuts, binding.display);
@@ -132,23 +128,17 @@ int dispatch_shortcuts(lua_State* lua, ShortcutBinding& binding) {
     const auto events = std::exchange(binding.events, {});
     const auto generation = binding.generation;
     for (std::size_t i = 0; i <= events.size(); ++i) {
-        if (binding.closed || binding.generation != generation || invocation(lua).quit_requested.load(std::memory_order_relaxed)) break;
         if (i == 0 && !status) continue;
-        const int reference = i == 0 ? binding.on_status : binding.on_event;
-        if (reference < 0) continue;
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference); lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+        const int& callback = i == 0 ? binding.on_status : binding.on_event;
+        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
             if (i) {
                 const auto& event = events[i - 1]; lua_createtable(lua, 0, 4);
                 string_field(lua, "id", event.id); lua_pushboolean(lua, event.pressed); lua_setfield(lua, -2, "pressed");
                 identifier(lua, event.seconds); lua_setfield(lua, -2, "seconds");
                 lua_pushinteger(lua, event.nanoseconds); lua_setfield(lua, -2, "nanoseconds");
             }
-            if (binding.closed || binding.generation != generation || reference != (i == 0 ? binding.on_status : binding.on_event)) return 0;
-            lua_call(lua, i ? 2 : 1, 0); return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+            return i ? 1 : 0;
+        }) < 0) return -1;
     }
     return 0;
 }

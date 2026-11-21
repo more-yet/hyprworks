@@ -385,7 +385,7 @@ void WorkspaceConnection::advance_command(short events, TimePoint now, DispatchR
 DispatchResult WorkspaceConnection::dispatch(const WaitSet& ready, TimePoint now) {
     if (ready.generation != wait_generation_ || ready.fds[0].fd != (running(status_.phase) ? events_.fd : -1) ||
         ready.fds[1].fd != (running(status_.phase) ? command_.fd : -1))
-        throw std::logic_error("dispatch requires the current unmodified wait set");
+        return {};
     ++wait_generation_;
     const auto previous = status_;
     DispatchResult result;

@@ -259,7 +259,7 @@ WaitSet PowerConnection::prepare_wait() {
 Update PowerConnection::dispatch(const WaitSet& ready) {
     auto& state = *state_;
     if (ready.generation != state.generation || ready.fd.fd != (state.bus ? sd_bus_get_fd(state.bus) : -1))
-        throw std::logic_error("dispatch requires the current UPower wait set");
+        return {};
     ++state.generation;
     const auto before = state.status;
     const auto revision = state.snapshot ? state.snapshot->revision : 0;

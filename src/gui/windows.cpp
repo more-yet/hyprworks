@@ -155,7 +155,7 @@ const ext_image_copy_capture_frame_v1_listener capture_frame_listener{
     .ready = [](void* data, auto* frame) {
         auto& capture = *static_cast<WindowCapture*>(data);
         ext_image_copy_capture_frame_v1_destroy(frame); capture.frame = nullptr;
-        capture.ready = true; capture.deadline.reset(); capture.constraint_failures = 0;
+        capture.ready = true; capture.constraint_failures = 0;
     },
     .failed = [](void* data, auto* frame, std::uint32_t reason) {
         auto& capture = *static_cast<WindowCapture*>(data);
@@ -495,6 +495,11 @@ void advance_capture(WindowCapture& capture) {
     }
     try {
         if (std::exchange(capture.ready, false)) {
+            if (!capture.constraints || capture.width != capture.buffer_width || capture.height != capture.buffer_height ||
+                capture.format != capture.buffer_format) {
+                capture.next_frame = now;
+                return;
+            }
             if (capture.transform != WL_OUTPUT_TRANSFORM_NORMAL) {
                 capture_error(capture, "unsupported window capture transform");
                 return;
@@ -519,7 +524,7 @@ void advance_capture(WindowCapture& capture) {
             cairo_paint(paint.get());
             if (cairo_status(paint.get()) != CAIRO_STATUS_SUCCESS) throw std::runtime_error("cannot scale captured frame");
             image->submitted = true; image->ready.store(true, std::memory_order_release);
-            capture.image = std::move(image); capture.pending = true;
+            capture.image = std::move(image); capture.pending = true; capture.deadline.reset();
             capture.next_frame = now + capture.interval;
         }
         if (!capture.constraints || capture.frame || capture.pending || !capture.next_frame || now < *capture.next_frame) return;
@@ -682,21 +687,13 @@ int dispatch_windows(WindowCatalog& catalog) {
     const auto generation = catalog.generation;
     const bool status = std::exchange(catalog.status_pending, false);
     const bool change = std::exchange(catalog.change_pending, false);
-    for (bool state : {true, false}) {
-        const int reference = state ? catalog.on_status : catalog.on_change;
-        if (!(state ? status : change) || reference < 0 || catalog.generation != generation ||
-            catalog.gui->owner.quit_requested.load(std::memory_order_relaxed)) continue;
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, catalog.handle);
-            if (catalog.generation != generation || reference != (state ? catalog.on_status : catalog.on_change)) return 0;
-            lua_call(lua, 1, 0); return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+    for (bool is_status : {true, false}) {
+        if (!(is_status ? status : change)) continue;
+        const int& callback = is_status ? catalog.on_status : catalog.on_change;
+        if (dispatch_callback(lua, catalog, callback, generation, [](lua_State*) { return 0; }) < 0) return -1;
     }
     for (auto capture : catalog.captures) {
-        if (!capture || capture->closed || catalog.gui->owner.quit_requested.load(std::memory_order_relaxed)) continue;
+        if (!capture || capture->closed || catalog.gui->owner.requests.load(std::memory_order_relaxed)) continue;
         advance_capture(*capture);
         if (!std::exchange(capture->pending, false) || capture->callback < 0) continue;
         const auto image = capture->image;

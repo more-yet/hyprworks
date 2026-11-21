@@ -328,7 +328,7 @@ PangoRectangle input_cursor(Element& element, bool focused) {
 }
 
 void render(Surface& surface) {
-    if (!surface.configured || surface.closed || !surface.dirty || surface.frame) return;
+    if (!surface.configured || surface.closed || surface.close_pending || !surface.dirty || surface.frame) return;
     auto& gui = *surface.gui;
     const auto width = static_cast<int>(std::ceil(surface.width * surface.scale));
     const auto height = static_cast<int>(std::ceil(surface.height * surface.scale));
@@ -350,7 +350,7 @@ void render(Surface& surface) {
         if (count >= 3) { surface.waiting_buffer = true; return; }
         if (bytes > max_buffer_bytes - gui.buffer_bytes) {
             std::erase_if(gui.buffers, [](const auto& item) { return !item->busy; });
-            if (bytes > max_buffer_bytes - gui.buffer_bytes) throw std::runtime_error("presentation storage exceeds 256 MiB");
+            if (bytes > max_buffer_bytes - gui.buffer_bytes) { surface.waiting_buffer = true; return; }
         }
         auto replacement = std::make_unique<Buffer>();
         replacement->gui = &gui; replacement->surface = surface.id;

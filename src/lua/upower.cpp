@@ -126,19 +126,9 @@ int dispatch_power(lua_State* lua, PowerBinding& binding) {
     const bool change = std::exchange(binding.change_pending, false);
     const auto generation = binding.generation;
     for (const bool is_status : {true, false}) {
-        if (binding.closed || binding.generation != generation || invocation(lua).quit_requested.load(std::memory_order_relaxed)) break;
         if (!(is_status ? status : change)) continue;
-        const int reference = is_status ? binding.on_status : binding.on_change;
-        if (reference < 0) continue;
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
-            if (binding.closed || binding.generation != generation || reference != (is_status ? binding.on_status : binding.on_change)) return 0;
-            lua_call(lua, 1, 0);
-            return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+        const int& callback = is_status ? binding.on_status : binding.on_change;
+        if (dispatch_callback(lua, binding, callback, generation, [](lua_State*) { return 0; }) < 0) return -1;
     }
     return 0;
 }

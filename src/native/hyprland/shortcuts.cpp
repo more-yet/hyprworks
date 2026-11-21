@@ -18,7 +18,6 @@ struct ShortcutConnection::State {
     };
     wl_display* display = nullptr;
     bool owns_display = false;
-    std::function<void(Event)> on_event;
     std::function<void()> wake;
     wl_registry* registry = nullptr;
     wl_callback* sync = nullptr;
@@ -41,7 +40,7 @@ struct ShortcutConnection::State {
         if (registry) wl_registry_destroy(std::exchange(registry, nullptr));
         if (display && owns_display) wl_display_disconnect(display);
         display = nullptr; owns_display = false;
-        on_event = {}; wake = {};
+        wake = {};
         registrations.clear(); events.clear(); deadline.reset();
         registered = false; manager_name = 0; callback_error = nullptr;
     }
@@ -86,9 +85,7 @@ struct ShortcutConnection::State {
         else if (state.events.size() >= 256) state.callback_error = "shortcut event limit exceeded";
         else {
             try {
-                Event event{registration.shortcut.id, Pressed, (static_cast<std::uint64_t>(hi) << 32) | lo, ns};
-                if (state.on_event) state.on_event(std::move(event));
-                else state.events.push_back(std::move(event));
+                state.events.push_back({registration.shortcut.id, Pressed, (static_cast<std::uint64_t>(hi) << 32) | lo, ns});
             } catch (...) { state.callback_error = "cannot retain shortcut event"; }
         }
         if (state.wake) state.wake();
@@ -173,13 +170,12 @@ std::expected<void, std::string> ShortcutConnection::start(const std::string& ap
 }
 
 std::expected<void, std::string> ShortcutConnection::attach(wl_display* display, const std::string& app_id, std::span<const Shortcut> shortcuts,
-                                                          std::function<void(Event)> on_event, std::function<void()> wake) {
+                                                          std::function<void()> wake) {
     if (auto result = validate_shortcuts(app_id, shortcuts); !result) return result;
-    if (!display || !on_event || !wake) return std::unexpected("shared shortcut display requires event and wake callbacks");
+    if (!display || !wake) return std::unexpected("shared shortcut display requires a display and wake callback");
     stop();
     auto& state = *state_;
     state.display = display;
-    state.on_event = std::move(on_event);
     state.wake = std::move(wake);
     return state.subscribe(app_id, shortcuts);
 }
@@ -199,14 +195,14 @@ WaitSet ShortcutConnection::prepare_wait() {
             else { state.fail_display(); wait.fd = {-1, 0, 0}; }
         }
     }
-    wait.deadline = state.pending_status || state.callback_error ? Clock::time_point::min() : state.deadline;
+    wait.deadline = state.pending_status || state.callback_error || !state.events.empty() ? Clock::time_point::min() : state.deadline;
     return wait;
 }
 
 Update ShortcutConnection::dispatch(const WaitSet& ready) {
     auto& state = *state_;
     if (ready.generation != state.generation || ready.fd.fd != (state.display && state.owns_display ? wl_display_get_fd(state.display) : -1))
-        throw std::logic_error("dispatch requires the current shortcut wait set");
+        return {};
     ++state.generation;
     if (state.display && state.owns_display) {
         if (wl_display_dispatch_pending(state.display) < 0) state.fail_display();

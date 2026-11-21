@@ -415,7 +415,7 @@ WaitSet TrayConnection::prepare_wait() {
 }
 Update TrayConnection::dispatch(const WaitSet& ready) {
     auto& state = *state_;
-    if (ready.generation != state.generation || ready.fd.fd != (state.bus ? sd_bus_get_fd(state.bus) : -1)) throw std::logic_error("dispatch requires the current tray wait set");
+    if (ready.generation != state.generation || ready.fd.fd != (state.bus ? sd_bus_get_fd(state.bus) : -1)) return {};
     ++state.generation;
     const auto before = state.status;
     const auto revision = state.snapshot ? state.snapshot->revision : 0;

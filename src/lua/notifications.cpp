@@ -195,12 +195,9 @@ int dispatch_notifications(lua_State* lua, NotificationBinding& binding) {
     const auto events = std::exchange(binding.events, {});
     const auto generation = binding.generation;
     for (std::size_t i = 0; i < events.size() + 1; ++i) {
-        if (binding.closed || generation != binding.generation || invocation(lua).quit_requested.load(std::memory_order_relaxed)) break;
-        const int reference = i == 0 ? binding.on_status : binding.on_event;
-        if (reference < 0 || (i == 0 && !status)) continue;
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference); lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+        if (i == 0 && !status) continue;
+        const int& callback = i == 0 ? binding.on_status : binding.on_event;
+        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
             if (i) {
                 const auto& event = events[i - 1];
                 static const char* kinds[] = {"received", "closed", "action"};
@@ -211,10 +208,8 @@ int dispatch_notifications(lua_State* lua, NotificationBinding& binding) {
                 lua_pushboolean(lua, event.replaced); lua_setfield(lua, -2, "replaced");
                 if (!event.action.empty()) string_field(lua, "action", event.action);
             }
-            if (binding.closed || binding.generation != generation || reference != (i == 0 ? binding.on_status : binding.on_event)) return 0;
-            lua_call(lua, i ? 2 : 1, 0); return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+            return i ? 1 : 0;
+        }) < 0) return -1;
     }
     return 0;
 }

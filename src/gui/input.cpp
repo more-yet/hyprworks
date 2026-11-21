@@ -35,6 +35,8 @@ void enqueue(Seat& seat, Input event) {
         return;
     }
     event.seat = seat.id;
+    event.keyboard_generation = seat.keyboard_generation;
+    if (const auto* surface = find_surface(gui, event.surface)) event.generation = surface->input_generation;
     gui.events[gui.event_count++] = std::move(event);
 }
 
@@ -102,10 +104,19 @@ const wl_keyboard_listener keyboard_listener{
     .enter = [](void* data, wl_keyboard*, std::uint32_t serial, wl_surface* native, wl_array*) {
         auto& seat = *static_cast<Seat*>(data);
         seat.serial = serial; seat.keyboard_surface = surface_id(native);
+        seat.keyboard_tree.fill(0);
+        std::size_t depth = 0;
+        for (auto* surface = native ? static_cast<Surface*>(wl_surface_get_user_data(native)) : nullptr;
+            surface; surface = find_surface(*seat.gui, surface->parent)) {
+            seat.keyboard_tree[depth++] = surface->id;
+            surface->focus_seen = true;
+        }
         enqueue(seat, {.type = Input::Type::focus, .surface = seat.keyboard_surface});
     },
     .leave = [](void* data, wl_keyboard*, std::uint32_t, wl_surface*) {
         auto& seat = *static_cast<Seat*>(data);
+        ++seat.keyboard_generation;
+        seat.keyboard_tree.fill(0);
         enqueue(seat, {.type = Input::Type::blur, .surface = seat.keyboard_surface});
         seat.keyboard_surface = 0; seat.repeat_at.reset();
         if (seat.compose) xkb_compose_state_reset(seat.compose);
@@ -216,6 +227,8 @@ const wl_seat_listener seat_listener{
             if (!seat.keyboard) { seat.gui->error = "cannot create keyboard"; return; }
             wl_keyboard_add_listener(seat.keyboard, &keyboard_listener, &seat);
         } else if (!(capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && seat.keyboard) {
+            ++seat.keyboard_generation;
+            seat.keyboard_tree.fill(0);
             wl_keyboard_release(std::exchange(seat.keyboard, nullptr));
             enqueue(seat, {.type = Input::Type::blur, .surface = seat.keyboard_surface});
             seat.keyboard_surface = 0; seat.repeat_at.reset();
@@ -387,7 +400,7 @@ void destroy_seat(Seat& seat) {
 }
 
 int dispatch_scroll(Surface& surface) {
-    while (!surface.closed && !surface.gui->owner.quit_requested.load(std::memory_order_relaxed)) {
+    while (!surface.closed && !surface.gui->owner.requests.load(std::memory_order_relaxed)) {
         layout(surface);
         const auto found = std::ranges::find_if(surface.elements, [](const auto& element) { return element.scroll_origin.has_value(); });
         if (found == surface.elements.end()) break;
@@ -597,7 +610,7 @@ static void position_input_cursor(Surface& surface, Element& element, double x, 
 
 int process_input(Gui& gui, Input& event) {
     auto* surface = find_surface(gui, event.surface);
-    if (!surface) return -1;
+    if (!surface || surface->close_pending) return -1;
     auto& s = *surface;
     const bool owns_press = s.press_seat == event.seat && s.press_touch == event.touch;
     if (event.type == Input::Type::blur) {
@@ -614,7 +627,18 @@ int process_input(Gui& gui, Input& event) {
         if (owns_press) s.pressed = -1;
         return -1;
     }
-    if (event.type == Input::Type::focus) { s.dirty = true; return -1; }
+    if (event.type == Input::Type::focus) {
+        if (s.focused >= 0) reveal_focus(s, true);
+        s.dirty = true; return -1;
+    }
+    if (event.generation != s.input_generation) return -1;
+    if (event.type == Input::Type::key && event.pressed && event.serial && event.key == XKB_KEY_Escape) {
+        for (auto* current = &s; current; current = find_surface(gui, current->parent)) {
+            if (!current->dismiss_escape) continue;
+            request_surface_close(*current, "escape");
+            return -1;
+        }
+    }
     layout(s);
     if (event.type == Input::Type::axis) {
         auto* seat = find_seat(gui, event.seat);
@@ -783,24 +807,28 @@ int dispatch_input(Gui& gui) {
             seat->repeat_at = Clock::now() + std::chrono::milliseconds(1000 / std::max(1, seat->repeat_rate));
         }
     }
-    for (std::size_t i = 0; i < gui.event_count && !state.quit_requested.load(std::memory_order_relaxed); ++i) {
+    for (std::size_t i = 0; i < gui.event_count && !state.requests.load(std::memory_order_relaxed); ++i) {
         auto& event = gui.events[i];
-        gui.event_seat = find_seat(gui, event.seat);
+        const bool lifecycle = event.type == Input::Type::leave ||
+            event.type == Input::Type::focus || event.type == Input::Type::blur || event.type == Input::Type::ime_leave;
+        auto* recipient = find_surface(gui, event.surface);
+        if (!recipient || recipient->close_pending || (!lifecycle && event.generation != recipient->input_generation)) continue;
+        auto* event_seat = find_seat(gui, event.seat);
+        if (!lifecycle && (!event_seat || ((event.type == Input::Type::key || event.type == Input::Type::ime) &&
+            event.keyboard_generation != event_seat->keyboard_generation))) continue;
+        gui.event_seat = event_seat;
         gui.event_serial = event.type == Input::Type::key || event.type == Input::Type::button ? event.serial : 0;
         gui.event_surface = event.surface;
-        const bool lifecycle = event.type == Input::Type::leave ||
-            event.type == Input::Type::focus || event.type == Input::Type::blur;
         if (lifecycle) process_input(gui, event);
         bool consumed = false;
-        auto* recipient = find_surface(gui, event.surface);
-        if (recipient && event.pressed && (event.type == Input::Type::key || event.type == Input::Type::button)) {
+        if (event.pressed && (event.type == Input::Type::key || event.type == Input::Type::button)) {
             const bool visible = event.type == Input::Type::key;
             if (recipient->focus_visible != visible) {
                 recipient->focus_visible = visible;
                 recipient->dirty = true;
             }
         }
-        if (recipient && recipient->on_input >= 0 && event.type <= Input::Type::blur) {
+        if (recipient->on_input >= 0 && event.type <= Input::Type::blur) {
             const int reference = recipient->on_input;
             lua_pushcfunction(state.lua, traceback);
             const int result = protected_call(state.lua, [&](lua_State* lua) {
@@ -823,7 +851,9 @@ int dispatch_input(Gui& gui) {
                 lua_pushboolean(lua, event.shift); lua_setfield(lua, -2, "shift");
                 lua_pushboolean(lua, event.touch); lua_setfield(lua, -2, "touch");
                 lua_pushboolean(lua, event.horizontal); lua_setfield(lua, -2, "horizontal");
-                if (!find_surface(gui, event.surface) || state.quit_requested.load(std::memory_order_relaxed)) return 0;
+                const auto* live = find_surface(gui, event.surface);
+                if (!live || live->close_pending || (!lifecycle && event.generation != live->input_generation) ||
+                    state.requests.load(std::memory_order_relaxed)) return 0;
                 lua_call(lua, 2, 1);
                 consumed = lua_toboolean(lua, -1);
                 return 0;
@@ -839,7 +869,7 @@ int dispatch_input(Gui& gui) {
             if (surface && surface->press_seat == event.seat && surface->press_touch == event.touch)
                 surface->pressed = -1;
         }
-        const int target = lifecycle || consumed || state.quit_requested.load(std::memory_order_relaxed) ?
+        const int target = lifecycle || consumed || state.requests.load(std::memory_order_relaxed) ?
             -1 : process_input(gui, event);
         auto* surface = find_surface(gui, event.surface);
         if (surface && target >= 0 && notify(gui, surface->id, target, surface->elements[static_cast<std::size_t>(target)].callback,
@@ -859,7 +889,7 @@ int dispatch_input(Gui& gui) {
             transfer.error = "clipboard is not valid UTF-8 text";
         if (transfer.surface && transfer.error.empty()) {
             auto* surface = find_surface(gui, transfer.surface);
-            if (surface && surface->revision == transfer.revision && surface->focused == transfer.element) {
+            if (surface && !surface->close_pending && surface->revision == transfer.revision && surface->focused == transfer.element) {
                 auto& element = surface->elements[static_cast<std::size_t>(transfer.element)];
                 if (element.edit_revision == transfer.edit_revision &&
                     replace_text(*surface, element, std::min(element.cursor, element.anchor), std::max(element.cursor, element.anchor), transfer.data) &&
@@ -871,7 +901,7 @@ int dispatch_input(Gui& gui) {
                 lua_rawgeti(lua, LUA_REGISTRYINDEX, transfer.callback);
                 if (transfer.error.empty()) lua_pushlstring(lua, transfer.data.data(), transfer.data.size()); else lua_pushnil(lua);
                 if (transfer.error.empty()) lua_pushnil(lua); else lua_pushlstring(lua, transfer.error.data(), transfer.error.size());
-                if (!state.closing && !state.quit_requested.load(std::memory_order_relaxed)) lua_call(lua, 2, 0);
+                if (!state.closing && !state.requests.load(std::memory_order_relaxed)) lua_call(lua, 2, 0);
                 return 0;
             }, 0, 1);
             unref(state.lua, transfer.callback);

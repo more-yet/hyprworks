@@ -1,4 +1,5 @@
 #include <hyprworks/lua.hpp>
+#include <hyprworks/host.hpp>
 #include <cassert>
 #include <cerrno>
 #include <filesystem>
@@ -89,6 +90,26 @@ int main() {
         assert(invocation.load(path));
         assert(invocation.run());
     }
+    {
+        hyprworks::host::Process process;
+        const std::string arguments[]{"/bin/sh", "-c", "printf ready"};
+        assert(process.start(arguments));
+        const auto deadline = hyprworks::host::Clock::now() + std::chrono::seconds(3);
+        while (process.running()) {
+            assert(hyprworks::host::Clock::now() < deadline);
+            auto stale = process.prepare_wait();
+            auto current = process.prepare_wait();
+            assert(poll(current.fds.data(), current.fds.size(), 100) >= 0);
+            for (std::size_t i = 0; i < current.fds.size(); ++i) {
+                assert(stale.fds[i].fd == current.fds[i].fd);
+                stale.fds[i].revents = current.fds[i].revents;
+            }
+            assert(!process.dispatch(stale) && !process.result());
+            process.dispatch(current);
+        }
+        assert(process.result()->outcome == hyprworks::host::ProcessOutcome::exited);
+        assert(process.result()->stdout_text == "ready");
+    }
     close(pipe[0]); close(pipe[1]); close(script); unlink(path.c_str());
-    std::cout << "Invocation core: busy interruption, saturated wake pipe, termination precedence, cross-thread requests and callback failure passed\n";
+    std::cout << "Invocation core: interruption, saturated wake pipe, termination precedence, cross-thread requests, callback failure and stale readiness passed\n";
 }

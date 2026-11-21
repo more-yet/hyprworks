@@ -15,6 +15,7 @@
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
 #include "xdg-shell-client.h"
+#include "xdg-output-unstable-v1-client.h"
 #include "wlr-layer-shell-unstable-v1-client.h"
 #include "viewporter-client.h"
 #include "fractional-scale-v1-client.h"
@@ -87,8 +88,9 @@ struct Surface {
     wp_fractional_scale_v1* fractional = nullptr;
     hyprland_focus_grab_v1* grab = nullptr;
     std::uint64_t grab_generation = 0;
+    std::uint64_t input_generation = 0;
     wl_callback* frame = nullptr;
-    std::uint32_t popup_grab_seat = 0;
+    std::uint32_t popup_grab_seat = 0, popup_grab_serial = 0;
     std::vector<std::uint32_t> outputs;
     std::vector<Element> elements;
     int width = 640, height = 480, pending_width = 640, pending_height = 480;
@@ -105,6 +107,8 @@ struct Surface {
     bool closed = false, configured = false, dirty = true, layout_dirty = true, waiting_buffer = false;
     bool configure_pending = false, close_pending = false, grab_pending = false;
     bool mapped = false, popup_reposition_pending = false;
+    bool dismiss_focus_loss = false, dismiss_escape = false, dismiss_grab_cleared = false, focus_seen = false;
+    const char* close_reason = nullptr;
     int on_configure = -2, on_close = -2, on_grab_cleared = -2, on_input = -2, on_focus_change = -2;
     std::size_t content_bytes = 0;
 };
@@ -121,12 +125,22 @@ struct Buffer {
     ~Buffer();
 };
 
+struct OutputState {
+    std::string name, description, make, model;
+    int scale = 1, transform = 0, pixel_width = 0, pixel_height = 0, refresh_mhz = 0;
+    int physical_width = 0, physical_height = 0;
+    int x = 0, y = 0, width = 0, height = 0;
+    bool logical = false;
+    bool operator==(const OutputState&) const = default;
+};
+
 struct Output {
     Gui* gui = nullptr;
     wl_output* native = nullptr;
+    zxdg_output_v1* logical = nullptr;
     std::uint32_t id = 0;
-    std::string name, description;
-    int scale = 1;
+    OutputState state, pending;
+    bool ready = false;
 };
 
 struct Offer {
@@ -153,6 +167,8 @@ struct Seat {
     xkb_compose_state* compose = nullptr;
     std::uint64_t pointer_surface = 0, keyboard_surface = 0, ime_surface = 0, touch_surface = 0;
     std::uint64_t ime_revision = 0, ime_edit = 0, ime_applied_edit = 0;
+    std::uint64_t keyboard_generation = 0;
+    std::array<std::uint64_t, 32> keyboard_tree{};
     std::array<int, 4> ime_cursor{};
     int ime_element = -1;
     std::uint32_t ime_serial = 0, repeat_key = 0, serial = 0;
@@ -168,7 +184,7 @@ struct Seat {
 
 struct Input {
     enum class Type { motion, leave, button, axis, key, focus, blur, ime, ime_leave } type = Type::motion;
-    std::uint64_t surface = 0, revision = 0;
+    std::uint64_t surface = 0, revision = 0, generation = 0, keyboard_generation = 0;
     std::uint32_t seat = 0, serial = 0, key = 0;
     double x = 0, y = 0, delta = 0;
     bool pressed = false, shift = false, ctrl = false, alt = false, touch = false, horizontal = false;
@@ -195,6 +211,7 @@ struct Gui {
     wl_compositor* compositor = nullptr;
     wl_shm* shm = nullptr;
     xdg_wm_base* shell = nullptr;
+    zxdg_output_manager_v1* output_manager = nullptr;
     zwlr_layer_shell_v1* layers = nullptr;
     wp_viewporter* viewporter = nullptr;
     wp_fractional_scale_manager_v1* fractions = nullptr;
@@ -258,11 +275,13 @@ Gui& gui_state(lua_State* lua);
 void push_handle(lua_State* lua, Handle value, const char* type);
 void focus(Surface& surface, int index);
 void close_surface(Surface& surface);
-void request_surface_close(Surface& surface);
+void request_surface_close(Surface& surface, const char* reason = "compositor");
+void cancel_surface_input(Surface& surface, bool descendants = false);
 SurfaceFocus surface_focus(const Surface& surface);
 int dispatch_close(Surface& surface);
 void destroy_surface(Surface& surface);
 void reposition_popup(Surface& surface);
+void initialize_popup(Surface& surface);
 void update_scale(Surface& surface);
 int notify(Gui& gui, std::uint64_t id, int element_index, int reference,
     const char* kind = nullptr, const std::string* error = nullptr);

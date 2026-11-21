@@ -318,22 +318,14 @@ int dispatch_workspaces(lua_State* lua, InvocationState& state) {
         const bool status = std::exchange(binding.status_pending, false);
         const bool change = std::exchange(binding.change_pending, false);
         for (const auto event : {Event::status, Event::change, Event::result}) {
-            if (binding.closed || binding.generation != generation || state.quit_requested.load(std::memory_order_relaxed)) break;
+            if (binding.closed || binding.generation != generation || state.requests.load(std::memory_order_relaxed)) break;
             if (!(event == Event::status ? status : event == Event::change ? change : binding.result.has_value())) continue;
             const auto result = event == Event::result ? std::exchange(binding.result, {}) : std::nullopt;
             const auto& callback = event == Event::status ? binding.on_status : event == Event::change ? binding.on_change : binding.on_result;
-            const int reference = callback;
-            if (reference < 0) continue;
-            lua_pushcfunction(lua, traceback);
-            if (protected_call(lua, [&](lua_State* lua) {
-                lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-                lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+            if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
                 if (event == Event::result) push_switch_result(lua, *result);
-                if (binding.closed || binding.generation != generation || callback != reference) return 0;
-                lua_call(lua, event == Event::result ? 2 : 1, 0);
-                return 0;
-            }, 0, 1) < 0) return -1;
-            lua_settop(lua, 0);
+                return result ? 1 : 0;
+            }) < 0) return -1;
         }
     }
     return 0;

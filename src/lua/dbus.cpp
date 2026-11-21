@@ -293,13 +293,9 @@ int dispatch_dbus(lua_State* lua, InvocationState::BusBinding& bus) {
     const auto events = std::exchange(bus.events, {});
     const bool status = std::exchange(bus.status_pending, false);
     for (std::size_t i = 0; i <= events.size(); ++i) {
-        if (bus.closed || generation != bus.generation || invocation(lua).quit_requested.load(std::memory_order_relaxed)) break;
-        const int reference = i == 0 ? bus.on_status : bus.on_event;
-        if (reference < 0 || (i == 0 && !status)) continue;
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, bus.handle);
+        if (i == 0 && !status) continue;
+        const int& callback = i == 0 ? bus.on_status : bus.on_event;
+        if (dispatch_callback(lua, bus, callback, generation, [&](lua_State* lua) {
             if (i > 0) {
                 const auto& event = events[i - 1];
                 static const char* kinds[] = {"reply", "signal", "method", "expired"};
@@ -314,11 +310,8 @@ int dispatch_dbus(lua_State* lua, InvocationState::BusBinding& bus) {
                 for (const auto& value : event.arguments) { push_value(lua, value); lua_rawseti(lua, -2, index++); }
                 lua_setfield(lua, -2, "arguments");
             }
-            if (bus.closed || generation != bus.generation || reference != (i == 0 ? bus.on_status : bus.on_event)) return 0;
-            lua_call(lua, i == 0 ? 1 : 2, 0);
-            return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+            return i ? 1 : 0;
+        }) < 0) return -1;
     }
     return 0;
 }

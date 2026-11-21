@@ -255,20 +255,14 @@ int dispatch_media(lua_State* lua, MediaBinding& binding) {
     const bool status = std::exchange(binding.status_pending, false), change = std::exchange(binding.change_pending, false);
     const auto generation = binding.generation;
     for (const auto kind : {Event::status, Event::change, Event::result}) {
-        if (binding.closed || generation != binding.generation || invocation(lua).quit_requested.load(std::memory_order_relaxed)) break;
+        if (binding.closed || generation != binding.generation || invocation(lua).requests.load(std::memory_order_relaxed)) break;
         if (!(kind == Event::status ? status : kind == Event::change ? change : binding.result.has_value())) continue;
         auto result = kind == Event::result ? std::exchange(binding.result, {}) : std::nullopt;
-        const int reference = kind == Event::status ? binding.on_status : kind == Event::change ? binding.on_change : binding.on_result;
-        if (reference < 0) continue;
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference); lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+        const int& callback = kind == Event::status ? binding.on_status : kind == Event::change ? binding.on_change : binding.on_result;
+        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
             if (result) push_media_result(lua, *result);
-            const int current = kind == Event::status ? binding.on_status : kind == Event::change ? binding.on_change : binding.on_result;
-            if (binding.closed || generation != binding.generation || current != reference) return 0;
-            lua_call(lua, result ? 2 : 1, 0); return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+            return result ? 1 : 0;
+        }) < 0) return -1;
     }
     return 0;
 }

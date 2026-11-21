@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.5)
-project(hyprworks VERSION 0.1.2 LANGUAGES CXX)
+project(hyprworks VERSION 0.1.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
@@ -107,6 +107,7 @@ if(HYPRWORKS_BUILD_LUA)
         pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
         set(GUI_PROTOCOLS
             "${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml"
+            "${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output-unstable-v1.xml"
             "${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml"
             "${WAYLAND_PROTOCOLS_DIR}/staging/fractional-scale/fractional-scale-v1.xml"
             "${WAYLAND_PROTOCOLS_DIR}/staging/cursor-shape/cursor-shape-v1.xml"
@@ -142,7 +143,6 @@ if(HYPRWORKS_BUILD_LUA)
             target_include_directories(hyprworks-gui-core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
             target_compile_definitions(hyprworks-gui-core PRIVATE HYPRWORKS_HAS_GUI)
             target_compile_options(hyprworks-gui-core PRIVATE -UNDEBUG -Wall -Wextra -Wpedantic)
-            add_dependencies(hyprworks-gui-core hyprworks-lua)
             add_test(NAME gui-core COMMAND hyprworks-gui-core)
             add_test(NAME image-worker COMMAND hyprworks-gui-core --images)
             set_tests_properties(gui-core image-worker PROPERTIES TIMEOUT 15)

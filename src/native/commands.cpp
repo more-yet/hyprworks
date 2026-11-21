@@ -120,7 +120,7 @@ WaitSet CommandServer::prepare_wait() {
 Update CommandServer::dispatch(const WaitSet& ready) {
     auto& state = *state_;
     if (ready.generation != state.generation || ready.fd.fd != (state.bus ? sd_bus_get_fd(state.bus) : -1))
-        throw std::logic_error("dispatch requires the current command wait set");
+        return {};
     ++state.generation;
     if (state.bus) try {
         state.more = dbus::process(state.bus, state.callback_error);

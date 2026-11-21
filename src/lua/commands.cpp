@@ -90,7 +90,7 @@ int dispatch_commands(lua_State* lua, CommandBinding& binding) {
     const auto requests = std::exchange(binding.requests, {}); const bool status = std::exchange(binding.status_pending, false);
     const auto generation = binding.generation;
     for (std::size_t i = 0; i <= requests.size(); ++i) {
-        if (binding.closed || binding.generation != generation || invocation(lua).quit_requested.load(std::memory_order_relaxed)) break;
+        if (binding.closed || binding.generation != generation || invocation(lua).requests.load(std::memory_order_relaxed)) break;
         if (!i && !status) continue;
         const int reference = i ? binding.on_request : binding.on_status;
         bool success = true, delivered = false;

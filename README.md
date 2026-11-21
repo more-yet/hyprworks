@@ -25,8 +25,11 @@ build/local/hyprworks --config /path/to/main.lua
 Desktop integrations have individual `HYPRWORKS_BUILD_<FEATURE>` options.
 
 The CLI loads `~/.config/hyprworks/main.lua`, respecting `XDG_CONFIG_HOME`.
-Modules resolve relative to the entry file. Entry-file changes, `hw.reload()`
-and SIGHUP start a fresh invocation.
+Modules resolve relative to the entry file. Changes to the entry file or local
+Lua modules loaded through standard `require`, `hw.reload()` and SIGHUP request
+a fresh invocation. Reload closes the current invocation and loads the
+configuration from disk. Configuration errors release resources, print a
+diagnostic and exit.
 
 ## Compose a shell
 

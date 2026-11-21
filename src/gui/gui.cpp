@@ -18,26 +18,55 @@ const xdg_wm_base_listener shell_listener{
 };
 
 const wl_output_listener output_listener{
-    .geometry = [](void*, wl_output*, int, int, int, int, int, const char*, const char*, int) {},
-    .mode = [](void*, wl_output*, std::uint32_t, int, int, int) {},
+    .geometry = [](void* data, wl_output*, int, int, int width, int height, int, const char* make, const char* model, int transform) {
+        auto& output = *static_cast<Output*>(data);
+        protocol(*output.gui, [&] {
+            output.pending.make = make; output.pending.model = model;
+            output.pending.physical_width = width; output.pending.physical_height = height;
+            output.pending.transform = transform;
+        });
+    },
+    .mode = [](void* data, wl_output*, std::uint32_t flags, int width, int height, int refresh) {
+        if (!(flags & WL_OUTPUT_MODE_CURRENT)) return;
+        auto& pending = static_cast<Output*>(data)->pending;
+        pending.pixel_width = width; pending.pixel_height = height; pending.refresh_mhz = refresh;
+    },
     .done = [](void* data, wl_output*) {
         auto& output = *static_cast<Output*>(data);
-        output.gui->outputs_pending = true;
-        for (auto& surface : output.gui->surfaces) if (surface) update_scale(*surface);
+        protocol(*output.gui, [&] {
+            if (output.ready && output.state == output.pending) return;
+            output.state = output.pending; output.ready = true;
+            output.gui->outputs_pending = true;
+            for (auto& surface : output.gui->surfaces) if (surface) update_scale(*surface);
+        });
     },
     .scale = [](void* data, wl_output*, int scale) {
         auto& output = *static_cast<Output*>(data);
         if (scale < 1 || scale > 8) { output.gui->error = "unsupported output scale"; return; }
-        output.scale = scale;
+        output.pending.scale = scale;
     },
     .name = [](void* data, wl_output*, const char* name) {
         auto& output = *static_cast<Output*>(data);
-        protocol(*output.gui, [&] { output.name = name; });
+        protocol(*output.gui, [&] { output.pending.name = name; });
     },
     .description = [](void* data, wl_output*, const char* text) {
         auto& output = *static_cast<Output*>(data);
-        protocol(*output.gui, [&] { output.description = text; });
+        protocol(*output.gui, [&] { output.pending.description = text; });
     },
+};
+
+const zxdg_output_v1_listener logical_output_listener{
+    .logical_position = [](void* data, zxdg_output_v1*, int x, int y) {
+        auto& pending = static_cast<Output*>(data)->pending;
+        pending.x = x; pending.y = y;
+    },
+    .logical_size = [](void* data, zxdg_output_v1*, int width, int height) {
+        auto& pending = static_cast<Output*>(data)->pending;
+        pending.width = width; pending.height = height; pending.logical = width > 0 && height > 0;
+    },
+    .done = [](void*, zxdg_output_v1*) {},
+    .name = [](void*, zxdg_output_v1*, const char*) {},
+    .description = [](void*, zxdg_output_v1*, const char*) {},
 };
 
 const wl_registry_listener registry_listener{
@@ -61,6 +90,7 @@ const wl_registry_listener registry_listener{
             bind(gui.text_input, zwp_text_input_manager_v3_interface, 1);
             bind(gui.data, wl_data_device_manager_interface, 3, 3);
             bind(gui.focus_grabs, hyprland_focus_grab_manager_v1_interface, 1);
+            bind(gui.output_manager, zxdg_output_manager_v1_interface, 3, 3);
             if (!std::strcmp(interface, wl_output_interface.name) && version >= 4) {
                 if (gui.outputs.size() >= 128) throw std::runtime_error("output limit reached");
                 auto& output = gui.outputs.emplace_back(std::make_unique<Output>());
@@ -78,6 +108,11 @@ const wl_registry_listener registry_listener{
                 if (gui.compose) seat->compose = xkb_compose_state_new(gui.compose, XKB_COMPOSE_STATE_NO_FLAGS);
                 wl_seat_add_listener(seat->native, &seat_listener, seat.get());
             }
+            for (auto& output : gui.outputs) if (gui.output_manager && !output->logical) {
+                output->logical = zxdg_output_manager_v1_get_xdg_output(gui.output_manager, output->native);
+                if (!output->logical) throw std::runtime_error("cannot create logical output");
+                zxdg_output_v1_add_listener(output->logical, &logical_output_listener, output.get());
+            }
             for (auto& seat : gui.seats) attach_seat_services(*seat);
         });
     },
@@ -86,14 +121,17 @@ const wl_registry_listener registry_listener{
         std::erase_if(gui.outputs, [&](auto& output) {
             if (output->id != name) return false;
             for (auto& surface : gui.surfaces) if (surface) {
-                if (surface->layer && surface->output == name) request_surface_close(*surface);
-                std::erase(surface->outputs, name);
+                if (surface->layer && surface->output == name) request_surface_close(*surface, "output_removed");
+                if (std::erase(surface->outputs, name)) surface->configure_pending = true;
             }
+            if (output->logical) zxdg_output_v1_destroy(output->logical);
             wl_output_release(output->native); gui.outputs_pending = true; return true;
         });
         for (auto& surface : gui.surfaces) if (surface) update_scale(*surface);
         std::erase_if(gui.seats, [&](auto& seat) {
             if (seat->id != name) return false;
+            for (auto& surface : gui.surfaces)
+                if (surface && surface->popup_grab_seat == name) request_surface_close(*surface, "seat_removed");
             enqueue(*seat, {.type = Input::Type::blur, .surface = seat->keyboard_surface});
             enqueue(*seat, {.type = Input::Type::leave, .surface = seat->pointer_surface});
             enqueue(*seat, {.type = Input::Type::leave, .surface = seat->touch_surface, .touch = true});
@@ -153,14 +191,32 @@ void synchronize(Gui& gui) {
 
 int outputs(lua_State* lua) {
     auto& gui = gui_state(lua);
-    struct Record { std::string name, description; int scale; };
+    struct Record { std::uint32_t id; OutputState state; };
     std::vector<Record> records;
-    for (const auto& output : gui.outputs) records.push_back({output->name, output->description, output->scale});
+    for (const auto& output : gui.outputs) if (output->ready) records.push_back({output->id, output->state});
     return protected_call(lua, [&](lua_State* lua) {
         lua_createtable(lua, static_cast<int>(records.size()), 0);
         for (std::size_t i = 0; i < records.size(); ++i) {
-            lua_createtable(lua, 0, 3); string_field(lua, "name", records[i].name); string_field(lua, "description", records[i].description);
-            lua_pushinteger(lua, records[i].scale); lua_setfield(lua, -2, "scale"); lua_rawseti(lua, -2, static_cast<lua_Integer>(i + 1));
+            const auto& record = records[i];
+            const auto& value = record.state;
+            lua_createtable(lua, 0, 16);
+            string_field(lua, "name", value.name); string_field(lua, "description", value.description);
+            string_field(lua, "make", value.make); string_field(lua, "model", value.model);
+            lua_pushinteger(lua, record.id); lua_setfield(lua, -2, "id");
+            lua_pushinteger(lua, value.scale); lua_setfield(lua, -2, "scale");
+            lua_pushinteger(lua, value.transform); lua_setfield(lua, -2, "transform");
+            lua_pushinteger(lua, value.pixel_width); lua_setfield(lua, -2, "pixel_width");
+            lua_pushinteger(lua, value.pixel_height); lua_setfield(lua, -2, "pixel_height");
+            lua_pushinteger(lua, value.refresh_mhz); lua_setfield(lua, -2, "refresh_mhz");
+            lua_pushinteger(lua, value.physical_width); lua_setfield(lua, -2, "physical_width_mm");
+            lua_pushinteger(lua, value.physical_height); lua_setfield(lua, -2, "physical_height_mm");
+            if (value.logical) {
+                lua_pushinteger(lua, value.x); lua_setfield(lua, -2, "x");
+                lua_pushinteger(lua, value.y); lua_setfield(lua, -2, "y");
+                lua_pushinteger(lua, value.width); lua_setfield(lua, -2, "width");
+                lua_pushinteger(lua, value.height); lua_setfield(lua, -2, "height");
+            }
+            lua_rawseti(lua, -2, static_cast<lua_Integer>(i + 1));
         }
         return 1;
     }, 1);
@@ -175,12 +231,15 @@ int on_outputs(lua_State* lua) {
 int capabilities(lua_State* lua) {
     auto& gui = gui_state(lua);
     const bool layer = gui.layers, fraction = gui.fractions && gui.viewporter, ime = gui.text_input, clipboard = gui.data, grab = gui.focus_grabs;
-    lua_createtable(lua, 0, 5);
+    const bool logical = gui.output_manager;
+    lua_createtable(lua, 0, 7);
     lua_pushboolean(lua, layer); lua_setfield(lua, -2, "layer_shell");
     lua_pushboolean(lua, fraction); lua_setfield(lua, -2, "fractional_scale");
     lua_pushboolean(lua, ime); lua_setfield(lua, -2, "text_input");
     lua_pushboolean(lua, clipboard); lua_setfield(lua, -2, "clipboard");
-    lua_pushboolean(lua, grab); lua_setfield(lua, -2, "focus_grab"); return 1;
+    lua_pushboolean(lua, grab); lua_setfield(lua, -2, "focus_grab");
+    lua_pushboolean(lua, logical); lua_setfield(lua, -2, "logical_outputs");
+    lua_pushboolean(lua, false); lua_setfield(lua, -2, "passive_outside_click"); return 1;
 }
 
 }
@@ -228,10 +287,14 @@ void close_gui(Gui& gui) noexcept {
     gui.transfers.clear();
     for (auto& seat : gui.seats) destroy_seat(*seat);
     gui.seats.clear();
-    for (auto& output : gui.outputs) if (output->native) wl_output_release(output->native);
+    for (auto& output : gui.outputs) {
+        if (output->logical) zxdg_output_v1_destroy(output->logical);
+        if (output->native) wl_output_release(output->native);
+    }
     gui.outputs.clear();
     unref(state.lua, gui.on_outputs);
     if (gui.focus_grabs) hyprland_focus_grab_manager_v1_destroy(gui.focus_grabs);
+    if (gui.output_manager) zxdg_output_manager_v1_destroy(gui.output_manager);
     if (gui.data) wl_data_device_manager_destroy(gui.data);
     if (gui.text_input) zwp_text_input_manager_v3_destroy(gui.text_input);
     if (gui.cursors) wp_cursor_shape_manager_v1_destroy(gui.cursors);
@@ -272,7 +335,7 @@ void prepare_gui(InvocationState& state, WaitSet& wait) {
     if (gui.event_count || gui.outputs_pending || gui.focus_pending) deadline(Clock::time_point::min());
     for (const auto& seat : gui.seats) if (seat->repeat_at) deadline(*seat->repeat_at);
     for (const auto& surface : gui.surfaces) if (surface) {
-        if (surface->closed || surface->close_pending || surface->configure_pending || surface->grab_pending ||
+        if (surface->closed || surface->close_pending || (surface->configured && surface->configure_pending) || surface->grab_pending ||
             (surface->mapped && surface->popup_reposition_pending) ||
             (surface->dirty && surface->configured && !surface->frame && !surface->waiting_buffer))
             deadline(Clock::time_point::min());
@@ -320,17 +383,30 @@ int dispatch_gui(InvocationState& state) {
     auto& gui = *state.gui;
     check_display(gui);
     for (auto& surface : gui.surfaces)
-        if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
+        if (surface && !surface->closed && !surface->close_pending && surface->dismiss_focus_loss &&
+            surface->focus_seen && !surface_focus(*surface).within)
+            request_surface_close(*surface, "focus_lost");
     for (auto& surface : gui.surfaces)
-        if (surface && !surface->closed && std::exchange(surface->grab_pending, false) &&
-            notify(gui, surface->id, -1, surface->on_grab_cleared) < 0) return -1;
+        if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
+    for (auto& surface : gui.surfaces) {
+        if (!surface || surface->closed || !std::exchange(surface->grab_pending, false)) continue;
+        const auto generation = surface->grab_generation;
+        if (notify(gui, surface->id, -1, surface->on_grab_cleared) < 0) return -1;
+        if (!surface->closed && !surface->grab && surface->grab_generation == generation && surface->dismiss_grab_cleared)
+            request_surface_close(*surface, "grab_cleared");
+    }
+    for (auto& surface : gui.surfaces)
+        if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
     if (gui.windows && dispatch_windows(*gui.windows) < 0) return -1;
     if (std::exchange(gui.outputs_pending, false) && notify(gui, 0, -1, gui.on_outputs) < 0) return -1;
     if (dispatch_input(gui) < 0) return -1;
+    for (auto& surface : gui.surfaces)
+        if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
     for (auto& surface : gui.surfaces) {
         if (!surface || surface->closed) continue;
         const auto id = surface->id;
-        if (std::exchange(surface->configure_pending, false) && notify(gui, id, -1, surface->on_configure) < 0) return -1;
+        if (surface->configured && std::exchange(surface->configure_pending, false) &&
+            notify(gui, id, -1, surface->on_configure) < 0) return -1;
         if (surface->closed) continue;
         const auto revision = surface->revision;
         layout(*surface);
@@ -366,9 +442,11 @@ int dispatch_gui(InvocationState& state) {
     for (auto& surface : gui.surfaces) if (surface && surface->closed) surface.reset();
     std::erase_if(gui.buffers, [&](const auto& buffer) { return !buffer->busy && !find_surface(gui, buffer->surface); });
     for (auto& surface : gui.surfaces)
-        if (surface && !state.quit_requested.load(std::memory_order_relaxed)) render(*surface);
+        if (surface && !state.requests.load(std::memory_order_relaxed)) render(*surface);
     for (auto& surface : gui.surfaces)
-        if (surface && !state.quit_requested.load(std::memory_order_relaxed)) reposition_popup(*surface);
+        if (surface && !state.requests.load(std::memory_order_relaxed)) initialize_popup(*surface);
+    for (auto& surface : gui.surfaces)
+        if (surface && !state.requests.load(std::memory_order_relaxed)) reposition_popup(*surface);
     return 0;
 }
 

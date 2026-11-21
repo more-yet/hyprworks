@@ -182,7 +182,7 @@ ProcessWait Process::prepare_wait() {
 bool Process::dispatch(const ProcessWait& ready) {
     auto& state = *state_;
     if (ready.generation != state.generation || ready.fds[0].fd != state.output || ready.fds[1].fd != state.error ||
-        ready.fds[2].fd != (state.exited ? -1 : state.pidfd)) throw std::logic_error("dispatch requires the current process wait set");
+        ready.fds[2].fd != (state.exited ? -1 : state.pidfd)) return false;
     ++state.generation;
     if (state.pid < 0) return false;
     try {
@@ -344,21 +344,39 @@ std::expected<void, std::string> write_file(const std::string& path, const std::
 }
 
 FileWatch::~FileWatch() { stop(); }
-void FileWatch::stop() noexcept { close_fd(fd_); filename_.clear(); }
+void FileWatch::stop() noexcept { close_fd(fd_); targets_.clear(); }
 bool FileWatch::running() const noexcept { return fd_ >= 0; }
 pollfd FileWatch::prepare_wait() const noexcept { return {fd_, POLLIN, 0}; }
 
 std::expected<void, std::string> FileWatch::start(const std::string& path, bool directory) {
     stop();
+    return add(path, directory);
+}
+
+std::expected<void, std::string> FileWatch::add(const std::string& path, bool directory) {
     try {
         valid_path(path);
         const auto target = std::filesystem::absolute(path).lexically_normal();
-        filename_ = directory ? "" : target.filename().string();
-        fd_ = inotify_init1(IN_CLOEXEC | IN_NONBLOCK); check(fd_, "create file watch");
-        check(inotify_add_watch(fd_, (directory ? target : target.parent_path()).c_str(),
-            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR), "watch directory");
+        const auto parent = directory ? target : target.parent_path();
+        Target added{.filename = directory ? "" : target.filename().string()};
+        if (targets_.size() == 256) throw std::runtime_error("file watch target limit reached (256)");
+        if (targets_.size() == targets_.capacity())
+            targets_.reserve(std::min<std::size_t>(256, std::max<std::size_t>(4, targets_.size() * 2)));
+        if (fd_ < 0) {
+            fd_ = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+            check(fd_, "create file watch");
+        }
+        added.descriptor = inotify_add_watch(fd_, parent.c_str(),
+            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR);
+        check(added.descriptor, "watch directory");
+        for (const auto& existing : targets_)
+            if (existing.descriptor == added.descriptor && existing.filename == added.filename) return {};
+        targets_.push_back(std::move(added));
         return {};
-    } catch (const std::exception& error) { stop(); return std::unexpected(error.what()); }
+    } catch (const std::exception& error) {
+        if (targets_.empty()) close_fd(fd_);
+        return std::unexpected(error.what());
+    }
 }
 
 FileUpdate FileWatch::dispatch() {
@@ -375,7 +393,10 @@ FileUpdate FileWatch::dispatch() {
             const auto* event = reinterpret_cast<const inotify_event*>(buffer + offset);
             if (event->mask & IN_Q_OVERFLOW) update.overflow = update.changed = true;
             if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT)) update.invalidated = update.changed = true;
-            if (event->len && (filename_.empty() || filename_ == event->name)) update.changed = true;
+            if (event->len)
+                for (const auto& target : targets_)
+                    if (target.descriptor == event->wd && (target.filename.empty() || target.filename == event->name))
+                        update.changed = true;
             offset += sizeof(inotify_event) + event->len;
         }
     }

@@ -222,7 +222,7 @@ WaitSet DesktopEntries::prepare_wait() {
 Update DesktopEntries::dispatch(const WaitSet& ready) {
     auto& state = *state_;
     if (ready.generation != state.generation || ready.fd.fd != state.fd)
-        throw std::logic_error("dispatch requires the current desktop-entry wait set");
+        return {};
     ++state.generation;
     if (state.fd >= 0) try {
         if (ready.fd.revents & (POLLERR | POLLHUP | POLLNVAL)) throw std::runtime_error("desktop directory watch failed");

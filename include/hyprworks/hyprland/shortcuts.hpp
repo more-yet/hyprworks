@@ -58,10 +58,10 @@ public:
     std::expected<void, std::string> start(const std::string& app_id, std::span<const Shortcut> shortcuts,
                                            const std::string& display = {});
     /// Borrows a display driven by the caller. Stop before releasing that display.
-    /// Native callbacks defer connection operations until dispatch returns.
-    /// Event exceptions fail the subscription; wake completes without throwing.
+    /// Wake schedules dispatch, which returns queued events. Wake is nonthrowing
+    /// and defers connection operations until native dispatch returns.
     std::expected<void, std::string> attach(wl_display* display, const std::string& app_id, std::span<const Shortcut> shortcuts,
-                                           std::function<void(Event)> on_event, std::function<void()> wake);
+                                           std::function<void()> wake);
     void stop() noexcept;
     WaitSet prepare_wait();
     Update dispatch(const WaitSet& ready);

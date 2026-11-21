@@ -332,7 +332,7 @@ void read_clock_change(InvocationState& state) {
 
 int dispatch_utilities(lua_State* lua, InvocationState& state) {
     if (std::exchange(state.clock_pending, false) && state.on_clock_change >= 0 &&
-        !state.quit_requested.load(std::memory_order_relaxed)) {
+        !state.requests.load(std::memory_order_relaxed)) {
         const int reference = state.on_clock_change;
         const auto generation = state.clock_generation;
         tzset();
@@ -346,61 +346,41 @@ int dispatch_utilities(lua_State* lua, InvocationState& state) {
     }
     const auto timers = state.timers.size(), processes = state.processes.size(), watches = state.watches.size();
     for (std::size_t i = 0; i < timers; ++i) {
-        if (state.quit_requested.load(std::memory_order_relaxed)) return 0;
+        if (state.requests.load(std::memory_order_relaxed)) return 0;
         auto& binding = *state.timers[i];
         if (binding.closed || !binding.pending) continue;
         const auto ticks = std::exchange(binding.pending, 0);
-        const int reference = binding.callback;
-        if (reference < 0) continue;
         const auto generation = binding.generation;
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+        if (dispatch_callback(lua, binding, binding.callback, generation, [&](lua_State* lua) {
             lua_pushinteger(lua, static_cast<lua_Integer>(ticks));
-            if (binding.closed || binding.generation != generation || binding.callback != reference) return 0;
-            lua_call(lua, 2, 0); return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+            return 1;
+        }) < 0) return -1;
     }
     for (std::size_t i = 0; i < processes; ++i) {
-        if (state.quit_requested.load(std::memory_order_relaxed)) return 0;
+        if (state.requests.load(std::memory_order_relaxed)) return 0;
         auto& binding = *state.processes[i];
         if (binding.closed || !binding.pending) continue;
         binding.pending = false;
-        const int reference = binding.callback;
-        if (reference < 0) continue;
+        if (binding.callback < 0) continue;
         const auto generation = binding.generation;
         const auto result = binding.process.result();
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+        if (dispatch_callback(lua, binding, binding.callback, generation, [&](lua_State* lua) {
             push_process_result(lua, result);
-            if (binding.closed || binding.generation != generation || binding.callback != reference) return 0;
-            lua_call(lua, 2, 0); return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+            return 1;
+        }) < 0) return -1;
     }
     for (std::size_t i = 0; i < watches; ++i) {
-        if (state.quit_requested.load(std::memory_order_relaxed)) return 0;
+        if (state.requests.load(std::memory_order_relaxed)) return 0;
         auto& binding = *state.watches[i];
         if (binding.closed || !binding.pending.changed) continue;
         const auto event = std::exchange(binding.pending, {});
-        const int reference = binding.callback;
-        if (reference < 0) continue;
         const auto generation = binding.generation;
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+        if (dispatch_callback(lua, binding, binding.callback, generation, [&](lua_State* lua) {
             lua_createtable(lua, 0, 2);
             lua_pushboolean(lua, event.overflow); lua_setfield(lua, -2, "overflow");
             lua_pushboolean(lua, event.invalidated); lua_setfield(lua, -2, "invalidated");
-            if (binding.closed || binding.generation != generation || binding.callback != reference) return 0;
-            lua_call(lua, 2, 0); return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+            return 1;
+        }) < 0) return -1;
     }
     return 0;
 }

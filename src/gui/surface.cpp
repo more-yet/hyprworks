@@ -19,14 +19,10 @@ SurfaceFocus surface_focus(const Surface& surface) {
     if (surface.closed || surface.close_pending) return result;
     auto& gui = *surface.gui;
     for (const auto& seat : gui.seats) {
-        auto* entered = find_surface(gui, seat->keyboard_surface);
-        if (!entered || entered->close_pending) continue;
-        result.focused |= entered->id == surface.id;
-        for (auto* current = entered; current; current = find_surface(gui, current->parent)) {
-            if (current->id != surface.id) continue;
-            result.within = true;
-            break;
-        }
+        result.focused |= seat->keyboard_surface == surface.id;
+        // Retiring a popup does not move native focus; retain ancestry until keyboard leave.
+        result.within |= seat->keyboard_surface == surface.id ||
+            std::ranges::find(seat->keyboard_tree, surface.id) != seat->keyboard_tree.end();
     }
     return result;
 }
@@ -119,15 +115,29 @@ void destroy_surface(Surface& surface) {
 }
 
 void close_surface(Surface& surface) {
+    if (surface.closed) return;
+    cancel_surface_input(surface);
     surface.closed = true;
     surface.gui->focus_pending = true;
-    surface.pressed = -1;
     if (surface.grab) hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
     surface.grab_pending = false;
-    for (auto& seat : surface.gui->seats)
-        if (seat->keyboard_surface == surface.id) seat->repeat_at.reset();
     for (auto& child : surface.gui->surfaces)
         if (child && child->parent == surface.id) close_surface(*child);
+}
+
+void cancel_surface_input(Surface& surface, bool descendants) {
+    ++surface.input_generation;
+    surface.pressed = -1;
+    for (auto& element : surface.elements) if (element.kind == Kind::input) {
+        element.preedit.clear(); ++element.edit_revision;
+    }
+    for (auto& seat : surface.gui->seats) if (seat->keyboard_surface == surface.id) {
+        seat->repeat_at.reset();
+        if (seat->compose) xkb_compose_state_reset(seat->compose);
+    }
+    if (descendants) for (auto& child : surface.gui->surfaces)
+        if (child && child->parent == surface.id && !child->closed) cancel_surface_input(*child, true);
+    surface.dirty = true;
 }
 
 int dispatch_close(Surface& surface) {
@@ -154,8 +164,11 @@ void update_scale(Surface& surface) {
     if (surface.fractional) return;
     int scale = 1;
     for (const auto& output : surface.gui->outputs)
-        if (std::ranges::find(surface.outputs, output->id) != surface.outputs.end()) scale = std::max(scale, output->scale);
-    if (surface.scale != scale) { surface.scale = scale; dirty(surface); surface.configure_pending = true; }
+        if (std::ranges::find(surface.outputs, output->id) != surface.outputs.end()) scale = std::max(scale, output->state.scale);
+    if (surface.scale != scale) {
+        surface.scale = scale; dirty(surface); surface.configure_pending = true;
+        if (surface.frame) wl_callback_destroy(std::exchange(surface.frame, nullptr));
+    }
 }
 
 Gui& gui_state(lua_State* lua) {
@@ -182,11 +195,13 @@ void push_handle(lua_State* lua, Handle value, const char* type) {
     luaL_setmetatable(lua, type);
 }
 
-void request_surface_close(Surface& surface) {
-    if (surface.closed) return;
+void request_surface_close(Surface& surface, const char* reason) {
+    if (surface.closed || surface.close_pending) return;
+    cancel_surface_input(surface);
     surface.close_pending = true;
+    surface.close_reason = reason;
     for (auto& child : surface.gui->surfaces)
-        if (child && child->parent == surface.id) request_surface_close(*child);
+        if (child && child->parent == surface.id) request_surface_close(*child, "parent_closed");
 }
 
 namespace {
@@ -199,6 +214,9 @@ void set_configure(Surface& surface, int width, int height) {
     }
     const bool initial = !surface.configured;
     const bool resized = surface.width != width || surface.height != height;
+    if (resized || (surface.parent &&
+        (surface.popup_x != surface.pending_popup_x || surface.popup_y != surface.pending_popup_y)))
+        cancel_surface_input(surface, true);
     surface.width = width; surface.height = height;
     surface.configured = true; surface.configure_pending = true;
     if (surface.popup) {
@@ -206,6 +224,7 @@ void set_configure(Surface& surface, int width, int height) {
         surface.popup_y = surface.pending_popup_y;
     }
     if (resized) {
+        if (surface.frame) wl_callback_destroy(std::exchange(surface.frame, nullptr));
         for (auto& child : surface.gui->surfaces)
             if (child && child->parent == surface.id && !child->closed && !child->close_pending)
                 child->popup_reposition_pending = true;
@@ -265,12 +284,14 @@ const wl_surface_listener surface_listener{
             for (const auto& output : surface.gui->outputs)
                 if (output->native == native && std::ranges::find(surface.outputs, output->id) == surface.outputs.end())
                     surface.outputs.push_back(output->id);
+            surface.configure_pending = true;
             update_scale(surface);
         });
     },
     .leave = [](void* data, wl_surface*, wl_output* native) {
         auto& surface = *static_cast<Surface*>(data);
         for (const auto& output : surface.gui->outputs) if (output->native == native) std::erase(surface.outputs, output->id);
+        surface.configure_pending = true;
         update_scale(surface);
     },
     .preferred_buffer_scale = [](void*, wl_surface*, int) {},
@@ -280,7 +301,9 @@ const wp_fractional_scale_v1_listener scale_listener{
     .preferred_scale = [](void* data, wp_fractional_scale_v1*, std::uint32_t scale) {
         auto& surface = *static_cast<Surface*>(data);
         if (!scale || scale > 960) { surface.gui->error = "unsupported fractional scale"; return; }
+        if (surface.scale == scale / 120.0) return;
         surface.scale = scale / 120.0;
+        if (surface.frame) wl_callback_destroy(std::exchange(surface.frame, nullptr));
         surface.configure_pending = true; dirty(surface);
     }
 };
@@ -710,6 +733,7 @@ const hyprland_focus_grab_v1_listener grab_listener{
         auto& surface = *static_cast<Surface*>(data);
         hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
         surface.grab_pending = true;
+        cancel_surface_input(surface, true);
     }
 };
 
@@ -737,6 +761,9 @@ int create_surface(lua_State* lua) {
         callback_field(lua, 2, "on_grab_cleared", surface->on_grab_cleared);
         callback_field(lua, 2, "on_input", surface->on_input);
         callback_field(lua, 2, "on_focus_change", surface->on_focus_change);
+        surface->dismiss_focus_loss = boolean_field(lua, 2, "dismiss_on_focus_loss", false);
+        surface->dismiss_escape = boolean_field(lua, 2, "dismiss_on_escape", false);
+        surface->dismiss_grab_cleared = boolean_field(lua, 2, "dismiss_on_grab_cleared", false);
         if constexpr (Role == 1) {
             static const char* edges[] = {"top", "bottom", "left", "right", "all", nullptr};
             static const char* layers[] = {"background", "bottom", "top", "overlay", nullptr};
@@ -781,10 +808,14 @@ int create_surface(lua_State* lua) {
             throw std::runtime_error("nested popup grab requires a parent popup grabbed by the same seat");
         if (grab && root_surface(*parent).grab)
             throw std::runtime_error("popup cannot take an XDG grab while its root owns a focus grab");
+        if (grab) {
+            surface->popup_grab_seat = gui.event_seat->id;
+            surface->popup_grab_serial = gui.event_serial;
+        }
     }
     wl_output* native_output = nullptr;
     if (!output.empty()) {
-        for (const auto& item : gui.outputs) if (item->name == output) {
+        for (const auto& item : gui.outputs) if (item->ready && item->state.name == output) {
             native_output = item->native;
             if constexpr (Role == 1) surface->output = item->id;
         }
@@ -825,20 +856,11 @@ int create_surface(lua_State* lua) {
             xdg_toplevel_set_title(surface->toplevel, title.c_str()); xdg_toplevel_set_app_id(surface->toplevel, app_id.c_str());
         } else {
             surface->popup_placement = {x, y, width, height};
-            auto* position = popup_positioner(*parent, surface->popup_placement);
-            surface->popup = xdg_surface_get_popup(surface->xdg, parent->xdg, position);
-            xdg_positioner_destroy(position);
-            if (!surface->popup) throw std::runtime_error("cannot create popup");
-            xdg_popup_add_listener(surface->popup, &popup_listener, surface.get());
-            if (parent->layer) zwlr_layer_surface_v1_get_popup(parent->layer, surface->popup);
-            if (grab) {
-                xdg_popup_grab(surface->popup, gui.event_seat->native, gui.event_serial);
-                surface->popup_grab_seat = gui.event_seat->id;
-            }
         }
     }
     const auto id = surface->id;
-    wl_surface_commit(surface->native);
+    if constexpr (Role == 2) initialize_popup(*surface);
+    else wl_surface_commit(surface->native);
     *slot = std::move(surface); cleanup.surface = nullptr;
     if (protected_call(lua, [&](lua_State* lua) { push_handle(lua, {id, 0, -1}, surface_type); return 1; }, 1) < 0) {
         close_surface(**slot); return -1;
@@ -856,32 +878,52 @@ int surface_close(lua_State* lua) {
 
 int surface_state(lua_State* lua) {
     auto& gui = gui_state(lua); const auto identity = handle(lua, 1, surface_type);
-    const auto* surface = find_surface(gui, identity.surface);
+    auto* surface = find_surface(gui, identity.surface);
     const int width = surface ? surface->width : 0, height = surface ? surface->height : 0;
     const double scale = surface ? surface->scale : 1; const bool configured = surface && surface->configured;
     const bool positioned = surface && surface->popup && configured;
     const int x = positioned ? surface->popup_x : 0, y = positioned ? surface->popup_y : 0;
     const auto focus = surface ? surface_focus(*surface) : SurfaceFocus{};
-    lua_createtable(lua, 0, positioned ? 9 : 7);
-    lua_pushboolean(lua, !surface); lua_setfield(lua, -2, "closed");
-    lua_pushboolean(lua, configured); lua_setfield(lua, -2, "configured");
-    lua_pushinteger(lua, width); lua_setfield(lua, -2, "width");
-    lua_pushinteger(lua, height); lua_setfield(lua, -2, "height");
-    lua_pushnumber(lua, scale); lua_setfield(lua, -2, "scale");
-    lua_pushboolean(lua, focus.focused); lua_setfield(lua, -2, "focused");
-    lua_pushboolean(lua, focus.within); lua_setfield(lua, -2, "focus_within");
-    if (positioned) {
-        lua_pushinteger(lua, x); lua_setfield(lua, -2, "x");
-        lua_pushinteger(lua, y); lua_setfield(lua, -2, "y");
-    }
-    return 1;
+    const bool closing = surface && surface->close_pending;
+    const bool mapped = surface && surface->mapped;
+    const bool grabbed = surface && root_surface(*surface).grab;
+    const auto entered_outputs = surface ? surface->outputs : std::vector<std::uint32_t>{};
+    const auto output = surface ? surface->output : 0;
+    const char* reason = surface ? surface->close_reason : nullptr;
+    const Handle focused{identity.surface, surface ? surface->revision : 0, surface ? surface->focused : -1};
+    return protected_call(lua, [&](lua_State* lua) {
+        lua_createtable(lua, 0, positioned ? 16 : 14);
+        lua_pushboolean(lua, !surface); lua_setfield(lua, -2, "closed");
+        lua_pushboolean(lua, configured); lua_setfield(lua, -2, "configured");
+        lua_pushinteger(lua, width); lua_setfield(lua, -2, "width");
+        lua_pushinteger(lua, height); lua_setfield(lua, -2, "height");
+        lua_pushnumber(lua, scale); lua_setfield(lua, -2, "scale");
+        lua_pushboolean(lua, focus.focused); lua_setfield(lua, -2, "focused");
+        lua_pushboolean(lua, focus.within); lua_setfield(lua, -2, "focus_within");
+        lua_pushboolean(lua, closing); lua_setfield(lua, -2, "closing");
+        lua_pushboolean(lua, mapped); lua_setfield(lua, -2, "mapped");
+        lua_pushboolean(lua, grabbed); lua_setfield(lua, -2, "focus_grab");
+        if (focused.element >= 0) { push_handle(lua, focused, element_type); lua_setfield(lua, -2, "focused_element"); }
+        if (reason) { lua_pushstring(lua, reason); lua_setfield(lua, -2, "close_reason"); }
+        if (output) { lua_pushinteger(lua, output); lua_setfield(lua, -2, "output_id"); }
+        lua_createtable(lua, static_cast<int>(entered_outputs.size()), 0);
+        for (std::size_t i = 0; i < entered_outputs.size(); ++i) {
+            lua_pushinteger(lua, entered_outputs[i]); lua_rawseti(lua, -2, static_cast<lua_Integer>(i + 1));
+        }
+        lua_setfield(lua, -2, "outputs");
+        if (positioned) {
+            lua_pushinteger(lua, x); lua_setfield(lua, -2, "x");
+            lua_pushinteger(lua, y); lua_setfield(lua, -2, "y");
+        }
+        return 1;
+    }, 1);
 }
 
 int popup_reposition(lua_State* lua) {
     auto& gui = gui_state(lua);
     const auto identity = handle(lua, 1, surface_type);
     const auto& initial = live_surface(gui, identity);
-    if (!initial.popup) throw std::runtime_error("only popups can be repositioned");
+    if (!initial.parent) throw std::runtime_error("only popups can be repositioned");
     luaL_checktype(lua, 2, LUA_TTABLE);
     auto placement = initial.popup_placement;
     placement.x = static_cast<int>(integer_field(lua, 2, "x", placement.x, -16384));
@@ -903,7 +945,7 @@ int grab_focus(lua_State* lua) {
     if (!gui.focus_grabs || !surface.configured) throw std::runtime_error("focus grab requires a configured surface and compositor support");
     if (!surface.grab) {
         for (const auto& member : gui.surfaces)
-            if (member && member->popup && member->popup_grab_seat &&
+            if (member && member->parent && member->popup_grab_seat &&
                 &root_surface(*member) == &surface)
                 throw std::runtime_error("focus grab conflicts with an active or retiring XDG popup grab");
         surface.grab = hyprland_focus_grab_manager_v1_create_grab(gui.focus_grabs);
@@ -913,6 +955,7 @@ int grab_focus(lua_State* lua) {
             if (!previous || previous.get() == &surface || !previous->grab) continue;
             hyprland_focus_grab_v1_destroy(std::exchange(previous->grab, nullptr));
             previous->grab_pending = true;
+            cancel_surface_input(*previous, true);
         }
         for (const auto& member : gui.surfaces)
             if (member && !member->closed && !member->close_pending && member->configured &&
@@ -928,6 +971,7 @@ int grab_focus(lua_State* lua) {
 int release_focus(lua_State* lua) {
     auto& gui = gui_state(lua); auto& surface = live_surface(gui, handle(lua, 1, surface_type));
     if (surface.parent) throw std::runtime_error("focus grabs belong to the root surface");
+    if (surface.grab || surface.grab_pending) cancel_surface_input(surface, true);
     if (surface.grab) hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
     ++surface.grab_generation;
     surface.grab_pending = false;
@@ -966,8 +1010,29 @@ int input_region(lua_State* lua) {
 
 }
 
+void initialize_popup(Surface& surface) {
+    if (!surface.parent || surface.popup || surface.closed || surface.close_pending) return;
+    auto& gui = *surface.gui;
+    auto* parent = find_surface(gui, surface.parent);
+    // Hyprland announces nested popup roles only after the parent's mapping commit.
+    if (!parent || parent->close_pending || !parent->mapped) return;
+    auto* position = popup_positioner(*parent, surface.popup_placement);
+    surface.popup = xdg_surface_get_popup(surface.xdg, parent->xdg, position);
+    xdg_positioner_destroy(position);
+    if (!surface.popup) throw std::runtime_error("cannot create popup");
+    xdg_popup_add_listener(surface.popup, &popup_listener, &surface);
+    if (parent->layer) zwlr_layer_surface_v1_get_popup(parent->layer, surface.popup);
+    if (surface.popup_grab_seat) {
+        const auto seat = std::ranges::find_if(gui.seats, [&](const auto& item) { return item->id == surface.popup_grab_seat; });
+        if (seat == gui.seats.end()) { request_surface_close(surface, "seat_removed"); return; }
+        xdg_popup_grab(surface.popup, (*seat)->native, surface.popup_grab_serial);
+    }
+    surface.popup_reposition_pending = false;
+    wl_surface_commit(surface.native);
+}
+
 int notify(Gui& gui, std::uint64_t id, int element_index, int reference, const char* kind, const std::string* error) {
-    if (reference < 0 || gui.owner.quit_requested.load(std::memory_order_relaxed)) return 0;
+    if (reference < 0 || gui.owner.requests.load(std::memory_order_relaxed)) return 0;
     auto* surface = id ? find_surface(gui, id) : nullptr;
     if (id && !surface) return 0;
     const auto revision = surface ? surface->revision : 0;

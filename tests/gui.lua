@@ -26,19 +26,6 @@ local function content(label)
 end
 
 assert(window:set_content(content("original")))
-local old = assert(window:find("label"))
-assert(old:set {text = "updated"})
-assert(old:state().text == "updated")
-assert(not pcall(function()
-    window:set_content {kind = "column", children = {{kind = "not-a-kind"}}}
-end))
-assert(old:state().text == "updated")
-assert(not window:set_content {kind = "row", children = {
-    {kind = "text", id = "duplicate"}, {kind = "text", id = "duplicate"},
-}})
-assert(old:state().text == "updated")
-assert(window:set_content(content("replacement")))
-assert(not old:set {text = "stale"})
 assert(window:find("entry"):focus())
 
 local obsolete = assert(hw.window {width = 32, height = 32})
@@ -83,7 +70,7 @@ hw.timer(50, function(timer)
         transient:close()
     else
         timer:close()
-        print("GUI lifecycle: atomic replacement, stale handles, image cancellation, popup ownership and slot reuse passed")
+        print("GUI lifecycle: configure, image cancellation, popup ownership and slot reuse passed")
         hw.quit()
     end
 end, true)

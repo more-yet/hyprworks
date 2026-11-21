@@ -33,7 +33,6 @@
 #endif
 
 #include "../lua/binding.hpp"
-#include <array>
 #include <atomic>
 
 namespace hyprworks::lua {
@@ -190,10 +189,9 @@ struct InvocationState {
     ~InvocationState();
     lua_State* lua = nullptr;
     EventLoop loop = EventLoop::headless;
-    std::atomic<bool> quit_requested{false};
     std::atomic<unsigned> requests{0};
-    std::string entry_file;
-    std::optional<std::string> reload_source;
+    std::string configuration_directory;
+    std::vector<std::string> configuration_files;
     int wake_fd = -1;
     int clock_fd = -1, on_clock_change = LUA_NOREF;
     bool clock_pending = false;
@@ -253,6 +251,28 @@ struct InvocationState {
 
 inline InvocationState& invocation(lua_State* lua) {
     return **static_cast<InvocationState**>(lua_getextraspace(lua));
+}
+
+template<class Binding, class Arguments>
+int dispatch_callback(lua_State* lua, Binding& binding, const int& callback,
+    std::uint64_t generation, Arguments arguments) {
+    auto& state = invocation(lua);
+    if (callback < 0 || binding.closed || binding.generation != generation ||
+        state.requests.load(std::memory_order_relaxed)) return 0;
+    const int reference = callback;
+    lua_pushcfunction(lua, traceback);
+    const int result = protected_call(lua, [&](lua_State* lua) {
+        lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
+        lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+        const int count = arguments(lua);
+        // Argument allocation can run finalizers that replace or close this binding.
+        if (binding.closed || binding.generation != generation || callback != reference ||
+            state.requests.load(std::memory_order_relaxed)) return 0;
+        lua_call(lua, count + 1, 0);
+        return 0;
+    }, 0, 1);
+    if (result >= 0) lua_settop(lua, 0);
+    return result;
 }
 
 void wake(InvocationState& state) noexcept;
