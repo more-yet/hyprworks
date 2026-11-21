@@ -2,6 +2,7 @@
 #include "gui.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <charconv>
 #include <cmath>
 
@@ -28,6 +29,18 @@ void focus(Surface& surface, int index) {
 
 namespace {
 
+Surface& root_surface(Surface& surface) {
+    auto* root = &surface;
+    while (root->parent) {
+        const auto parent = std::ranges::find_if(surface.gui->surfaces,
+            [&](const auto& candidate) { return candidate && candidate->id == root->parent; });
+        // Parents remain allocated until every descendant has been destroyed.
+        assert(parent != surface.gui->surfaces.end());
+        root = parent->get();
+    }
+    return *root;
+}
+
 void clear_elements(lua_State* lua, std::vector<Element>& elements) {
     for (auto& element : elements) {
         if (element.layout) g_object_unref(element.layout);
@@ -40,12 +53,19 @@ void clear_elements(lua_State* lua, std::vector<Element>& elements) {
 
 void destroy_surface(Surface& surface) {
     auto& gui = *surface.gui;
+    if (surface.grab) hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
     for (auto& child : gui.surfaces)
         if (child && child->parent == surface.id) destroy_surface(*child);
+    if (surface.native && surface.parent) {
+        auto& root = root_surface(surface);
+        if (root.grab) {
+            hyprland_focus_grab_v1_remove_surface(root.grab, surface.native);
+            hyprland_focus_grab_v1_commit(root.grab);
+        }
+    }
     surface.parent = 0;
     surface.closed = true;
     if (surface.frame) wl_callback_destroy(std::exchange(surface.frame, nullptr));
-    if (surface.grab) hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
     if (surface.popup) xdg_popup_destroy(std::exchange(surface.popup, nullptr));
     if (surface.toplevel) xdg_toplevel_destroy(std::exchange(surface.toplevel, nullptr));
     if (surface.xdg) xdg_surface_destroy(std::exchange(surface.xdg, nullptr));
@@ -62,8 +82,23 @@ void destroy_surface(Surface& surface) {
 
 void close_surface(Surface& surface) {
     surface.closed = true;
+    surface.pressed = -1;
+    if (surface.grab) hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
+    surface.grab_pending = false;
+    for (auto& seat : surface.gui->seats)
+        if (seat->keyboard_surface == surface.id) seat->repeat_at.reset();
     for (auto& child : surface.gui->surfaces)
         if (child && child->parent == surface.id) close_surface(*child);
+}
+
+int dispatch_close(Surface& surface) {
+    if (surface.closed) return 0;
+    auto& gui = *surface.gui;
+    for (auto& child : gui.surfaces)
+        if (child && child->parent == surface.id && child->close_pending && dispatch_close(*child) < 0) return -1;
+    if (notify(gui, surface.id, -1, surface.on_close) < 0) return -1;
+    close_surface(surface);
+    return 0;
 }
 
 void update_scale(Surface& surface) {
@@ -100,13 +135,29 @@ void push_handle(lua_State* lua, Handle value, const char* type) {
 
 namespace {
 
+void request_close(Surface& surface) {
+    if (surface.closed) return;
+    surface.close_pending = true;
+    for (auto& child : surface.gui->surfaces)
+        if (child && child->parent == surface.id) request_close(*child);
+}
+
 void set_configure(Surface& surface, int width, int height) {
+    if (surface.closed || surface.close_pending) return;
     if (width < 1 || height < 1 || width > 16384 || height > 16384) {
         surface.gui->error = "configured surface dimensions outside 1..16384";
         return;
     }
+    const bool initial = !surface.configured;
     surface.width = width; surface.height = height;
     surface.configured = true; surface.configure_pending = true;
+    if (initial && surface.parent) {
+        auto& root = root_surface(surface);
+        if (root.grab) {
+            hyprland_focus_grab_v1_add_surface(root.grab, surface.native);
+            hyprland_focus_grab_v1_commit(root.grab);
+        }
+    }
     dirty(surface);
 }
 
@@ -123,7 +174,7 @@ const xdg_toplevel_listener toplevel_listener{
         if (width > 0) surface.pending_width = width;
         if (height > 0) surface.pending_height = height;
     },
-    .close = [](void* data, xdg_toplevel*) { static_cast<Surface*>(data)->close_pending = true; },
+    .close = [](void* data, xdg_toplevel*) { request_close(*static_cast<Surface*>(data)); },
     .configure_bounds = [](void*, xdg_toplevel*, int, int) {},
     .wm_capabilities = [](void*, xdg_toplevel*, wl_array*) {},
 };
@@ -132,7 +183,7 @@ const xdg_popup_listener popup_listener{
         auto& surface = *static_cast<Surface*>(data);
         surface.pending_width = width; surface.pending_height = height;
     },
-    .popup_done = [](void* data, xdg_popup*) { static_cast<Surface*>(data)->close_pending = true; },
+    .popup_done = [](void* data, xdg_popup*) { request_close(*static_cast<Surface*>(data)); },
     .repositioned = [](void*, xdg_popup*, std::uint32_t) {},
 };
 const zwlr_layer_surface_v1_listener layer_listener{
@@ -143,7 +194,7 @@ const zwlr_layer_surface_v1_listener layer_listener{
         set_configure(surface, width ? static_cast<int>(width) : surface.pending_width,
             height ? static_cast<int>(height) : surface.pending_height);
     },
-    .closed = [](void* data, zwlr_layer_surface_v1*) { static_cast<Surface*>(data)->close_pending = true; }
+    .closed = [](void* data, zwlr_layer_surface_v1*) { request_close(*static_cast<Surface*>(data)); }
 };
 
 const wl_surface_listener surface_listener{
@@ -589,11 +640,16 @@ int focus_element(lua_State* lua) {
     auto& surface = live_surface(gui, identity);
     if (!focusable(surface.elements[static_cast<std::size_t>(identity.element)])) throw std::runtime_error("element is not focusable");
     focus(surface, identity.element);
+    reveal_focus(surface, false);
     lua_pushboolean(lua, true); return 1;
 }
 
 const hyprland_focus_grab_v1_listener grab_listener{
-    .cleared = [](void* data, hyprland_focus_grab_v1*) { static_cast<Surface*>(data)->grab_pending = true; }
+    .cleared = [](void* data, hyprland_focus_grab_v1*) {
+        auto& surface = *static_cast<Surface*>(data);
+        hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
+        surface.grab_pending = true;
+    }
 };
 
 template<int Role>
@@ -654,10 +710,15 @@ int create_surface(lua_State* lua) {
     if constexpr (Role == 2) {
         parent = find_surface(gui, surface->parent);
         if (!parent || !parent->configured) throw std::runtime_error("popup parent must be configured");
+        if (parent->close_pending) throw std::runtime_error("popup parent is closing");
         for (const auto& item : gui.surfaces)
             if (item && item->parent == parent->id) throw std::runtime_error("parent already has an active or retiring popup");
         if (grab && (!gui.event_seat || !gui.event_serial || gui.event_surface != parent->id))
             throw std::runtime_error("popup grab requires a parent input callback");
+        if (grab && parent->popup && parent->popup_grab_seat != gui.event_seat->id)
+            throw std::runtime_error("nested popup grab requires a parent popup grabbed by the same seat");
+        if (grab && root_surface(*parent).grab)
+            throw std::runtime_error("popup cannot take an XDG grab while its root owns a focus grab");
     }
     wl_output* native_output = nullptr;
     if (!output.empty()) {
@@ -710,7 +771,10 @@ int create_surface(lua_State* lua) {
             if (!surface->popup) throw std::runtime_error("cannot create popup");
             xdg_popup_add_listener(surface->popup, &popup_listener, surface.get());
             if (parent->layer) zwlr_layer_surface_v1_get_popup(parent->layer, surface->popup);
-            if (grab) xdg_popup_grab(surface->popup, gui.event_seat->native, gui.event_serial);
+            if (grab) {
+                xdg_popup_grab(surface->popup, gui.event_seat->native, gui.event_serial);
+                surface->popup_grab_seat = gui.event_seat->id;
+            }
         }
     }
     const auto id = surface->id;
@@ -746,20 +810,39 @@ int surface_state(lua_State* lua) {
 int grab_focus(lua_State* lua) {
     auto& gui = gui_state(lua); const auto identity = handle(lua, 1, surface_type);
     auto& surface = live_surface(gui, identity);
+    if (surface.parent) throw std::runtime_error("focus grabs belong to the root surface");
+    if (surface.close_pending) throw std::runtime_error("surface is closing");
     if (!gui.focus_grabs || !surface.configured) throw std::runtime_error("focus grab requires a configured surface and compositor support");
     if (!surface.grab) {
+        for (const auto& member : gui.surfaces)
+            if (member && member->popup && member->popup_grab_seat &&
+                &root_surface(*member) == &surface)
+                throw std::runtime_error("focus grab conflicts with an active or retiring XDG popup grab");
         surface.grab = hyprland_focus_grab_manager_v1_create_grab(gui.focus_grabs);
         if (!surface.grab) throw std::runtime_error("cannot create focus grab");
         hyprland_focus_grab_v1_add_listener(surface.grab, &grab_listener, &surface);
+        for (const auto& previous : gui.surfaces) {
+            if (!previous || previous.get() == &surface || !previous->grab) continue;
+            hyprland_focus_grab_v1_destroy(std::exchange(previous->grab, nullptr));
+            previous->grab_pending = true;
+        }
+        for (const auto& member : gui.surfaces)
+            if (member && !member->closed && !member->close_pending && member->configured &&
+                &root_surface(*member) == &surface)
+                hyprland_focus_grab_v1_add_surface(surface.grab, member->native);
+        hyprland_focus_grab_v1_commit(surface.grab);
+        ++surface.grab_generation;
+        surface.grab_pending = false;
     }
-    hyprland_focus_grab_v1_add_surface(surface.grab, surface.native);
-    hyprland_focus_grab_v1_commit(surface.grab);
     lua_pushboolean(lua, true); return 1;
 }
 
 int release_focus(lua_State* lua) {
     auto& gui = gui_state(lua); auto& surface = live_surface(gui, handle(lua, 1, surface_type));
+    if (surface.parent) throw std::runtime_error("focus grabs belong to the root surface");
     if (surface.grab) hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
+    ++surface.grab_generation;
+    surface.grab_pending = false;
     lua_pushboolean(lua, true); return 1;
 }
 
@@ -800,6 +883,8 @@ int notify(Gui& gui, std::uint64_t id, int element_index, int reference, const c
     auto* surface = id ? find_surface(gui, id) : nullptr;
     if (id && !surface) return 0;
     const auto revision = surface ? surface->revision : 0;
+    const bool grab_cleared = surface && reference == surface->on_grab_cleared;
+    const auto grab_generation = grab_cleared ? surface->grab_generation : 0;
     std::string text, message = error ? *error : "";
     double value = 0, scroll = 0;
     bool scrolling = false;
@@ -823,6 +908,7 @@ int notify(Gui& gui, std::uint64_t id, int element_index, int reference, const c
             auto* live = find_surface(gui, id);
             if (!live || (element_index >= 0 && (live->revision != revision ||
                 live->elements[static_cast<std::size_t>(element_index)].callback != reference))) return 0;
+            if (grab_cleared && live->grab_generation != grab_generation) return 0;
         }
         lua_call(lua, id ? (element_index >= 0 ? 2 : 1) : 0, 0); return 0;
     }, 0, 1);

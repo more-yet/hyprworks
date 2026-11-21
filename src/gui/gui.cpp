@@ -315,19 +315,19 @@ int dispatch_gui(InvocationState& state) {
     if (!state.gui) return 0;
     auto& gui = *state.gui;
     check_display(gui);
+    for (auto& surface : gui.surfaces)
+        if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
+    for (auto& surface : gui.surfaces)
+        if (surface && !surface->closed && std::exchange(surface->grab_pending, false) &&
+            notify(gui, surface->id, -1, surface->on_grab_cleared) < 0) return -1;
     if (gui.windows && dispatch_windows(*gui.windows) < 0) return -1;
     if (std::exchange(gui.outputs_pending, false) && notify(gui, 0, -1, gui.on_outputs) < 0) return -1;
     if (dispatch_input(gui) < 0) return -1;
     for (auto& surface : gui.surfaces) {
         if (!surface || surface->closed) continue;
         const auto id = surface->id;
-        if (std::exchange(surface->close_pending, false)) {
-            if (notify(gui, id, -1, surface->on_close) < 0) return -1;
-            close_surface(*surface); continue;
-        }
         if (std::exchange(surface->configure_pending, false) && notify(gui, id, -1, surface->on_configure) < 0) return -1;
         if (surface->closed) continue;
-        if (std::exchange(surface->grab_pending, false) && notify(gui, id, -1, surface->on_grab_cleared) < 0) return -1;
         const auto revision = surface->revision;
         layout(*surface);
         for (std::size_t i = 0; !surface->closed && surface->revision == revision && i < surface->elements.size(); ++i) {

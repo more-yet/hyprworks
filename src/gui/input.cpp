@@ -666,7 +666,11 @@ int process_input(Gui& gui, Input& event) {
         const int start = s.focused >= 0 ? s.focused : direction > 0 ? -1 : 0;
         for (int i = 1; i <= count; ++i) {
             const int next = (start + direction * i + count * 2) % count;
-            if (focusable(s.elements[static_cast<std::size_t>(next)])) { focus(s, next); break; }
+            if (focusable(s.elements[static_cast<std::size_t>(next)])) {
+                focus(s, next);
+                reveal_focus(s, true);
+                break;
+            }
         }
         return -1;
     }

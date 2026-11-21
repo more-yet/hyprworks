@@ -48,7 +48,7 @@ struct Element {
     double width = -1, height = -1, grow = 0, padding = 0, gap = 0, radius = 0;
     double x = 0, y = 0, border_width = 0;
     int halign = 0, valign = 0, align = 0;
-    double value = 0, scroll = 0, natural_w = 0, natural_h = 0;
+    double value = 0, scroll = 0, scroll_limit = 0, natural_w = 0, natural_h = 0;
     std::optional<double> scroll_origin;
     std::uint32_t background = 0, color = 0xffffffff, accent = 0x8ab4f8ff, border_color = 0;
     bool enabled = true, wrap = false, password = false, horizontal = false;
@@ -77,7 +77,9 @@ struct Surface {
     wp_viewport* viewport = nullptr;
     wp_fractional_scale_v1* fractional = nullptr;
     hyprland_focus_grab_v1* grab = nullptr;
+    std::uint64_t grab_generation = 0;
     wl_callback* frame = nullptr;
+    std::uint32_t popup_grab_seat = 0;
     std::vector<std::uint32_t> outputs;
     std::vector<Element> elements;
     int width = 640, height = 480, pending_width = 640, pending_height = 480;
@@ -241,6 +243,7 @@ Gui& gui_state(lua_State* lua);
 void push_handle(lua_State* lua, Handle value, const char* type);
 void focus(Surface& surface, int index);
 void close_surface(Surface& surface);
+int dispatch_close(Surface& surface);
 void destroy_surface(Surface& surface);
 void update_scale(Surface& surface);
 int notify(Gui& gui, std::uint64_t id, int element_index, int reference,
@@ -248,6 +251,7 @@ int notify(Gui& gui, std::uint64_t id, int element_index, int reference,
 void register_surfaces(lua_State* lua);
 
 void layout(Surface& surface);
+void reveal_focus(Surface& surface, bool native);
 int layout_index(const Element& element, int index);
 PangoRectangle input_cursor(Element& element, bool focused);
 void render(Surface& surface);

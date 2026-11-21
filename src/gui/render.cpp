@@ -99,7 +99,10 @@ void arrange(Surface& surface, int index, Box box, Box clip) {
         ++count;
     }
     used += element.gap * std::max(0, count - 1);
-    if (element.kind == Kind::scroll) element.scroll = std::clamp(element.scroll, 0.0, std::max(0.0, used - (horizontal ? inner.w : inner.h)));
+    if (element.kind == Kind::scroll) {
+        element.scroll_limit = std::max(0.0, used - (horizontal ? inner.w : inner.h));
+        element.scroll = std::clamp(element.scroll, 0.0, element.scroll_limit);
+    }
     double offset = element.kind == Kind::scroll ? -element.scroll : 0;
     for (int child = index + 1; child < element.end; child = elements[static_cast<std::size_t>(child)].end) {
         auto& item = elements[static_cast<std::size_t>(child)];
@@ -263,6 +266,49 @@ void layout(Surface& surface) {
     arrange(surface, 0, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)},
         {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)});
     surface.layout_dirty = false;
+}
+
+void reveal_focus(Surface& surface, bool native) {
+    layout(surface);
+    auto& elements = surface.elements;
+    const auto& focused = elements[static_cast<std::size_t>(surface.focused)];
+    auto target = focused.box;
+    bool changed = false;
+    for (int index = focused.parent; index >= 0; index = elements[static_cast<std::size_t>(index)].parent) {
+        auto& element = elements[static_cast<std::size_t>(index)];
+        const Box viewport{element.box.x + element.padding, element.box.y + element.padding,
+            std::max(0.0, element.box.w - element.padding * 2), std::max(0.0, element.box.h - element.padding * 2)};
+        if (element.kind == Kind::scroll) {
+            const double start = element.horizontal ? target.x : target.y;
+            const double size = element.horizontal ? target.w : target.h;
+            const double visible_start = element.horizontal ? viewport.x : viewport.y;
+            const double visible_size = element.horizontal ? viewport.w : viewport.h;
+            const double end = start + size, visible_end = visible_start + visible_size;
+            double delta = 0;
+            if (size <= visible_size) {
+                if (start < visible_start) delta = start - visible_start;
+                else if (end > visible_end) delta = end - visible_end;
+            } else {
+                if (start > visible_start) delta = start - visible_start;
+                else if (end < visible_end) delta = end - visible_end;
+            }
+            const double next = std::clamp(element.scroll + delta, 0.0, element.scroll_limit);
+            if (next != element.scroll) {
+                if (native) {
+                    if (!element.scroll_origin) element.scroll_origin = element.scroll;
+                } else element.scroll_origin.reset();
+                if (element.horizontal) target.x -= next - element.scroll;
+                else target.y -= next - element.scroll;
+                element.scroll = next;
+                changed = true;
+            }
+        }
+        target = intersect(target, viewport);
+    }
+    if (changed) {
+        arrange(surface, 0, elements.front().box, elements.front().box);
+        surface.dirty = true;
+    }
 }
 
 int layout_index(const Element& element, int index) {
