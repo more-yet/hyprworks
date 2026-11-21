@@ -89,39 +89,35 @@ int command_close(lua_State* lua) {
 int dispatch_commands(lua_State* lua, CommandBinding& binding) {
     const auto requests = std::exchange(binding.requests, {}); const bool status = std::exchange(binding.status_pending, false);
     const auto generation = binding.generation;
-    for (std::size_t i = 0; i <= requests.size(); ++i) {
+    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    for (const auto& request : requests) {
         if (binding.closed || binding.generation != generation || invocation(lua).requests.load(std::memory_order_relaxed)) break;
-        if (!i && !status) continue;
-        const int reference = i ? binding.on_request : binding.on_status;
+        const int reference = binding.on_request;
         bool success = true, delivered = false;
         std::string response;
         if (reference >= 0) {
             lua_pushcfunction(lua, traceback);
             if (protected_call(lua, [&](lua_State* lua) {
                 lua_rawgeti(lua, LUA_REGISTRYINDEX, reference); lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
-                if (i) {
-                    const auto& request = requests[i - 1]; lua_createtable(lua, 0, 4);
-                    identifier(lua, request.id); lua_setfield(lua, -2, "id"); string_field(lua, "name", request.name); string_field(lua, "sender", request.sender);
-                    push_strings(lua, request.arguments);
-                    lua_setfield(lua, -2, "arguments");
-                }
-                if (binding.closed || binding.generation != generation || reference != (i ? binding.on_request : binding.on_status)) return 0;
-                delivered = true; lua_call(lua, i ? 2 : 1, i ? 2 : 0);
-                if (i) {
-                    success = !lua_isnil(lua, -2) || lua_isnil(lua, -1);
-                    const int result = success ? -2 : -1;
-                    if (!lua_isnil(lua, result)) {
-                        luaL_checktype(lua, result, LUA_TSTRING); std::size_t size; const char* text = lua_tolstring(lua, result, &size);
-                        luaL_argcheck(lua, size <= 65536, result, "command response exceeds 64 KiB"); response.assign(text, size);
-                    }
+                lua_createtable(lua, 0, 4);
+                identifier(lua, request.id); lua_setfield(lua, -2, "id"); string_field(lua, "name", request.name); string_field(lua, "sender", request.sender);
+                push_strings(lua, request.arguments);
+                lua_setfield(lua, -2, "arguments");
+                if (binding.closed || binding.generation != generation || reference != binding.on_request) return 0;
+                delivered = true; lua_call(lua, 2, 2);
+                success = !lua_isnil(lua, -2) || lua_isnil(lua, -1);
+                const int result = success ? -2 : -1;
+                if (!lua_isnil(lua, result)) {
+                    luaL_checktype(lua, result, LUA_TSTRING); std::size_t size; const char* text = lua_tolstring(lua, result, &size);
+                    luaL_argcheck(lua, size <= 65536, result, "command response exceeds 64 KiB"); response.assign(text, size);
                 }
                 return 0;
             }, 0, 1) < 0) return -1;
             lua_settop(lua, 0);
         }
-        if (i && !binding.closed && binding.generation == generation) {
+        if (!binding.closed && binding.generation == generation) {
             if (!delivered) { success = false; response = "command callback is not installed"; }
-            const auto result = binding.server.respond(requests[i - 1].id, response, success);
+            const auto result = binding.server.respond(request.id, response, success);
             if (!result) throw std::runtime_error(result.error());
         }
     }

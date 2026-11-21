@@ -288,6 +288,7 @@ std::expected<std::string, std::string> read_file(const std::string& path, std::
         struct stat status{}; check(fstat(fd, &status), "stat file");
         if (!S_ISREG(status.st_mode)) throw std::runtime_error("file is not regular");
         std::string result;
+        if (status.st_size > 0) result.reserve(std::min(static_cast<std::uintmax_t>(status.st_size), static_cast<std::uintmax_t>(limit)));
         for (;;) {
             char buffer[16384];
             const auto size = ::read(fd, buffer, sizeof(buffer));

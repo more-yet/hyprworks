@@ -141,11 +141,10 @@ std::pair<std::string_view, std::string_view> read_player_key(lua_State* lua) {
 }
 
 int media_action(lua_State* lua) {
-    auto& binding = media_handle(lua);
     static const char* actions[] = {"play", "pause", "play_pause", "stop", "next", "previous", "raise", "quit", nullptr};
     const auto action = luaL_checkoption(lua, 3, nullptr, actions);
     const auto [name, owner] = read_player_key(lua);
-    if (binding.closed) return luaL_error(lua, "MPRIS connection closed while parsing request");
+    auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
     const mpris::PlayerKey key{std::string(name), std::string(owner)};
     const auto result = binding.connection.action(key, static_cast<mpris::Action>(action));
@@ -153,10 +152,9 @@ int media_action(lua_State* lua) {
 }
 
 int media_seek(lua_State* lua) {
-    auto& binding = media_handle(lua);
     const auto offset = luaL_checkinteger(lua, 3);
     const auto [name, owner] = read_player_key(lua);
-    if (binding.closed) return luaL_error(lua, "MPRIS connection closed while parsing request");
+    auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
     const mpris::PlayerKey key{std::string(name), std::string(owner)};
     const auto result = binding.connection.seek(key, offset);
@@ -164,13 +162,12 @@ int media_seek(lua_State* lua) {
 }
 
 int media_set_position(lua_State* lua) {
-    auto& binding = media_handle(lua);
     std::size_t track_length;
     const char* track = luaL_checklstring(lua, 3, &track_length);
     luaL_argcheck(lua, track_length <= 16384, 3, "text exceeds 16 KiB");
     const auto position = luaL_checkinteger(lua, 4);
     const auto [name, owner] = read_player_key(lua);
-    if (binding.closed) return luaL_error(lua, "MPRIS connection closed while parsing request");
+    auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
     const mpris::PlayerKey key{std::string(name), std::string(owner)};
     const auto result = binding.connection.set_position(key, std::string(track, track_length), position);
@@ -178,10 +175,9 @@ int media_set_position(lua_State* lua) {
 }
 
 int media_set_volume(lua_State* lua) {
-    auto& binding = media_handle(lua);
     const auto volume = luaL_checknumber(lua, 3);
     const auto [name, owner] = read_player_key(lua);
-    if (binding.closed) return luaL_error(lua, "MPRIS connection closed while parsing request");
+    auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
     const mpris::PlayerKey key{std::string(name), std::string(owner)};
     const auto result = binding.connection.set_volume(key, volume);
@@ -189,10 +185,9 @@ int media_set_volume(lua_State* lua) {
 }
 
 int media_set_rate(lua_State* lua) {
-    auto& binding = media_handle(lua);
     const auto rate = luaL_checknumber(lua, 3);
     const auto [name, owner] = read_player_key(lua);
-    if (binding.closed) return luaL_error(lua, "MPRIS connection closed while parsing request");
+    auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
     const mpris::PlayerKey key{std::string(name), std::string(owner)};
     const auto result = binding.connection.set_rate(key, rate);
@@ -200,11 +195,10 @@ int media_set_rate(lua_State* lua) {
 }
 
 int media_set_shuffle(lua_State* lua) {
-    auto& binding = media_handle(lua);
     luaL_checktype(lua, 3, LUA_TBOOLEAN);
     const bool shuffle = lua_toboolean(lua, 3);
     const auto [name, owner] = read_player_key(lua);
-    if (binding.closed) return luaL_error(lua, "MPRIS connection closed while parsing request");
+    auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
     const mpris::PlayerKey key{std::string(name), std::string(owner)};
     const auto result = binding.connection.set_shuffle(key, shuffle);
@@ -212,12 +206,11 @@ int media_set_shuffle(lua_State* lua) {
 }
 
 int media_set_loop_status(lua_State* lua) {
-    auto& binding = media_handle(lua);
     std::size_t status_length;
     const char* status = luaL_checklstring(lua, 3, &status_length);
     luaL_argcheck(lua, status_length <= 16384, 3, "text exceeds 16 KiB");
     const auto [name, owner] = read_player_key(lua);
-    if (binding.closed) return luaL_error(lua, "MPRIS connection closed while parsing request");
+    auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
     const mpris::PlayerKey key{std::string(name), std::string(owner)};
     const auto result = binding.connection.set_loop_status(key, std::string(status, status_length));
@@ -225,12 +218,11 @@ int media_set_loop_status(lua_State* lua) {
 }
 
 int media_open_uri(lua_State* lua) {
-    auto& binding = media_handle(lua);
     std::size_t uri_length;
     const char* uri = luaL_checklstring(lua, 3, &uri_length);
     luaL_argcheck(lua, uri_length <= 16384, 3, "text exceeds 16 KiB");
     const auto [name, owner] = read_player_key(lua);
-    if (binding.closed) return luaL_error(lua, "MPRIS connection closed while parsing request");
+    auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
     const mpris::PlayerKey key{std::string(name), std::string(owner)};
     const auto result = binding.connection.open_uri(key, std::string(uri, uri_length));
@@ -254,14 +246,13 @@ int media_close(lua_State* lua) {
 int dispatch_media(lua_State* lua, MediaBinding& binding) {
     const bool status = std::exchange(binding.status_pending, false), change = std::exchange(binding.change_pending, false);
     const auto generation = binding.generation;
-    for (const auto kind : {Event::status, Event::change, Event::result}) {
-        if (binding.closed || generation != binding.generation || invocation(lua).requests.load(std::memory_order_relaxed)) break;
-        if (!(kind == Event::status ? status : kind == Event::change ? change : binding.result.has_value())) continue;
-        auto result = kind == Event::result ? std::exchange(binding.result, {}) : std::nullopt;
-        const int& callback = kind == Event::status ? binding.on_status : kind == Event::change ? binding.on_change : binding.on_result;
-        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
-            if (result) push_media_result(lua, *result);
-            return result ? 1 : 0;
+    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (binding.result && !binding.closed && generation == binding.generation && !invocation(lua).requests.load(std::memory_order_relaxed)) {
+        const auto result = std::exchange(binding.result, {});
+        if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
+            push_media_result(lua, *result);
+            return 1;
         }) < 0) return -1;
     }
     return 0;

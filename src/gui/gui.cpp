@@ -163,7 +163,7 @@ void synchronize(Gui& gui) {
     const auto deadline = Clock::now() + std::chrono::seconds(3);
     try {
         while (!done) {
-            if (wl_display_dispatch_pending(gui.display) < 0) check_display(gui);
+            wl_display_dispatch_pending(gui.display);
             check_display(gui);
             if (done) break;
             if (Clock::now() >= deadline) throw std::runtime_error("Wayland initialization timed out");
@@ -319,7 +319,7 @@ Gui::~Gui() { close_gui(*this); }
 void prepare_gui(InvocationState& state, WaitSet& wait) {
     auto& gui = *state.gui;
     if (gui.read_prepared) { wl_display_cancel_read(gui.display); gui.read_prepared = false; }
-    if (wl_display_dispatch_pending(gui.display) < 0) check_display(gui);
+    wl_display_dispatch_pending(gui.display);
     check_display(gui);
     gui.wait_offset = wait.fds.size();
     wait.fds.push_back({wl_display_get_fd(gui.display), POLLIN, 0});
@@ -339,9 +339,11 @@ void prepare_gui(InvocationState& state, WaitSet& wait) {
             (surface->mapped && surface->popup_reposition_pending) ||
             (surface->dirty && surface->configured && !surface->frame && !surface->waiting_buffer))
             deadline(Clock::time_point::min());
-        for (const auto& element : surface->elements)
+        for (const int index : surface->image_elements) {
+            const auto& element = surface->elements[static_cast<std::size_t>(index)];
             if (element.image && !element.image_notified && element.image->ready.load(std::memory_order_acquire))
                 deadline(Clock::time_point::min());
+        }
     }
     if (gui.windows) prepare_windows(*gui.windows, wait);
     if (wl_display_prepare_read(gui.display) == 0) gui.read_prepared = true;
@@ -373,7 +375,7 @@ void read_gui(InvocationState& state, const WaitSet& wait) {
     }
     for (std::size_t i = 0; i < gui.transfer_wait_count; ++i)
         transfer_io(gui.transfers[i], wait.fds[gui.wait_offset + 1 + i].revents);
-    if (wl_display_dispatch_pending(gui.display) < 0) check_display(gui);
+    wl_display_dispatch_pending(gui.display);
     check_display(gui);
     if (gui.windows) read_windows(*gui.windows, wait);
 }
@@ -410,8 +412,9 @@ int dispatch_gui(InvocationState& state) {
         if (surface->closed) continue;
         const auto revision = surface->revision;
         layout(*surface);
-        for (std::size_t i = 0; !surface->closed && surface->revision == revision && i < surface->elements.size(); ++i) {
-            auto& element = surface->elements[i];
+        for (std::size_t i = 0; !surface->closed && surface->revision == revision && i < surface->image_elements.size(); ++i) {
+            const int index = surface->image_elements[i];
+            auto& element = surface->elements[static_cast<std::size_t>(index)];
             if (element.image && !element.image->icon.empty()) {
                 const auto pixels = static_cast<int>(std::clamp(std::ceil(std::max(1.0, element.box.w) * surface->scale), 1.0, 4096.0));
                 if (element.image->pixels != pixels) {
@@ -422,9 +425,9 @@ int dispatch_gui(InvocationState& state) {
             }
             if (element.image && !element.image->submitted) gui.images.submit(element.image);
             if (!element.image || element.image_notified || !element.image->ready.load(std::memory_order_acquire)) continue;
-            element.image_notified = true; invalidate_element(*surface, static_cast<int>(i), true);
+            element.image_notified = true; invalidate_element(*surface, index, true);
             const auto image = element.image;
-            if (notify(gui, id, static_cast<int>(i), element.callback, "loaded", &image->error) < 0) return -1;
+            if (notify(gui, id, index, element.callback, "loaded", &image->error) < 0) return -1;
         }
     }
     for (auto& surface : gui.surfaces)

@@ -7,6 +7,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <unistd.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 
 namespace hyprworks::lua {
 namespace {
@@ -22,13 +25,39 @@ void reserve(Image& image, std::size_t bytes) {
     image.bytes += bytes;
 }
 
-void premultiply(Image& image, const unsigned char* source, int channels) {
+template<int Channels>
+void premultiply(Image& image, const unsigned char* source) {
     auto* target = reinterpret_cast<std::uint32_t*>(cairo_image_surface_get_data(image.surface));
     const auto count = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
-    for (std::size_t i = 0; i < count; ++i) {
-        const std::uint32_t r = source[0], g = source[1], b = source[2], a = channels == 4 ? source[3] : 255;
+    std::size_t i = 0;
+#ifdef __SSE2__
+    if constexpr (Channels == 4) {
+        const auto zero = _mm_setzero_si128(), rounding = _mm_set1_epi16(128);
+        const auto red = _mm_set1_epi32(0x00ff0000), green = _mm_set1_epi32(0x0000ff00);
+        const auto alpha = _mm_slli_epi32(_mm_set1_epi32(255), 24);
+        for (; i + 4 <= count; i += 4, source += 16) {
+            const auto rgba = _mm_loadu_si128(reinterpret_cast<const __m128i*>(source));
+            auto low = _mm_unpacklo_epi8(rgba, zero), high = _mm_unpackhi_epi8(rgba, zero);
+            const auto low_alpha = _mm_shufflehi_epi16(_mm_shufflelo_epi16(low, _MM_SHUFFLE(3, 3, 3, 3)), _MM_SHUFFLE(3, 3, 3, 3));
+            const auto high_alpha = _mm_shufflehi_epi16(_mm_shufflelo_epi16(high, _MM_SHUFFLE(3, 3, 3, 3)), _MM_SHUFFLE(3, 3, 3, 3));
+            low = _mm_add_epi16(_mm_mullo_epi16(low, low_alpha), rounding);
+            high = _mm_add_epi16(_mm_mullo_epi16(high, high_alpha), rounding);
+            // Exact rounded /255 for products in 0..65025, without overflowing 16 bits.
+            low = _mm_srli_epi16(_mm_add_epi16(low, _mm_srli_epi16(low, 8)), 8);
+            high = _mm_srli_epi16(_mm_add_epi16(high, _mm_srli_epi16(high, 8)), 8);
+            const auto scaled = _mm_packus_epi16(low, high);
+            const auto argb = _mm_or_si128(_mm_or_si128(_mm_and_si128(rgba, alpha), _mm_and_si128(scaled, green)),
+                _mm_or_si128(_mm_and_si128(_mm_slli_epi32(scaled, 16), red),
+                    _mm_srli_epi32(_mm_and_si128(scaled, red), 16)));
+            // The full input block is loaded before the store, including in-place PNG conversion.
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(target + i), argb);
+        }
+    }
+#endif
+    for (; i < count; ++i) {
+        const std::uint32_t r = source[0], g = source[1], b = source[2], a = Channels == 4 ? source[3] : 255;
         target[i] = a << 24 | ((r * a + 127) / 255) << 16 | ((g * a + 127) / 255) << 8 | (b * a + 127) / 255;
-        source += channels;
+        source += Channels;
     }
     cairo_surface_mark_dirty(image.surface);
 }
@@ -50,7 +79,8 @@ void decode(Image& image) {
         image.allocate();
         const auto required = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * static_cast<std::size_t>(image.channels);
         if (image.encoded.size() != required) throw std::runtime_error("raw image byte count does not match its dimensions");
-        premultiply(image, reinterpret_cast<const unsigned char*>(image.encoded.data()), image.channels);
+        if (image.channels == 3) premultiply<3>(image, reinterpret_cast<const unsigned char*>(image.encoded.data()));
+        else premultiply<4>(image, reinterpret_cast<const unsigned char*>(image.encoded.data()));
     } else if (image.encoded.size() >= 8 && png_sig_cmp(reinterpret_cast<const unsigned char*>(image.encoded.data()), 0, 8) == 0) {
         png_image png{};
         png.version = PNG_IMAGE_VERSION;
@@ -64,7 +94,7 @@ void decode(Image& image) {
         auto* pixels = cairo_image_surface_get_data(image.surface);
         if (!png_image_finish_read(&png, nullptr, pixels, cairo_image_surface_get_stride(image.surface), nullptr))
             throw std::runtime_error(png.message);
-        premultiply(image, pixels, 4);
+        premultiply<4>(image, pixels);
     } else {
         GError* error = nullptr;
         const std::unique_ptr<RsvgHandle, decltype(&g_object_unref)> svg(

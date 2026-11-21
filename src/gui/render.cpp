@@ -143,6 +143,10 @@ void color(cairo_t* cr, std::uint32_t rgba) {
 
 void rounded(cairo_t* cr, Box box, double radius) {
     const double r = std::min({radius, box.w / 2, box.h / 2});
+    if (r <= 0) {
+        cairo_rectangle(cr, box.x, box.y, box.w, box.h);
+        return;
+    }
     constexpr double pi = 3.14159265358979323846;
     cairo_new_sub_path(cr);
     cairo_arc(cr, box.x + box.w - r, box.y + r, r, -pi / 2, 0);
@@ -158,11 +162,18 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
         const auto box = element.box;
         const auto visible = intersect(element.clip, damaged);
         if (visible.w <= 0 || visible.h <= 0) continue;
+        const auto background = element.kind == Kind::toggle && element.value != 0 ? element.accent : element.background;
+        const bool border = element.border_width > 0 && (element.border_color & 255);
+        const bool outline = surface.focus_visible && static_cast<int>(index) == surface.focused && focusable(element);
+        if (!(background & 255) && !border && !outline && !element.layout &&
+            element.kind != Kind::slider && element.kind != Kind::image) continue;
         cairo_save(cr);
         cairo_rectangle(cr, element.clip.x, element.clip.y, element.clip.w, element.clip.h); cairo_clip(cr);
-        color(cr, element.kind == Kind::toggle && element.value != 0 ? element.accent : element.background);
-        rounded(cr, box, element.radius); cairo_fill(cr);
-        if (element.border_width > 0) {
+        if (background & 255) {
+            color(cr, background);
+            rounded(cr, box, element.radius); cairo_fill(cr);
+        }
+        if (border) {
             const double inset = element.border_width / 2;
             color(cr, element.border_color); cairo_set_line_width(cr, element.border_width);
             rounded(cr, {box.x + inset, box.y + inset, std::max(0.0, box.w - 2 * inset),
@@ -226,7 +237,7 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
             }
         }
         cairo_restore(cr);
-        if (surface.focus_visible && static_cast<int>(index) == surface.focused && focusable(element)) {
+        if (outline) {
             cairo_save(cr);
             cairo_rectangle(cr, element.clip.x, element.clip.y, element.clip.w, element.clip.h); cairo_clip(cr);
             color(cr, element.accent); cairo_set_line_width(cr, 1);
@@ -281,7 +292,7 @@ void invalidate_element(Surface& surface, int index, bool geometry) {
 void dirty(Surface& surface) {
     surface.dirty = surface.layout_dirty = true;
     for (auto& element : surface.elements)
-        element.measure_dirty = element.text_dirty = true;
+        element.measure_dirty = true;
     damage(surface, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)});
 }
 
@@ -295,8 +306,11 @@ void layout(Surface& surface) {
         const bool horizontal = element.kind == Kind::row || (element.kind == Kind::scroll && element.horizontal);
         const bool vertical = element.kind == Kind::column || (element.kind == Kind::scroll && !element.horizontal);
         if (element.kind == Kind::text || element.kind == Kind::button || element.kind == Kind::toggle || element.kind == Kind::input) {
-            text_layout(*surface.gui, element, -1);
-            int w, h; pango_layout_get_pixel_size(element.layout, &w, &h); width = w; height = h;
+            if (!element.layout || element.text_dirty) {
+                text_layout(*surface.gui, element, -1);
+                pango_layout_get_pixel_size(element.layout, &element.natural_text_width, &element.natural_text_height);
+            }
+            width = element.natural_text_width; height = element.natural_text_height;
             if (element.kind == Kind::input) width = std::max(width, 160.0);
         } else if (element.kind == Kind::image) {
             width = height = 32;
@@ -411,8 +425,7 @@ void render(Surface& surface) {
     Buffer* buffer = nullptr;
     std::size_t count = 0;
     std::erase_if(gui.buffers, [&](auto& item) {
-        const auto* owner = find_surface(gui, item->surface);
-        return !item->busy && (!owner || (item->surface == surface.id && (item->width != width || item->height != height)));
+        return !item->busy && item->surface == surface.id && (item->width != width || item->height != height);
     });
     for (auto& item : gui.buffers) {
         if (item->surface != surface.id) continue;

@@ -292,25 +292,21 @@ int dispatch_dbus(lua_State* lua, InvocationState::BusBinding& bus) {
     const auto generation = bus.generation;
     const auto events = std::exchange(bus.events, {});
     const bool status = std::exchange(bus.status_pending, false);
-    for (std::size_t i = 0; i <= events.size(); ++i) {
-        if (i == 0 && !status) continue;
-        const int& callback = i == 0 ? bus.on_status : bus.on_event;
-        if (dispatch_callback(lua, bus, callback, generation, [&](lua_State* lua) {
-            if (i > 0) {
-                const auto& event = events[i - 1];
-                static const char* kinds[] = {"reply", "signal", "method", "expired"};
-                lua_createtable(lua, 0, 9);
-                lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
-                identifier(lua, event.id); lua_setfield(lua, -2, "id");
-                string_field(lua, "sender", event.sender); string_field(lua, "path", event.path);
-                string_field(lua, "interface", event.interface); string_field(lua, "member", event.member);
-                if (!event.error.empty()) { string_field(lua, "error", event.error); string_field(lua, "error_name", event.error_name); }
-                lua_createtable(lua, static_cast<int>(event.arguments.size()), 0);
-                lua_Integer index = 1;
-                for (const auto& value : event.arguments) { push_value(lua, value); lua_rawseti(lua, -2, index++); }
-                lua_setfield(lua, -2, "arguments");
-            }
-            return i ? 1 : 0;
+    if (status && dispatch_callback(lua, bus, bus.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    for (const auto& event : events) {
+        if (dispatch_callback(lua, bus, bus.on_event, generation, [&](lua_State* lua) {
+            static const char* kinds[] = {"reply", "signal", "method", "expired"};
+            lua_createtable(lua, 0, 9);
+            lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
+            identifier(lua, event.id); lua_setfield(lua, -2, "id");
+            string_field(lua, "sender", event.sender); string_field(lua, "path", event.path);
+            string_field(lua, "interface", event.interface); string_field(lua, "member", event.member);
+            if (!event.error.empty()) { string_field(lua, "error", event.error); string_field(lua, "error_name", event.error_name); }
+            lua_createtable(lua, static_cast<int>(event.arguments.size()), 0);
+            lua_Integer index = 1;
+            for (const auto& value : event.arguments) { push_value(lua, value); lua_rawseti(lua, -2, index++); }
+            lua_setfield(lua, -2, "arguments");
+            return 1;
         }) < 0) return -1;
     }
     return 0;

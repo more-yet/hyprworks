@@ -44,31 +44,31 @@ enum class Kind { row, column, scroll, box, text, image, button, toggle, slider,
 /// Array position is valid within one surface revision. Moving a preserved
 /// element transfers its editing, image and callback ownership at commit.
 struct Element {
-    Kind kind = Kind::box;
-    int parent = -1, end = 0;
     std::string id, text, placeholder, font = "Sans 12";
     std::string accessible_role, accessible_name, accessible_description;
-    bool accessible_hidden = false;
     double width = -1, height = -1, grow = 0, padding = 0, gap = 0, radius = 0;
     double x = 0, y = 0, border_width = 0;
-    int halign = 0, valign = 0, align = 0;
     double value = 0, scroll = 0, scroll_limit = 0;
     std::optional<double> scroll_origin;
-    std::uint32_t background = 0, color = 0xffffffff, accent = 0x8ab4f8ff, border_color = 0;
-    bool enabled = true, wrap = false, password = false, horizontal = false;
-    int callback = -2;
     Box box, clip;
     double intrinsic_w = 0, intrinsic_h = 0, measured_width = -1, measured_height = 0;
-    int text_width = -1;
-    bool measure_dirty = true, arrange_dirty = true, text_dirty = true;
     PangoLayout* layout = nullptr;
     std::shared_ptr<Image> image;
-    bool image_notified = false;
     std::uint64_t edit_revision = 0;
-    int cursor = 0, anchor = 0;
     std::string preedit;
+    Kind kind = Kind::box;
+    int parent = -1, end = 0;
+    int halign = 0, valign = 0, align = 0;
+    std::uint32_t background = 0, color = 0xffffffff, accent = 0x8ab4f8ff, border_color = 0;
+    int callback = -2, text_width = -1;
+    int natural_text_width = 0, natural_text_height = 0;
+    int cursor = 0, anchor = 0;
     std::uint32_t preedit_seat = 0;
     int preedit_cursor = 0, preedit_end = 0;
+    bool accessible_hidden = false;
+    bool enabled = true, wrap = false, password = false, horizontal = false;
+    bool measure_dirty = true, arrange_dirty = true, text_dirty = true;
+    bool image_notified = false;
 };
 
 struct PopupPlacement {
@@ -99,6 +99,7 @@ struct Surface {
     std::uint32_t popup_grab_seat = 0, popup_grab_serial = 0;
     std::vector<std::uint32_t> outputs;
     std::vector<Element> elements;
+    std::vector<int> named_elements, image_elements, scroll_elements;
     int width = 640, height = 480, pending_width = 640, pending_height = 480;
     PopupPlacement popup_placement;
     int popup_x = 0, popup_y = 0, pending_popup_x = 0, pending_popup_y = 0;
@@ -277,8 +278,7 @@ inline bool focusable(const Element& element) {
 }
 
 inline bool valid_text(const std::string& text) {
-    return text.size() <= max_text && text.find('\0') == std::string::npos &&
-        g_utf8_validate(text.data(), static_cast<gssize>(text.size()), nullptr);
+    return text.size() <= max_text && g_utf8_validate(text.data(), static_cast<gssize>(text.size()), nullptr);
 }
 
 Surface* find_surface(Gui& gui, std::uint64_t id);

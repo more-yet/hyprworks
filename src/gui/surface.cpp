@@ -112,6 +112,7 @@ void destroy_surface(Surface& surface) {
     if (surface.viewport) wp_viewport_destroy(std::exchange(surface.viewport, nullptr));
     if (surface.native) wl_surface_destroy(std::exchange(surface.native, nullptr));
     clear_elements(gui.owner.lua, surface.elements);
+    surface.named_elements.clear(); surface.image_elements.clear(); surface.scroll_elements.clear();
     unref(gui.owner.lua, surface.on_configure);
     unref(gui.owner.lua, surface.on_close);
     unref(gui.owner.lua, surface.on_grab_cleared);
@@ -345,9 +346,9 @@ void properties(lua_State* lua, int table, Element& element, Gui& gui) {
         const int role = enum_field(lua, -1, "role",
             element.accessible_role.empty() ? "auto" : element.accessible_role.c_str(), roles);
         element.accessible_role = role ? roles[role] : "";
-        text_field(lua, -1, "name", element.accessible_name, max_text);
-        text_field(lua, -1, "description", element.accessible_description, max_text);
-        if (!valid_text(element.accessible_name) || !valid_text(element.accessible_description))
+        if (text_field(lua, -1, "name", element.accessible_name, max_text) && !valid_text(element.accessible_name))
+            luaL_error(lua, "accessibility text must be valid UTF-8 without NUL");
+        if (text_field(lua, -1, "description", element.accessible_description, max_text) && !valid_text(element.accessible_description))
             luaL_error(lua, "accessibility text must be valid UTF-8 without NUL");
         element.accessible_hidden = boolean_field(lua, -1, "hidden", element.accessible_hidden);
     }
@@ -358,13 +359,15 @@ void properties(lua_State* lua, int table, Element& element, Gui& gui) {
         std::size_t size; const char* text = luaL_checklstring(lua, -1, &size);
         if (size > max_text) luaL_error(lua, "text exceeds 16 KiB");
         text_changed = element.text != std::string_view(text, size);
-        element.text.assign(text, size);
+        if (text_changed) {
+            element.text.assign(text, size);
+            if (!valid_text(element.text)) luaL_error(lua, "text must be valid UTF-8 without NUL");
+        }
     }
     lua_pop(lua, 1);
-    if (!valid_text(element.text)) luaL_error(lua, "text must be valid UTF-8 without NUL");
     if (element.kind == Kind::input) {
-        text_field(lua, table, "placeholder", element.placeholder, max_text);
-        if (!valid_text(element.placeholder)) luaL_error(lua, "placeholder must be valid UTF-8 without NUL");
+        if (text_field(lua, table, "placeholder", element.placeholder, max_text) && !valid_text(element.placeholder))
+            luaL_error(lua, "placeholder must be valid UTF-8 without NUL");
     }
     if (text_field(lua, table, "font", element.font, 256)) {
         auto* font = pango_font_description_from_string(element.font.c_str());
@@ -430,7 +433,6 @@ void properties(lua_State* lua, int table, Element& element, Gui& gui) {
             field(lua, -1, "data");
             if (!lua_isnil(lua, -1)) {
                 std::size_t length; const char* bytes = luaL_checklstring(lua, -1, &length);
-                if (length > 8 * 1024 * 1024) luaL_error(lua, "image input exceeds 8 MiB");
                 image.reserve_input(length);
                 image.encoded.assign(bytes, length);
             }
@@ -501,21 +503,16 @@ std::size_t element_text_bytes(const Element& element) {
         (element.image ? element.image->icon.size() + element.image->path.size() + element.image->theme.size() : 0);
 }
 
-std::size_t content_bytes(const std::vector<Element>& elements) {
-    std::size_t bytes = 0;
-    for (std::size_t i = 0; i < elements.size(); ++i) {
-        const auto& element = elements[i];
-        bytes += element_text_bytes(element);
-        if (!element.id.empty()) for (std::size_t j = 0; j < i; ++j)
-            if (elements[j].id == element.id) throw std::runtime_error("duplicate element id: " + element.id);
-    }
-    if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
-    return bytes;
+bool same_text_layout(const Element& a, const Element& b) {
+    return a.font == b.font && a.text == b.text && a.placeholder == b.placeholder &&
+        a.password == b.password && a.preedit == b.preedit && a.wrap == b.wrap && a.align == b.align &&
+        (a.preedit.empty() || a.cursor == b.cursor);
 }
 
 void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, bool preserve) {
     auto& gui = *surface.gui;
     auto& old = surface.elements;
+    if (parsed.elements.size() < parsed.elements.capacity() / 2) parsed.elements.shrink_to_fit();
     const int delta = static_cast<int>(parsed.elements.size()) - (end - begin);
     if (static_cast<int>(old.size()) + delta > 2048) throw std::runtime_error("tree exceeds 2048 elements");
     std::vector<int> remap(old.size(), -1);
@@ -525,40 +522,55 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
         for (std::size_t i = 0; i < parsed.elements.size(); ++i) {
             auto& next = parsed.elements[i];
             if (next.id.empty()) continue;
-            for (int j = begin; j < end; ++j) {
-                const auto& previous = old[static_cast<std::size_t>(j)];
-                if (previous.id != next.id || previous.kind != next.kind) continue;
-                remap[static_cast<std::size_t>(j)] = begin + static_cast<int>(i);
-                if (!(parsed.specified[i] & text_specified)) next.text = previous.text;
-                if (!(parsed.specified[i] & value_specified)) next.value = previous.value;
-                if (!(parsed.specified[i] & scroll_specified)) {
-                    next.scroll = previous.scroll;
-                    next.scroll_origin = previous.scroll_origin;
-                }
-                const bool same_editor = next.text == previous.text && next.password == previous.password;
-                next.edit_revision = previous.edit_revision + (same_editor ? 0 : 1);
-                if (next.text == previous.text) {
-                    next.cursor = previous.cursor; next.anchor = previous.anchor;
-                } else next.cursor = next.anchor = static_cast<int>(next.text.size());
-                if (same_editor && next.enabled) {
-                    next.preedit = previous.preedit; next.preedit_seat = previous.preedit_seat;
-                    next.preedit_cursor = previous.preedit_cursor; next.preedit_end = previous.preedit_end;
-                }
-                break;
+            const auto found = std::ranges::lower_bound(surface.named_elements, next.id, {},
+                [&](int index) -> const std::string& { return old[static_cast<std::size_t>(index)].id; });
+            if (found == surface.named_elements.end() || *found < begin || *found >= end) continue;
+            const auto& previous = old[static_cast<std::size_t>(*found)];
+            if (previous.id != next.id || previous.kind != next.kind) continue;
+            remap[static_cast<std::size_t>(*found)] = begin + static_cast<int>(i);
+            if (!(parsed.specified[i] & text_specified)) next.text = previous.text;
+            if (!(parsed.specified[i] & value_specified)) next.value = previous.value;
+            if (!(parsed.specified[i] & scroll_specified)) {
+                next.scroll = previous.scroll;
+                next.scroll_origin = previous.scroll_origin;
+            }
+            const bool same_editor = next.text == previous.text && next.password == previous.password;
+            next.edit_revision = previous.edit_revision + (same_editor ? 0 : 1);
+            if (next.text == previous.text) {
+                next.cursor = previous.cursor; next.anchor = previous.anchor;
+            } else next.cursor = next.anchor = static_cast<int>(next.text.size());
+            if (same_editor && next.enabled) {
+                next.preedit = previous.preedit; next.preedit_seat = previous.preedit_seat;
+                next.preedit_cursor = previous.preedit_cursor; next.preedit_end = previous.preedit_end;
             }
         }
     }
-    auto bytes = content_bytes(parsed.elements);
-    for (int i = 0; i < static_cast<int>(old.size()); ++i) {
-        if (i >= begin && i < end) continue;
-        const auto& retained = old[static_cast<std::size_t>(i)];
-        bytes += element_text_bytes(retained);
-        if (!retained.id.empty()) for (const auto& added : parsed.elements)
-            if (retained.id == added.id) throw std::runtime_error("duplicate element id: " + retained.id);
+    const int count = static_cast<int>(old.size()) + delta;
+    const auto next_element = [&](int index) -> const Element& {
+        if (index < begin) return old[static_cast<std::size_t>(index)];
+        if (index < end + delta) return parsed.elements[static_cast<std::size_t>(index - begin)];
+        return old[static_cast<std::size_t>(index - delta)];
+    };
+    std::vector<int> named, images, scrolls;
+    named.reserve(std::min(static_cast<std::size_t>(count), surface.named_elements.size()));
+    images.reserve(std::min(static_cast<std::size_t>(count), surface.image_elements.size()));
+    scrolls.reserve(std::min(static_cast<std::size_t>(count), surface.scroll_elements.size()));
+    std::size_t bytes = 0;
+    for (int i = 0; i < count; ++i) {
+        const auto& element = next_element(i);
+        bytes += element_text_bytes(element);
+        if (!element.id.empty()) named.push_back(i);
+        if (element.kind == Kind::image) images.push_back(i);
+        if (element.kind == Kind::scroll) scrolls.push_back(i);
     }
     if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
+    std::ranges::sort(named, {}, [&](int index) -> const std::string& { return next_element(index).id; });
+    for (std::size_t i = 1; i < named.size(); ++i)
+        if (next_element(named[i - 1]).id == next_element(named[i]).id)
+            throw std::runtime_error("duplicate element id: " + next_element(named[i]).id);
+    const bool whole_tree = begin == 0 && end == static_cast<int>(old.size());
     std::vector<Element> combined;
-    combined.reserve(static_cast<std::size_t>(static_cast<int>(old.size()) + delta));
+    if (!whole_tree) combined.reserve(static_cast<std::size_t>(count));
     const int previous_focus = surface.focused;
     int next_focus = previous_focus < 0 ? -1 : remap[static_cast<std::size_t>(previous_focus)];
     const Element* next_editor = nullptr;
@@ -581,31 +593,47 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
         if (mapped < 0) continue;
         auto& previous = old[static_cast<std::size_t>(i)];
         auto& next = parsed.elements[static_cast<std::size_t>(mapped - begin)];
-        if (next.font == previous.font) next.layout = std::exchange(previous.layout, nullptr);
+        if (previous.layout && next.font == previous.font) {
+            next.layout = std::exchange(previous.layout, nullptr);
+            if (same_text_layout(next, previous)) {
+                next.text_dirty = previous.text_dirty;
+                next.text_width = previous.text_width;
+                next.natural_text_width = previous.natural_text_width;
+                next.natural_text_height = previous.natural_text_height;
+            }
+        }
     }
-    for (int i = 0; i < begin; ++i) {
-        auto& element = old[static_cast<std::size_t>(i)];
-        if (element.end >= end) element.end += delta;
-        combined.push_back(std::move(element));
+    if (whole_tree) {
+        clear_elements(parsed.lua, old);
+        old = std::move(parsed.elements);
+    } else {
+        for (int i = 0; i < begin; ++i) {
+            auto& element = old[static_cast<std::size_t>(i)];
+            if (element.end >= end) element.end += delta;
+            combined.push_back(std::move(element));
+        }
+        for (auto& element : parsed.elements) {
+            element.parent = element.parent < 0 ? begin - 1 : element.parent + begin;
+            element.end += begin;
+            combined.push_back(std::move(element));
+        }
+        for (int i = begin; i < end; ++i) {
+            auto& element = old[static_cast<std::size_t>(i)];
+            if (element.layout) g_object_unref(element.layout);
+            unref(parsed.lua, element.callback);
+        }
+        for (int i = end; i < static_cast<int>(old.size()); ++i) {
+            auto& element = old[static_cast<std::size_t>(i)];
+            if (element.parent >= end) element.parent += delta;
+            element.end += delta;
+            combined.push_back(std::move(element));
+        }
+        parsed.elements.clear();
+        old = std::move(combined);
     }
-    for (auto& element : parsed.elements) {
-        element.parent = element.parent < 0 ? begin - 1 : element.parent + begin;
-        element.end += begin;
-        combined.push_back(std::move(element));
-    }
-    for (int i = begin; i < end; ++i) {
-        auto& element = old[static_cast<std::size_t>(i)];
-        if (element.layout) g_object_unref(element.layout);
-        unref(parsed.lua, element.callback);
-    }
-    for (int i = end; i < static_cast<int>(old.size()); ++i) {
-        auto& element = old[static_cast<std::size_t>(i)];
-        if (element.parent >= end) element.parent += delta;
-        element.end += delta;
-        combined.push_back(std::move(element));
-    }
-    parsed.elements.clear();
-    old = std::move(combined);
+    surface.named_elements = std::move(named);
+    surface.image_elements = std::move(images);
+    surface.scroll_elements = std::move(scrolls);
     ++surface.revision; surface.pressed = surface.key_pressed = -1; surface.content_bytes = bytes;
     surface.focused = next_focus;
     const bool activation_target = next_focus >= 0 &&
@@ -638,11 +666,12 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
 int set_content(lua_State* lua) {
     auto& gui = gui_state(lua);
     const auto identity = handle(lua, 1, surface_type);
-    live_surface(gui, identity);
+    const auto previous_size = live_surface(gui, identity).elements.size();
     luaL_checktype(lua, 2, LUA_TTABLE);
     if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TTABLE);
     const bool preserve = !lua_isnoneornil(lua, 3) && boolean_field(lua, 3, "preserve_state", false);
     ParsedTree parsed{lua, {}, {}};
+    parsed.elements.reserve(previous_size); parsed.specified.reserve(previous_size);
     lua_pushvalue(lua, 2);
     if (protected_call(lua, [&](lua_State* lua) { parse_tree(lua, 2, parsed, gui, -1, 1); return 0; }, 0, 0, 1) < 0) return -1;
     auto& surface = live_surface(gui, identity);
@@ -655,9 +684,18 @@ int find_element(lua_State* lua) {
     const auto identity = handle(lua, 1, surface_type);
     std::size_t length; const char* id = luaL_checklstring(lua, 2, &length);
     const auto& surface = live_surface(gui, identity);
-    for (std::size_t i = 0; i < surface.elements.size(); ++i) {
-        if (surface.elements[i].id != std::string_view(id, length)) continue;
-        push_handle(lua, {surface.id, surface.revision, static_cast<int>(i)}, element_type); return 1;
+    const std::string_view name(id, length);
+    if (name.empty()) {
+        const auto found = std::ranges::find(surface.elements, name, &Element::id);
+        if (found != surface.elements.end()) {
+            push_handle(lua, {surface.id, surface.revision, static_cast<int>(found - surface.elements.begin())}, element_type);
+            return 1;
+        }
+    }
+    const auto found = std::ranges::lower_bound(surface.named_elements, name, {},
+        [&](int index) -> const std::string& { return surface.elements[static_cast<std::size_t>(index)].id; });
+    if (found != surface.named_elements.end() && surface.elements[static_cast<std::size_t>(*found)].id == name) {
+        push_handle(lua, {surface.id, surface.revision, *found}, element_type); return 1;
     }
     lua_pushnil(lua); lua_pushliteral(lua, "element id not found"); return 2;
 }
@@ -667,6 +705,7 @@ int replace_children(lua_State* lua) {
     const auto identity = handle(lua, 1, element_type);
     const auto& initial = live_surface(gui, identity);
     const auto kind = initial.elements[static_cast<std::size_t>(identity.element)].kind;
+    const auto previous_size = static_cast<std::size_t>(initial.elements[static_cast<std::size_t>(identity.element)].end - identity.element - 1);
     if (kind != Kind::row && kind != Kind::column &&
         kind != Kind::scroll && kind != Kind::box && kind != Kind::button)
         throw std::runtime_error("only containers accept children");
@@ -677,6 +716,7 @@ int replace_children(lua_State* lua) {
     if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TTABLE);
     const bool preserve = !lua_isnoneornil(lua, 3) && boolean_field(lua, 3, "preserve_state", false);
     ParsedTree parsed{lua, {}, {}};
+    parsed.elements.reserve(previous_size); parsed.specified.reserve(previous_size);
     lua_pushvalue(lua, 2);
     if (protected_call(lua, [&](lua_State* lua) {
         const auto count = lua_rawlen(lua, 2);
@@ -719,9 +759,7 @@ int set_element(lua_State* lua) {
     if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
     replacement.edit_revision = element.edit_revision +
         (replacement.text != element.text || replacement.password != element.password ? 1 : 0);
-    const bool text_changed = replacement.font != element.font || replacement.text != element.text ||
-        replacement.placeholder != element.placeholder || replacement.password != element.password ||
-        replacement.preedit != element.preedit || replacement.wrap != element.wrap || replacement.align != element.align;
+    const bool text_changed = !same_text_layout(replacement, element);
     const bool geometry = text_changed || replacement.width != element.width || replacement.height != element.height ||
         replacement.x != element.x || replacement.y != element.y || replacement.grow != element.grow ||
         replacement.padding != element.padding || replacement.gap != element.gap ||
@@ -822,8 +860,10 @@ int create_surface(lua_State* lua) {
     bool exclusive = false, grab = false;
     lua_pushvalue(lua, 1);
     if (protected_call(lua, [&](lua_State* lua) {
-        width = static_cast<int>(integer_field(lua, 2, "width", width, Role == 1 ? 0 : 1));
-        height = static_cast<int>(integer_field(lua, 2, "height", height, Role == 1 ? 0 : 1));
+        if constexpr (Role != 1) {
+            width = static_cast<int>(integer_field(lua, 2, "width", width, 1));
+            height = static_cast<int>(integer_field(lua, 2, "height", height, 1));
+        }
         text_field(lua, 2, "title", title, 256); text_field(lua, 2, "app_id", app_id, 256);
         text_field(lua, 2, "output", output, 256);
         callback_field(lua, 2, "on_configure", surface->on_configure);
@@ -844,14 +884,10 @@ int create_surface(lua_State* lua) {
             exclusive = boolean_field(lua, 2, "exclusive", false);
             exclusive_zone = static_cast<int>(integer_field(lua, 2, "exclusive_zone", 0, -1));
             margin = static_cast<int>(integer_field(lua, 2, "margin", 0, 0, 4096));
-            if (edge == 4) {
-                width = static_cast<int>(integer_field(lua, 2, "width", 0, 0));
-                height = static_cast<int>(integer_field(lua, 2, "height", 0, 0));
-                if (exclusive || exclusive_zone > 0) luaL_error(lua, "an all-edge layer cannot reserve space");
-            } else if (edge >= 2) {
-                width = static_cast<int>(integer_field(lua, 2, "width", 32, 1));
-                height = static_cast<int>(integer_field(lua, 2, "height", 0, 0));
-            } else height = static_cast<int>(integer_field(lua, 2, "height", 32, 1));
+            const bool vertical = edge == 2 || edge == 3;
+            width = static_cast<int>(integer_field(lua, 2, "width", vertical ? 32 : 0, vertical ? 1 : 0));
+            height = static_cast<int>(integer_field(lua, 2, "height", edge < 2 ? 32 : 0, edge < 2 ? 1 : 0));
+            if (edge == 4 && (exclusive || exclusive_zone > 0)) luaL_error(lua, "an all-edge layer cannot reserve space");
         }
         if constexpr (Role == 2) {
             field(lua, 2, "parent"); surface->parent = handle(lua, -1, surface_type).surface; lua_pop(lua, 1);

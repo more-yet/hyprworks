@@ -38,7 +38,6 @@
 namespace hyprworks::lua {
 
 namespace native = hyprworks::hyprland;
-enum class Event { status, change, result };
 struct Gui;
 struct WaitSet {
     std::vector<pollfd> fds;

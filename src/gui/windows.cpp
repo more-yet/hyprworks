@@ -528,17 +528,17 @@ void advance_capture(WindowCapture& capture) {
             capture.next_frame = now + capture.interval;
         }
         if (!capture.constraints || capture.frame || capture.pending || !capture.next_frame || now < *capture.next_frame) return;
-        if (!capture.width || !capture.height || capture.width > 8192 || capture.height > 8192 ||
-            static_cast<std::uint64_t>(capture.width) * capture.height * 4 > 64 * 1024 * 1024) {
-            capture_error(capture, "window capture buffer exceeds 64 MiB");
-            return;
-        }
-        if (capture.format == UINT32_MAX) {
-            capture_error(capture, "window capture requires ARGB8888 or XRGB8888 shared memory", true);
-            return;
-        }
         if (!capture.buffer || capture.buffer_width != capture.width || capture.buffer_height != capture.height ||
             capture.buffer_format != capture.format) {
+            if (!capture.width || !capture.height || capture.width > 8192 || capture.height > 8192 ||
+                static_cast<std::uint64_t>(capture.width) * capture.height * 4 > 64 * 1024 * 1024) {
+                capture_error(capture, "window capture buffer exceeds 64 MiB");
+                return;
+            }
+            if (capture.format == UINT32_MAX) {
+                capture_error(capture, "window capture requires ARGB8888 or XRGB8888 shared memory", true);
+                return;
+            }
             release_buffer(capture);
             const auto bytes = static_cast<std::size_t>(capture.width) * capture.height * 4;
             if (bytes > capture_limit - capture.catalog->capture_bytes) {
@@ -687,11 +687,8 @@ int dispatch_windows(WindowCatalog& catalog) {
     const auto generation = catalog.generation;
     const bool status = std::exchange(catalog.status_pending, false);
     const bool change = std::exchange(catalog.change_pending, false);
-    for (bool is_status : {true, false}) {
-        if (!(is_status ? status : change)) continue;
-        const int& callback = is_status ? catalog.on_status : catalog.on_change;
-        if (dispatch_callback(lua, catalog, callback, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    }
+    if (status && dispatch_callback(lua, catalog, catalog.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (change && dispatch_callback(lua, catalog, catalog.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
     for (auto capture : catalog.captures) {
         if (!capture || capture->closed || catalog.gui->owner.requests.load(std::memory_order_relaxed)) continue;
         advance_capture(*capture);

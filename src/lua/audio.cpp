@@ -127,7 +127,6 @@ int audio_refresh(lua_State* lua) {
 }
 
 int audio_set_volume(lua_State* lua) {
-    auto& binding = audio_handle(lua);
     static const char* directions[] = {"output", "input", nullptr};
     const auto direction = luaL_checkoption(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
     std::size_t length = 0;
@@ -141,30 +140,31 @@ int audio_set_volume(lua_State* lua) {
         volumes[i] = luaL_checknumber(lua, -1);
         lua_pop(lua, 1);
     }
+    auto& binding = audio_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an audio result awaits delivery"); return 2; }
     const auto result = binding.connection.set_volume(direction, std::string(name, length), {volumes.data(), count});
     return request_result(lua, result);
 }
 
 int audio_set_mute(lua_State* lua) {
-    auto& binding = audio_handle(lua);
     static const char* directions[] = {"output", "input", nullptr};
     const auto direction = luaL_checkoption(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
     std::size_t length;
     const char* name = luaL_checklstring(lua, 3, &length);
     luaL_checktype(lua, 4, LUA_TBOOLEAN);
     const bool mute = lua_toboolean(lua, 4);
+    auto& binding = audio_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an audio result awaits delivery"); return 2; }
     const auto result = binding.connection.set_mute(direction, std::string(name, length), mute);
     return request_result(lua, result);
 }
 
 int audio_set_default(lua_State* lua) {
-    auto& binding = audio_handle(lua);
     static const char* directions[] = {"output", "input", nullptr};
     const auto direction = luaL_checkoption(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
     std::size_t length;
     const char* name = luaL_checklstring(lua, 3, &length);
+    auto& binding = audio_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an audio result awaits delivery"); return 2; }
     const auto result = binding.connection.set_default(direction, std::string(name, length));
     return request_result(lua, result);
@@ -192,14 +192,13 @@ int dispatch_audio(lua_State* lua, AudioBinding& binding) {
     const bool status = std::exchange(binding.status_pending, false);
     const bool change = std::exchange(binding.change_pending, false);
     const auto generation = binding.generation;
-    for (const auto kind : {Event::status, Event::change, Event::result}) {
-        if (binding.closed || generation != binding.generation || invocation(lua).requests.load(std::memory_order_relaxed)) break;
-        if (!(kind == Event::status ? status : kind == Event::change ? change : binding.result.has_value())) continue;
-        auto result = kind == Event::result ? std::exchange(binding.result, {}) : std::nullopt;
-        const int& callback = kind == Event::status ? binding.on_status : kind == Event::change ? binding.on_change : binding.on_result;
-        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
-            if (result) push_audio_result(lua, *result);
-            return result ? 1 : 0;
+    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (binding.result && !binding.closed && generation == binding.generation && !invocation(lua).requests.load(std::memory_order_relaxed)) {
+        const auto result = std::exchange(binding.result, {});
+        if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
+            push_audio_result(lua, *result);
+            return 1;
         }) < 0) return -1;
     }
     return 0;

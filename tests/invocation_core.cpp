@@ -75,6 +75,28 @@ int main() {
     }
     config(R"(
         local hw = require('hyprworks')
+        local finished, ticks = 0, 0
+        local first = assert(hw.process {"/bin/sh", "-c", "exec 1>&- 2>&-; sleep 0.03"})
+        local second = assert(hw.process {"/bin/sh", "-c", "sleep 0.01; printf ready"})
+        local function exited(process)
+            local result = process:result()
+            assert(result.outcome == "exited" and result.exit_code == 0)
+            if process == second then assert(result.stdout == "ready") end
+            finished = finished + 1
+            if finished == 2 then assert(ticks > 0); hw.quit() end
+        end
+        first:on_exit(exited)
+        second:on_exit(exited)
+        hw.timer(1, function() ticks = ticks + 1 end, true)
+        hw.timer(1000, function() error('sparse readiness timeout') end)
+    )");
+    {
+        Invocation invocation;
+        assert(invocation.load(path));
+        assert(invocation.run());
+    }
+    config(R"(
+        local hw = require('hyprworks')
         assert(hw.on_clock_change(function() error('obsolete clock callback') end))
         assert(hw.on_clock_change(nil))
         assert(hw.on_clock_change(function()

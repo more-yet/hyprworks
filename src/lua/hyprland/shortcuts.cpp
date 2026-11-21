@@ -127,17 +127,14 @@ int dispatch_shortcuts(lua_State* lua, ShortcutBinding& binding) {
     const bool status = std::exchange(binding.status_pending, false);
     const auto events = std::exchange(binding.events, {});
     const auto generation = binding.generation;
-    for (std::size_t i = 0; i <= events.size(); ++i) {
-        if (i == 0 && !status) continue;
-        const int& callback = i == 0 ? binding.on_status : binding.on_event;
-        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
-            if (i) {
-                const auto& event = events[i - 1]; lua_createtable(lua, 0, 4);
-                string_field(lua, "id", event.id); lua_pushboolean(lua, event.pressed); lua_setfield(lua, -2, "pressed");
-                identifier(lua, event.seconds); lua_setfield(lua, -2, "seconds");
-                lua_pushinteger(lua, event.nanoseconds); lua_setfield(lua, -2, "nanoseconds");
-            }
-            return i ? 1 : 0;
+    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    for (const auto& event : events) {
+        if (dispatch_callback(lua, binding, binding.on_event, generation, [&](lua_State* lua) {
+            lua_createtable(lua, 0, 4);
+            string_field(lua, "id", event.id); lua_pushboolean(lua, event.pressed); lua_setfield(lua, -2, "pressed");
+            identifier(lua, event.seconds); lua_setfield(lua, -2, "seconds");
+            lua_pushinteger(lua, event.nanoseconds); lua_setfield(lua, -2, "nanoseconds");
+            return 1;
         }) < 0) return -1;
     }
     return 0;

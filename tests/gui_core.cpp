@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <linux/input-event-codes.h>
+#include <png.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -44,6 +45,47 @@ int main(int argc, char**) {
         cairo_surface_flush(image->surface);
         assert(*reinterpret_cast<std::uint32_t*>(cairo_image_surface_get_data(image->surface)) == 0x80800000);
         image.reset();
+        for (const int channels : {3, 4, 0}) {
+            const int stride = channels == 3 ? 3 : 4;
+            std::string source(257 * 257 * static_cast<std::size_t>(stride), '\0');
+            for (unsigned i = 0; i < 257 * 257; ++i) {
+                const unsigned a = (i / 256) & 255, c = i & 255;
+                const auto offset = i * static_cast<unsigned>(stride);
+                source[offset] = static_cast<char>(c);
+                source[offset + 1] = static_cast<char>((c + a) & 255);
+                source[offset + 2] = static_cast<char>(a);
+                if (stride == 4) source[offset + 3] = static_cast<char>(a);
+            }
+            auto decoded = std::make_shared<Image>(work);
+            decoded->width = decoded->height = 257; decoded->channels = channels;
+            if (channels) decoded->encoded = source;
+            else {
+                png_image png{};
+                png.version = PNG_IMAGE_VERSION; png.width = png.height = 257; png.format = PNG_FORMAT_RGBA;
+                png_alloc_size_t size = 0;
+                assert(png_image_write_to_memory(&png, nullptr, &size, 0, source.data(), 0, nullptr));
+                decoded->encoded.resize(size);
+                assert(png_image_write_to_memory(&png, decoded->encoded.data(), &size, 0, source.data(), 0, nullptr));
+                decoded->encoded.resize(size);
+                png_image_free(&png);
+            }
+            assert(work.submit(decoded));
+            while (!decoded->ready.load(std::memory_order_acquire)) {
+                pollfd fd{wake, POLLIN, 0};
+                assert(poll(&fd, 1, 3000) > 0);
+                std::uint64_t value;
+                assert(read(wake, &value, sizeof(value)) == sizeof(value));
+            }
+            assert(decoded->error.empty() && decoded->encoded.empty());
+            const auto* pixels = reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(decoded->surface));
+            for (unsigned i = 0; i < 257 * 257; ++i) {
+                const unsigned a = (i / 256) & 255, c = i & 255;
+                const unsigned alpha = stride == 4 ? a : 255;
+                const auto expected = alpha << 24 | ((c * alpha + 127) / 255) << 16 |
+                    ((((c + a) & 255) * alpha + 127) / 255) << 8 | (a * alpha + 127) / 255;
+                assert(pixels[i] == expected);
+            }
+        }
         for (int i = 0; i < 200; ++i) {
             auto job = std::make_shared<Image>(work);
             job->encoded.assign("\xff\0\0\xff", 4);
@@ -94,7 +136,7 @@ int main(int argc, char**) {
     auto& surface = *gui.surfaces[0];
     surface.gui = &gui; surface.id = ++gui.next_surface;
     surface.width = 320; surface.height = 160; surface.configured = true;
-    lua_newtable(state.lua); open_gui(state.lua); register_host(state.lua); lua_setglobal(state.lua, "hw");
+    lua_newtable(state.lua); open_gui(state.lua); register_host(state.lua); register_workspaces(state.lua); lua_setglobal(state.lua, "hw");
     push_handle(state.lua, {1, 0, -1}, surface_type); lua_setglobal(state.lua, "surface");
     const auto script = [&](const char* source) {
         if (luaL_dostring(state.lua, source) != LUA_OK) {
@@ -138,6 +180,21 @@ int main(int argc, char**) {
     }) == 0);
     assert(callback_timer.closed && lua_gettop(state.lua) == 0);
     script("assert(finalized == 2 and delivered == 1); collectgarbage('restart')");
+
+    state.workspaces.push_back(std::make_unique<WorkspaceBinding>());
+    auto& workspace = *state.workspaces.back();
+    assert(retain_handle(state.lua, workspace, "hyprworks.workspaces") == 1);
+    lua_setglobal(state.lua, "workspace");
+    script(R"(
+        workspace:on_status(function(connection)
+            assert(connection:close().id == "17")
+        end)
+        workspace:on_change(function() error("closed snapshot delivered") end)
+        workspace:on_result(function() error("closed result delivered") end)
+    )");
+    workspace.result = native::SwitchResult{17, native::SwitchOutcome::cancelled, false, {}};
+    assert(dispatch_workspaces(state.lua, state) == 0);
+    assert(workspace.closed && !workspace.result && lua_gettop(state.lua) == 0);
 
     script(R"(
         notifications = 0
@@ -639,6 +696,44 @@ int main(int argc, char**) {
         assert(pango_layout_get_serial(surface.elements[static_cast<std::size_t>(index_of("moving"))].layout) == scroll_shaping);
         script("assert(surface:find('edit'):set {text = 'Changed editor', font = 'Sans 16'})");
         paint_buffer(surface, first); compare(first);
+        for (const auto* kind : {"input", "text"}) for (const bool preserve : {false, true}) {
+            lua_pushstring(state.lua, kind); lua_setglobal(state.lua, "cached_kind");
+            script(R"(
+                cached_tree = {kind = "column", padding = 5, children = {
+                    {kind = cached_kind, id = "cached", text = "aé日", placeholder = "Placeholder"},
+                    {kind = "text", id = "wrapped", text = "Words that wrap onto multiple lines",
+                        width = 90, wrap = true},
+                }}
+                assert(surface:set_content(cached_tree))
+            )");
+            paint_buffer(surface, first);
+            for (const auto* change : {
+                "{}", "{text = 'A longer replacement'}", "{font = 'Serif 18'}",
+                "{text = '', placeholder = 'Changed placeholder'}", "{text = 'é日', password = true}",
+                "{password = false, padding = 12, width = 80}", "{align = 'right', wrap = true}",
+            }) {
+                script((std::string("change = ") + change + R"(
+                    for key, value in pairs(change) do cached_tree.children[1][key] = value end
+                )").c_str());
+                script(preserve ? "assert(surface:set_content(cached_tree, {preserve_state = true}))" :
+                    "assert(surface:find('cached'):set(change))");
+                paint_buffer(surface, first);
+                boxes.clear();
+                for (const auto& element : surface.elements) boxes.push_back(element.box);
+                script("assert(surface:set_content(cached_tree))");
+                compare(first);
+                for (std::size_t i = 0; i < boxes.size(); ++i) assert(surface.elements[i].box == boxes[i]);
+            }
+            for (const int width : {300, 480}) {
+                surface.width = width; dirty(surface);
+                paint_buffer(surface, first);
+                boxes.clear();
+                for (const auto& element : surface.elements) boxes.push_back(element.box);
+                script("assert(surface:set_content(cached_tree))");
+                compare(first);
+                for (std::size_t i = 0; i < boxes.size(); ++i) assert(surface.elements[i].box == boxes[i]);
+            }
+        }
         gui.buffers.clear();
         surface.scale = 1;
     }
@@ -722,6 +817,7 @@ int main(int argc, char**) {
         wl_display_disconnect(std::exchange(gui.display, nullptr));
         close(wayland[1]);
     }
+    script("assert(surface:set_content {kind = 'box'})");
     gui.images.stop();
     assert(gui.images.bytes.load() == 0);
 

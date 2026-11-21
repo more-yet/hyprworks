@@ -227,9 +227,10 @@ bool Invocation::reload_requested() const noexcept {
 }
 
 void Invocation::close() noexcept {
-    wake(*state_);
     auto& state = *state_;
+    if (state.closing) return;
     state.closing = true;
+    wake(state);
     state.reload_watch.stop();
     state.reload_at.reset();
     if (state.clock_fd >= 0) ::close(std::exchange(state.clock_fd, -1));
@@ -401,10 +402,11 @@ void Invocation::prepare_wait() {
         return;
     if (state.signals) wait.fds.push_back({state.signals->fd, POLLIN, 0});
     const auto append_wait = [&](const auto& prepared) {
-        if constexpr (requires { prepared.fd; })
-            wait.fds.push_back(prepared.fd);
-        else
-            wait.fds.insert(wait.fds.end(), prepared.fds.begin(), prepared.fds.end());
+        if constexpr (requires { prepared.fd; }) {
+            if (prepared.fd.fd >= 0) wait.fds.push_back(prepared.fd);
+        } else {
+            for (const auto& fd : prepared.fds) if (fd.fd >= 0) wait.fds.push_back(fd);
+        }
         if (prepared.deadline && (!wait.deadline || *prepared.deadline < *wait.deadline))
             wait.deadline = prepared.deadline;
     };
@@ -526,6 +528,7 @@ void Invocation::dispatch() {
     const auto now = native::Clock::now();
     std::size_t offset = state.signals ? 2 : 1;
     const auto consume_fd = [&](pollfd& fd) {
+        if (fd.fd < 0) { fd.revents = 0; return false; }
         assert(offset < ready.fds.size() && ready.fds[offset].fd == fd.fd && ready.fds[offset].events == fd.events);
         fd.revents = ready.fds[offset++].revents;
         return fd.revents != 0;

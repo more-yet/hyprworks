@@ -212,11 +212,11 @@ int workspace_status(lua_State* lua) {
 }
 
 int workspace_switch(lua_State* lua) {
-    auto& binding = workspace(lua);
     static const char* types[] = {"normal", "special", nullptr};
     const int type = luaL_checkoption(lua, 2, nullptr, types);
     std::size_t length;
     const char* address = luaL_checklstring(lua, 3, &length);
+    auto& binding = workspace(lua);
     auto result = binding.result ?
         std::expected<std::uint64_t, native::Error>(std::unexpected(native::Error{
             native::ErrorCode::busy, "switch", "a workspace result awaits delivery"})) :
@@ -317,14 +317,13 @@ int dispatch_workspaces(lua_State* lua, InvocationState& state) {
         const auto generation = binding.generation;
         const bool status = std::exchange(binding.status_pending, false);
         const bool change = std::exchange(binding.change_pending, false);
-        for (const auto event : {Event::status, Event::change, Event::result}) {
-            if (binding.closed || binding.generation != generation || state.requests.load(std::memory_order_relaxed)) break;
-            if (!(event == Event::status ? status : event == Event::change ? change : binding.result.has_value())) continue;
-            const auto result = event == Event::result ? std::exchange(binding.result, {}) : std::nullopt;
-            const auto& callback = event == Event::status ? binding.on_status : event == Event::change ? binding.on_change : binding.on_result;
-            if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
-                if (event == Event::result) push_switch_result(lua, *result);
-                return result ? 1 : 0;
+        if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+        if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
+        if (binding.result && !binding.closed && generation == binding.generation && !state.requests.load(std::memory_order_relaxed)) {
+            const auto result = std::exchange(binding.result, {});
+            if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
+                push_switch_result(lua, *result);
+                return 1;
             }) < 0) return -1;
         }
     }

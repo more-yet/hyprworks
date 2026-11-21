@@ -405,12 +405,14 @@ void destroy_seat(Seat& seat) {
 int dispatch_scroll(Surface& surface) {
     while (!surface.closed && !surface.gui->owner.requests.load(std::memory_order_relaxed)) {
         layout(surface);
-        const auto found = std::ranges::find_if(surface.elements, [](const auto& element) { return element.scroll_origin.has_value(); });
-        if (found == surface.elements.end()) break;
-        const double origin = *std::exchange(found->scroll_origin, {});
-        if (origin == found->scroll) continue;
-        const int index = static_cast<int>(found - surface.elements.begin());
-        if (notify(*surface.gui, surface.id, index, found->callback, "change") < 0) return -1;
+        const auto found = std::ranges::find_if(surface.scroll_elements,
+            [&](int index) { return surface.elements[static_cast<std::size_t>(index)].scroll_origin.has_value(); });
+        if (found == surface.scroll_elements.end()) break;
+        const int index = *found;
+        auto& element = surface.elements[static_cast<std::size_t>(index)];
+        const double origin = *std::exchange(element.scroll_origin, {});
+        if (origin == element.scroll) continue;
+        if (notify(*surface.gui, surface.id, index, element.callback, "change") < 0) return -1;
     }
     return 0;
 }
@@ -735,7 +737,7 @@ int process_input(Gui& gui, Input& event) {
         bool changed = false;
         const int selection_begin = std::min(element.cursor, element.anchor), selection_end = std::max(element.cursor, element.anchor);
         if (event.before > static_cast<std::uint32_t>(selection_begin) || event.after > element.text.size() - static_cast<std::size_t>(selection_end) ||
-            (event.commit_set && !valid_text(event.text)) || (event.preedit_set && !valid_text(event.preedit))) return -1;
+            (event.preedit_set && !valid_text(event.preedit))) return -1;
         if (event.preedit_set) {
             const auto boundary = [&](int index) {
                 return index == -1 || (index >= 0 && index <= static_cast<int>(event.preedit.size()) &&
@@ -937,10 +939,8 @@ int dispatch_input(Gui& gui) {
         if (gui.transfers[i].fd >= 0) { ++i; continue; }
         auto transfer = std::move(gui.transfers[i]); gui.transfers.erase(gui.transfers.begin() + static_cast<std::ptrdiff_t>(i));
         if (transfer.writing) continue;
-        if (transfer.error.empty() && (transfer.data.find('\0') != std::string::npos ||
-            !g_utf8_validate(transfer.data.data(), static_cast<gssize>(transfer.data.size()), nullptr)))
-            transfer.error = "clipboard is not valid UTF-8 text";
-        if (transfer.surface && transfer.error.empty()) {
+        if (transfer.surface) {
+            if (!transfer.error.empty()) continue;
             auto* surface = find_surface(gui, transfer.surface);
             if (surface && !surface->close_pending && surface->revision == transfer.revision && surface->focused == transfer.element) {
                 auto& element = surface->elements[static_cast<std::size_t>(transfer.element)];
@@ -949,6 +949,8 @@ int dispatch_input(Gui& gui) {
                     notify(gui, surface->id, transfer.element, element.callback, "change") < 0) return -1;
             }
         } else if (transfer.callback >= 0) {
+            if (transfer.error.empty() && !g_utf8_validate(transfer.data.data(), static_cast<gssize>(transfer.data.size()), nullptr))
+                transfer.error = "clipboard is not valid UTF-8 text";
             lua_pushcfunction(state.lua, traceback);
             const int result = protected_call(state.lua, [&](lua_State* lua) {
                 lua_rawgeti(lua, LUA_REGISTRYINDEX, transfer.callback);

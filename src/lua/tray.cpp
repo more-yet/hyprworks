@@ -271,7 +271,6 @@ int menu_close(lua_State* lua) {
 }
 
 int tray_action(lua_State* lua) {
-    auto& binding = tray_handle(lua);
     luaL_checktype(lua, 2, LUA_TTABLE);
     lua_settop(lua, 5);
     const char* parts[3]; std::size_t sizes[3];
@@ -284,7 +283,7 @@ int tray_action(lua_State* lua) {
     const auto action = luaL_checkoption(lua, 3, nullptr, actions);
     const auto x = luaL_optinteger(lua, 4, 0), y = luaL_optinteger(lua, 5, 0);
     luaL_argcheck(lua, x >= INT32_MIN && x <= INT32_MAX && y >= INT32_MIN && y <= INT32_MAX, 3, "coordinate or delta exceeds int32");
-    if (binding.closed) return luaL_error(lua, "tray connection closed while parsing request");
+    auto& binding = tray_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
     const tray::ItemKey key{std::string(parts[0], sizes[0]), std::string(parts[1], sizes[1]), std::string(parts[2], sizes[2])};
     const auto result = binding.connection.action(key, static_cast<tray::Action>(action), static_cast<std::int32_t>(x), static_cast<std::int32_t>(y));
@@ -292,7 +291,6 @@ int tray_action(lua_State* lua) {
 }
 
 int tray_scroll(lua_State* lua) {
-    auto& binding = tray_handle(lua);
     luaL_checktype(lua, 2, LUA_TTABLE);
     lua_settop(lua, 4);
     const char* parts[3]; std::size_t sizes[3];
@@ -305,7 +303,7 @@ int tray_scroll(lua_State* lua) {
     static const char* directions[] = {"vertical", "horizontal", nullptr};
     const bool horizontal = luaL_checkoption(lua, 4, "vertical", directions) == 1;
     luaL_argcheck(lua, delta >= INT32_MIN && delta <= INT32_MAX, 3, "coordinate or delta exceeds int32");
-    if (binding.closed) return luaL_error(lua, "tray connection closed while parsing request");
+    auto& binding = tray_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
     const tray::ItemKey key{std::string(parts[0], sizes[0]), std::string(parts[1], sizes[1]), std::string(parts[2], sizes[2])};
     const auto result = binding.connection.scroll(key, static_cast<std::int32_t>(delta), horizontal);
@@ -313,22 +311,22 @@ int tray_scroll(lua_State* lua) {
 }
 
 int menu_about_to_show(lua_State* lua) {
-    auto& binding = menu_handle(lua);
     const auto id = luaL_optinteger(lua, 2, 0);
     luaL_argcheck(lua, id >= 0 && id <= INT32_MAX, 2, "invalid menu item ID");
+    auto& binding = menu_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
     const auto result = binding.connection.about_to_show(static_cast<std::int32_t>(id));
     return request_result(lua, result);
 }
 
 int menu_event(lua_State* lua) {
-    auto& binding = menu_handle(lua);
     const auto id = luaL_optinteger(lua, 2, 0);
     luaL_argcheck(lua, id >= 0 && id <= INT32_MAX, 2, "invalid menu item ID");
     std::size_t length;
     const char* event = luaL_checklstring(lua, 3, &length);
     const auto timestamp = luaL_optinteger(lua, 4, 0);
     luaL_argcheck(lua, length <= 128 && timestamp >= 0 && timestamp <= UINT32_MAX, 3, "invalid menu event or timestamp");
+    auto& binding = menu_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
     const auto result = binding.connection.event(static_cast<std::int32_t>(id), std::string(event, length), static_cast<std::uint32_t>(timestamp));
     return request_result(lua, result);
@@ -339,14 +337,13 @@ int menu_event(lua_State* lua) {
 int dispatch_tray(lua_State* lua, TrayBinding& binding) {
     const bool status = std::exchange(binding.status_pending, false), change = std::exchange(binding.change_pending, false);
     const auto generation = binding.generation;
-    for (const auto event : {Event::status, Event::change, Event::result}) {
-        if (binding.closed || generation != binding.generation || invocation(lua).requests.load(std::memory_order_relaxed)) break;
-        if (!(event == Event::status ? status : event == Event::change ? change : binding.result.has_value())) continue;
-        auto result = event == Event::result ? std::exchange(binding.result, {}) : std::nullopt;
-        const int& callback = event == Event::status ? binding.on_status : event == Event::change ? binding.on_change : binding.on_result;
-        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
-            if (result) push_tray_result(lua, *result);
-            return result ? 1 : 0;
+    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (binding.result && !binding.closed && generation == binding.generation && !invocation(lua).requests.load(std::memory_order_relaxed)) {
+        const auto result = std::exchange(binding.result, {});
+        if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
+            push_tray_result(lua, *result);
+            return 1;
         }) < 0) return -1;
     }
     return 0;
@@ -356,14 +353,13 @@ int dispatch_menu(lua_State* lua, MenuBinding& binding) {
     const bool status = std::exchange(binding.status_pending, false), change = std::exchange(binding.change_pending, false);
     const auto generation = binding.generation;
     const auto activations = std::exchange(binding.activations, {});
-    for (const auto event : {Event::status, Event::change, Event::result}) {
-        if (binding.closed || generation != binding.generation || invocation(lua).requests.load(std::memory_order_relaxed)) break;
-        if (!(event == Event::status ? status : event == Event::change ? change : binding.result.has_value())) continue;
-        auto result = event == Event::result ? std::exchange(binding.result, {}) : std::nullopt;
-        const int& callback = event == Event::status ? binding.on_status : event == Event::change ? binding.on_change : binding.on_result;
-        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
-            if (result) push_menu_result(lua, *result);
-            return result ? 1 : 0;
+    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    if (binding.result && !binding.closed && generation == binding.generation && !invocation(lua).requests.load(std::memory_order_relaxed)) {
+        const auto result = std::exchange(binding.result, {});
+        if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
+            push_menu_result(lua, *result);
+            return 1;
         }) < 0) return -1;
     }
     for (const auto& activation : activations) {

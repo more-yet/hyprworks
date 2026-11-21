@@ -111,8 +111,8 @@ asynchronous D-Bus request ownership.
 | [`src/runner.cpp`](src/runner.cpp) | CLI configuration, process signals and reload loop |
 | [`protocols/`](protocols/) and [`cmake/`](cmake/) | Wayland definitions, installed targets and user service |
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) for ownership, execution order,
-resource lifetimes and the invariants shared across these paths.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) for end-to-end execution paths,
+failure/cancellation branches, ownership and simplification tradeoffs.
 
 ## Develop and verify
 

@@ -221,7 +221,8 @@ int process_close(lua_State* lua) {
     auto& binding = process_handle(lua);
     binding.process.cancel(); binding.closed = true; binding.pending = false; ++binding.generation;
     unref(lua, binding.callback);
-    return process_result(lua);
+    const auto result = binding.process.result();
+    return protected_call(lua, [&](lua_State* lua) { push_process_result(lua, result); return 1; }, 1);
 }
 
 int launch_application(lua_State* lua) {

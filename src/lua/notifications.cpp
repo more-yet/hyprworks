@@ -151,23 +151,23 @@ int notification_on_event(lua_State* lua) {
 }
 
 int notification_invoke(lua_State* lua) {
-    auto& binding = notification_handle(lua);
     const auto id = luaL_checkinteger(lua, 2);
     luaL_argcheck(lua, id > 0 && id <= UINT32_MAX, 2, "invalid notification identifier");
     std::size_t action_length, token_length;
     const char* action = luaL_checklstring(lua, 3, &action_length);
     const char* token = luaL_optlstring(lua, 4, "", &token_length);
     luaL_argcheck(lua, action_length <= 16384 && token_length <= 16384, 3, "notification action or token exceeds 16 KiB");
+    auto& binding = notification_handle(lua);
     const auto result = binding.server.invoke(static_cast<std::uint32_t>(id), std::string(action, action_length), std::string(token, token_length));
     return operation_result(lua, result);
 }
 
 int notification_dismiss(lua_State* lua) {
-    auto& binding = notification_handle(lua);
     const auto id = luaL_checkinteger(lua, 2);
     luaL_argcheck(lua, id > 0 && id <= UINT32_MAX, 2, "invalid notification identifier");
     const auto reason = luaL_optinteger(lua, 3, 2);
     luaL_argcheck(lua, reason >= 1 && reason <= 4, 3, "close reason must be 1..4");
+    auto& binding = notification_handle(lua);
     const auto result = binding.server.close(static_cast<std::uint32_t>(id), static_cast<notifications::CloseReason>(reason));
     return operation_result(lua, result);
 }
@@ -194,21 +194,17 @@ int dispatch_notifications(lua_State* lua, NotificationBinding& binding) {
     const bool status = std::exchange(binding.status_pending, false);
     const auto events = std::exchange(binding.events, {});
     const auto generation = binding.generation;
-    for (std::size_t i = 0; i < events.size() + 1; ++i) {
-        if (i == 0 && !status) continue;
-        const int& callback = i == 0 ? binding.on_status : binding.on_event;
-        if (dispatch_callback(lua, binding, callback, generation, [&](lua_State* lua) {
-            if (i) {
-                const auto& event = events[i - 1];
-                static const char* kinds[] = {"received", "closed", "action"};
-                lua_createtable(lua, 0, 5);
-                lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
-                lua_pushinteger(lua, event.id); lua_setfield(lua, -2, "id");
-                lua_pushinteger(lua, static_cast<unsigned>(event.reason)); lua_setfield(lua, -2, "reason");
-                lua_pushboolean(lua, event.replaced); lua_setfield(lua, -2, "replaced");
-                if (!event.action.empty()) string_field(lua, "action", event.action);
-            }
-            return i ? 1 : 0;
+    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    for (const auto& event : events) {
+        if (dispatch_callback(lua, binding, binding.on_event, generation, [&](lua_State* lua) {
+            static const char* kinds[] = {"received", "closed", "action"};
+            lua_createtable(lua, 0, 5);
+            lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
+            lua_pushinteger(lua, event.id); lua_setfield(lua, -2, "id");
+            lua_pushinteger(lua, static_cast<unsigned>(event.reason)); lua_setfield(lua, -2, "reason");
+            lua_pushboolean(lua, event.replaced); lua_setfield(lua, -2, "replaced");
+            if (!event.action.empty()) string_field(lua, "action", event.action);
+            return 1;
         }) < 0) return -1;
     }
     return 0;
