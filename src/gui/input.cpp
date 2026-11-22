@@ -464,7 +464,7 @@ void update_ime(Seat& seat) {
     seat.ime_surrounding = surrounding;
 }
 
-bool replace_text(Surface& surface, Element& element, int begin, int end, const std::string& inserted) {
+bool replace_text(Surface& surface, Element& element, int begin, int end, std::string_view inserted) {
     if (!valid_text(inserted) || begin < 0 || end < begin || end > static_cast<int>(element.text.size())) return false;
     const auto boundary = [&](int index) { return index == static_cast<int>(element.text.size()) || (static_cast<unsigned char>(element.text[static_cast<std::size_t>(index)]) & 0xc0) != 0x80; };
     if (!boundary(begin) || !boundary(end)) return false;
@@ -620,10 +620,8 @@ static void position_input_cursor(Surface& surface, Element& element, double x, 
     ++element.edit_revision; invalidate_element(surface, target);
 }
 
-int process_input(Gui& gui, Input& event) {
-    auto* surface = find_surface(gui, event.surface);
-    if (!surface || surface->close_pending) return -1;
-    auto& s = *surface;
+int process_input(Surface& s, Input& event) {
+    auto& gui = *s.gui;
     const bool owns_press = s.press_seat == event.seat && s.press_touch == event.touch;
     if (event.type == Input::Type::blur) {
         if (s.press_seat == event.seat) s.pressed = -1;
@@ -749,8 +747,8 @@ int process_input(Gui& gui, Input& event) {
             (event.preedit_set && !event.preedit.empty() && selection_begin != selection_end);
         if (replace_selection || event.before || event.after) {
             const bool backwards = element.cursor < element.anchor;
-            const auto insertion = event.commit_set ? event.text : replace_selection ? std::string{} :
-                element.text.substr(static_cast<std::size_t>(selection_begin), static_cast<std::size_t>(selection_end - selection_begin));
+            const auto insertion = event.commit_set ? std::string_view(event.text) : replace_selection ? std::string_view{} :
+                std::string_view(element.text).substr(static_cast<std::size_t>(selection_begin), static_cast<std::size_t>(selection_end - selection_begin));
             const int start = selection_begin - static_cast<int>(event.before);
             changed = replace_text(s, element, start, selection_end + static_cast<int>(event.after), insertion);
             if (!changed) return -1;
@@ -865,7 +863,7 @@ int dispatch_input(Gui& gui) {
         const auto revision = recipient->revision;
         const auto focused = recipient->focused;
         const auto focus_edit = focused < 0 ? 0 : recipient->elements[static_cast<std::size_t>(focused)].edit_revision;
-        if (lifecycle) process_input(gui, event);
+        if (lifecycle) process_input(*recipient, event);
         bool consumed = false;
         if (event.pressed && (event.type == Input::Type::key || event.type == Input::Type::button)) {
             const bool visible = event.type == Input::Type::key;
@@ -925,8 +923,8 @@ int dispatch_input(Gui& gui) {
                 (surface->revision != revision || surface->focused != focused || control.edit_revision != focus_edit))
                 consumed = true;
         }
-        const int target = !surface || lifecycle || consumed || state.requests.load(std::memory_order_relaxed) ?
-            -1 : process_input(gui, event);
+        const int target = !surface || surface->close_pending || lifecycle || consumed || state.requests.load(std::memory_order_relaxed) ?
+            -1 : process_input(*surface, event);
         if (target >= 0 && notify(gui, surface->id, target, surface->elements[static_cast<std::size_t>(target)].callback,
             surface->elements[static_cast<std::size_t>(target)].kind == Kind::button ? "activate" : "change") < 0) {
             gui.event_seat = nullptr; gui.event_serial = 0; gui.event_surface = 0; return -1;

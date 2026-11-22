@@ -31,6 +31,9 @@
 #ifdef HYPRWORKS_HAS_UPOWER
 #include <hyprworks/upower.hpp>
 #endif
+#ifdef HYPRWORKS_HAS_POLKIT
+#include <hyprworks/polkit.hpp>
+#endif
 
 #include "../lua/binding.hpp"
 #include <atomic>
@@ -181,6 +184,18 @@ struct PowerBinding {
 };
 #endif
 
+#ifdef HYPRWORKS_HAS_POLKIT
+struct PolkitBinding {
+    polkit::Agent agent;
+    polkit::Options options;
+    polkit::WaitSet wait;
+    std::vector<polkit::Event> events;
+    int handle = LUA_NOREF, on_status = LUA_NOREF, on_event = LUA_NOREF;
+    std::uint64_t generation = 0;
+    bool closed = false, status_pending = false;
+};
+#endif
+
 /// Stable binding storage spans native dispatch, reentrant Lua finalizers and
 /// lua_close. Native resources stop first; binding storage is reclaimed last.
 struct InvocationState {
@@ -246,6 +261,9 @@ struct InvocationState {
 #ifdef HYPRWORKS_HAS_GUI
     std::unique_ptr<Gui> gui;
 #endif
+#ifdef HYPRWORKS_HAS_POLKIT
+    std::optional<PolkitBinding> polkit;
+#endif
 };
 
 inline InvocationState& invocation(lua_State* lua) {
@@ -281,6 +299,10 @@ int dispatch_workspaces(lua_State* lua, InvocationState& state);
 void register_host(lua_State* lua);
 int dispatch_utilities(lua_State* lua, InvocationState& state);
 void read_clock_change(InvocationState& state);
+#ifdef HYPRWORKS_HAS_POLKIT
+void register_polkit(lua_State* lua);
+int dispatch_polkit(lua_State* lua, PolkitBinding& binding);
+#endif
 #ifdef HYPRWORKS_HAS_DBUS
 void register_dbus(lua_State* lua);
 int dispatch_dbus(lua_State* lua, InvocationState::BusBinding& binding);

@@ -9,8 +9,8 @@ The runtime brings those resources together in one invocation and event loop.
 ## Build and run
 
 Use a C++23 compiler, CMake, Ninja and pkg-config. The build resolves system
-libraries for Wayland, Cairo/Pango, image decoding, Lua, json-c, sd-bus, GIO and
-libpulse. Dependency versions and feature options live in [CMakeLists.txt](CMakeLists.txt).
+libraries for Wayland, Cairo/Pango, image decoding, Lua, json-c, sd-bus, GIO,
+libpulse and libpolkit-agent. Dependency versions and feature options live in [CMakeLists.txt](CMakeLists.txt).
 
 ```sh
 cmake -S . -B build/local -G Ninja \
@@ -92,6 +92,69 @@ failures return `nil, error`; malformed arguments raise Lua errors.
 
 The [live fixtures](tests/) demonstrate surface lifecycle, window capture and
 asynchronous D-Bus request ownership.
+
+### Polkit authentication
+
+`hw.polkit()` opens one native authentication agent for the login session.
+Hyprworks owns system-bus registration, authority verification, authentication
+helpers, retries and cancellation. Lua supplies the prompt UI and user choices.
+Build with `HYPRWORKS_BUILD_POLKIT=ON` (the standalone default) to use
+libpolkit-agent. Run one agent per login session.
+
+```lua
+local agent = assert(hw.polkit()) -- optional {session = "1", locale = "en_US.UTF-8"}
+agent:on_status(function(handle)
+    local status = handle:status()
+    if status.phase == "failed" then show_agent_error(status.error) end
+end)
+agent:on_event(function(handle, event)
+    if event.kind == "request" then
+        show_authentication(event.message, event.icon, event.identities,
+            function(uid) assert(handle:authenticate(event.id, uid)) end,
+            function() assert(handle:cancel(event.id)) end)
+    elseif event.kind == "prompt" then
+        show_prompt(event.text, event.echo, function(response)
+            assert(handle:respond(event.id, event.prompt, response))
+        end)
+    elseif event.kind == "info" or event.kind == "error" then
+        show_authentication_message(event.text)
+    elseif event.kind == "completed" then
+        hide_authentication(event.authorized, event.cancelled)
+    end
+end)
+```
+
+The `show_*`/`hide_*` functions above are your UI. Mask input when `echo` is
+false and clear the editor after submission or dismissal.
+
+- `status()` returns `phase` (`connecting`, `ready`, `failed`, `stopped` or
+  `closed`) and an optional `error`. `on_status` schedules initial delivery.
+- `on_event(function(agent, event) ... end)` replaces the event callback;
+  `nil` removes it. Each event has `kind` and an opaque decimal-string `id`.
+- `request` adds `action`, `message`, `icon`, a string-valued `details` table,
+  and `identities = {{uid = ..., name = ...}, ...}`. Choose an offered identity
+  with `authenticate(id, uid)` once; native code runs up to three attempts.
+- `prompt` adds a distinct opaque `prompt` ID, `text` and `echo`. Submit with
+  `respond(id, prompt, response)`. Reused or superseded IDs return `nil, error`.
+  Responses accept at most 4095 bytes and exclude NUL, CR and LF.
+- `info` and `error` carry `text`. `completed` carries `authorized` and
+  `cancelled`. `authorized` describes the authentication result; the requesting
+  application receives its authorization decision separately from Polkit.
+- `cancel(id)` dismisses the current request. `close()` cancels native work,
+  unregisters by disconnecting, and removes callbacks. `restart()` re-registers
+  using the original options and invalidates earlier requests; callbacks survive
+  a restart unless explicitly closed. `hw.polkit()` returns the shared handle.
+
+Session discovery uses the process's login session, then the user's display
+session. Registration conflicts and authority loss appear as failed status.
+Registration has a five-second deadline; each request has a five-minute
+deadline, including identity selection. One request is admitted at a time;
+concurrent requests are rejected. Admission accepts up to 32 identities,
+64 detail entries and 64 KiB of metadata, with 16 KiB per string. Native event
+delivery is bounded to 32 queued events. A request without an event callback is
+cancelled. Cookies and helper handles stay native; responses pass directly to
+the authentication helper.
+Closing, reload and shutdown release helpers before Lua storage.
 
 ### Workspace captures
 
@@ -175,6 +238,12 @@ build/local/hyprworks --config tests/windows.lua
 build/local/hyprworks --config tests/workspace_capture.lua
 dbus-run-session -- build/local/hyprworks --headless --config tests/dbus.lua
 ```
+
+With the existing session agent stopped, `tests/polkit.lua` checks real Polkit
+registration, PAM prompt delivery and cancellation using `pkcheck`, without
+submitting a password. Restore the existing agent afterward. `polkit-core`
+runs on an isolated bus with controlled helper signals to check retries,
+caller ownership and cancellation races.
 
 For sanitizer builds, pass compiler and linker sanitizer flags through CMake.
 The `image-worker` CTest target runs independently of font initialization.

@@ -78,8 +78,6 @@ void decode(Image& image) {
     }
     if (image.channels) {
         image.allocate();
-        const auto required = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * static_cast<std::size_t>(image.channels);
-        if (image.encoded.size() != required) throw std::runtime_error("raw image byte count does not match its dimensions");
         if (image.channels == 3) premultiply<3>(image, reinterpret_cast<const unsigned char*>(image.encoded.data()));
         else premultiply<4>(image, reinterpret_cast<const unsigned char*>(image.encoded.data()));
     } else if (image.encoded.size() >= 8 && png_sig_cmp(reinterpret_cast<const unsigned char*>(image.encoded.data()), 0, 8) == 0) {

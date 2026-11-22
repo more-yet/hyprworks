@@ -413,17 +413,15 @@ DispatchResult WorkspaceConnection::dispatch(const WaitSet& ready, TimePoint now
                 return;
         }
 
-        bool command_closed = false;
         if (pending_switch_ && now >= pending_switch_->deadline) {
             const Error error{ErrorCode::timeout, "switch", "switch deadline expired"};
             if (command_phase_ != CommandPhase::idle && command_kind_ == CommandKind::switch_workspace) {
                 fail_command(error, now, result);
-                command_closed = true;
             } else {
                 complete_switch(SwitchOutcome::failed, error, result);
             }
         }
-        if (command_phase_ != CommandPhase::idle && !command_closed) {
+        if (command_phase_ != CommandPhase::idle) {
             if (now >= command_deadline_)
                 fail_command(Error{ErrorCode::timeout, "command", "command deadline expired"}, now, result);
             else if (ready.fds[1].revents)

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <poll.h>
 #include <sys/types.h>
@@ -286,8 +287,8 @@ inline bool focusable(const Element& element) {
         element.kind == Kind::slider || element.kind == Kind::input);
 }
 
-inline bool valid_text(const std::string& text) {
-    return text.size() <= max_text && g_utf8_validate(text.data(), static_cast<gssize>(text.size()), nullptr);
+inline bool valid_text(std::string_view text) {
+    return text.empty() || (text.size() <= max_text && g_utf8_validate(text.data(), static_cast<gssize>(text.size()), nullptr));
 }
 
 Surface* find_surface(Gui& gui, std::uint64_t id);
@@ -320,10 +321,10 @@ void enqueue(Seat& seat, Input event);
 void attach_seat_services(Seat& seat);
 void destroy_seat(Seat& seat);
 void update_ime(Seat& seat);
-int process_input(Gui& gui, Input& event);
+int process_input(Surface& surface, Input& event);
 int dispatch_input(Gui& gui);
 int dispatch_scroll(Surface& surface);
-bool replace_text(Surface& surface, Element& element, int begin, int end, const std::string& inserted);
+bool replace_text(Surface& surface, Element& element, int begin, int end, std::string_view inserted);
 void paste(Seat& seat, Surface* surface, int callback = -2);
 ssize_t write_pipe(int fd, const char* data, std::size_t size);
 void transfer_io(Transfer& transfer, short events);

@@ -47,9 +47,6 @@ backpressure adds write readiness.
 
 ## Native integration paths
 
-Each row follows its implementation in `src/native/` through the corresponding
-Lua binding and invocation dispatch.
-
 | Path | Input → work → output | Failure, cancellation and repeated work |
 |---|---|---|
 | `hyprland/workspaces.cpp`, `workspace_protocol.cpp` | Session path → event socket → subscription marker → batched workspace/output query → bounded JSON → sorted, cross-checked snapshot | Event bursts coalesce. Subscription markers retry until acknowledged or timed out. Switch requests resolve a published key, encode once, send, then report outcome and refresh. Short socket1 writes end the request; sent actions retain execution uncertainty. |
@@ -62,6 +59,7 @@ Lua binding and invocation dispatch.
 | `dbus.cpp` | Lua values → typed body → native signature/value bounds → async call, subscription or export → owned events → Lua values | Calls cancel by ID. Exported methods retain their request until reply, error, expiration or close. Unknown/stale request IDs return operation errors. |
 | `notifications.cpp` | Acquire name → decode bounded notification → replace/append active record → event; deadline/action/close → removal and signal | String/binary/record budgets bound admission. Snapshot copies survive Lua finalizers. Name/transport failure releases the server; stop clears retained notifications/events. |
 | `commands.cpp` | Acquire name/export method → validate command/arguments → retain request and deadline → Lua callback → reply | Requests expire or receive a reply once. Callback errors stop the invocation. Close releases pending messages and bus resources. |
+| `polkit.cpp` | Discover login session → register over sd-bus → verify authority sender → retain one bounded request → UI identity choice → libpolkit-agent session → prompt/response → completion | Native code retries up to three attempts. Request/prompt IDs reject stale responses. Cancellation, deadline, authority loss and shutdown disconnect helper signals before releasing the session and retained D-Bus call. |
 | `desktop.cpp` | XDG roots → watched bounded traversal → precedence/deduplication → GIO metadata → sorted snapshot | File changes debounce rescans. Candidate watches/data commit together; failure releases transport state. Launch resolves the published entry and runs a private GLib completion loop. Scanning and launch execute synchronously. |
 
 Observers publish complete `shared_ptr<const Snapshot>` values. Lua conversion
@@ -73,6 +71,14 @@ Status, change and result delivery are explicit, in that order. A pending action
 result remains with its binding through earlier callbacks, allowing `close()`
 to return it. It transfers to a local value immediately before result delivery.
 Event batches transfer to local storage before callbacks can mutate the owner.
+
+Polkit uses the existing sd-bus path for registration and incoming calls and
+libpolkit-agent for authentication. Its private GLib context contributes poll
+descriptors and deadlines to the invocation loop; callbacks only retain native
+events. Lua delivery rechecks request/prompt ownership after marshalling.
+Disconnecting the dedicated bus releases agent registration. Helper initiation,
+response writes and cancellation use libpolkit-agent's synchronous operations;
+PAM/NSS and helper teardown can therefore delay the invocation thread.
 
 ## Host utility paths
 
@@ -93,13 +99,13 @@ Event batches transfer to local storage before callbacks can mutate the owner.
 | `surface.cpp`: create/close | Parse role/options/callbacks → resolve output/parent → allocate protocol role → retain surface → configure | Popup roles wait for the parent's first buffer commit. Dismissal cancels queued interaction/editor work before callbacks. Child roles retire before parents. |
 | Tree replacement | Parse candidate → preserve explicit-ID/kind state → validate combined IDs/budgets → allocate destination → transfer resources/remap targets → commit revision | Failed preparation destroys the candidate and retains the live tree. Whole-tree commit moves its vector; subtree commit splices. Explicit values override preserved state. Structural changes invalidate element handles. |
 | Element update | Copy candidate → apply supplied properties → resolve live handle → validate identity/budget → swap → invalidate affected geometry/paint | Retained strings keep their validated state; changed strings are checked at parsing. Unchanged shaping survives paint-only updates. |
-| `input.cpp`: input | Queue native packet → validate seat/target generation → Lua input callback → resolve target again → mutate interaction/editor state → interaction callback | Consumed events cancel matching presses. Keyboard activation retains physical key, seat, serial and target until release. Focus changes/tree commits retire presses. |
+| `input.cpp`: input | Queue native packet → validate seat/target generation → Lua input callback → resolve target again → pass live surface to input processing → interaction callback | Dispatch owns surface lookup and closing checks. Input processing checks the generation after the callback. Consumed events, focus changes and tree commits retire presses. |
 | IME/paste | Retain tree/editor identity → receive text → resolve current editor → validate insertion and UTF-8 boundaries → replace → callback | Stale transactions are ignored. Preedit validates independently. Clipboard callbacks validate received text at delivery; editor insertion owns validation on the editing branch. |
 | Clipboard transport | Validate Lua text or borrow a validated editor selection → copy into seat-owned storage → offer/pipe → bounded nonblocking local I/O → completion/timeout → delivery | Selection views last through the ownership copy. The source application receives a blocking writer. Transfers own endpoints and deadlines; SIGPIPE handling preserves the caller's signal state. |
 | Scrolling/focus | Hit-test → walk matching-axis ancestors → consume available range → layout clamp → coalesced change | Focus reveal uses the same geometry. Callback-driven tree replacement requires resolving the next pending target again. |
 | `render.cpp`: layout | Dirty ancestry → intrinsic measurement → width-dependent measurement → arrangement | Retained Pango configuration/natural sizes avoid shaping unchanged text. Hit testing, caret, IME rectangles and painting share arrangement. |
 | Presentation | Damage → configured/frame-ready surface → reusable buffer or bounded allocation → repair region → attach/commit | Busy buffers accumulate repair metadata and remain immutable. Release permits reuse; capacity exhaustion waits. GUI retirement collects orphaned buffers once per turn; render retires resized buffers for its own surface. |
-| `images.cpp`, `icons.cpp` | Account source → bounded queue → cached icon lookup → decode/premultiply → release/acquire completion → invalidate layout and notify | Superseded jobs are discarded. Queue exhaustion retries after completion wakes the loop. Errors publish with the image. Shutdown joins the worker before releasing its owner. |
+| `images.cpp`, `icons.cpp` | Validate/account source → bounded queue → cached icon lookup → decode/premultiply → release/acquire completion → invalidate layout and notify | Lua admission establishes raw image dimensions, channels and byte count. File decoders validate encoded inputs. Superseded jobs are discarded; queue exhaustion retries after completion. Shutdown joins the worker before releasing its owner. |
 | `windows.cpp`: catalog | Foreign-toplevel events → coalesced Hyprland query → Wayland synchronization → generation comparison → immutable records | A changed invalidation generation schedules another query. Session/generation identity prevents old targets from addressing restarted subscriptions. |
 | Window/workspace capture | Resolve published window identity or completed workspace name/output → create session → collect constraints → allocate buffer → request frame → scale into independent image → callback | GUI owns the shared eight-slot/128 MiB budget. Workspace targets belong to its Wayland connection; catalog closure cancels only its window captures. Workspace removal and protocol loss deliver terminal unavailability. Changed constraints discard incompatible completions; bounded retries handle constraint failures. Close releases protocol/storage ownership while delivered images retain their pixels. |
 
@@ -139,24 +145,16 @@ Invalid arguments raise Lua errors. Operational failures return `nil, error`.
 Uncaught callback errors stop the invocation. Protocol failure is handled by
 the connection that owns its recovery state.
 
-## Simplification decisions and tradeoffs
+## Design tradeoffs
 
-| Decision | Benefit and practical effect | Cost or constraint |
+| Choice | Benefit and practical effect | Cost or constraint |
 |---|---|---|
-| Direct ordered callback calls | Removes synthetic event entries, kind switches and repeated selection branches | A few similar calls remain beside each binding's concrete payload conversion |
-| Resolve action handles after parsing | Uses one current handle check after argument conversion and its possible finalizers | Malformed arguments can be reported before a closed-handle error |
-| Validation at mutation/allocation boundaries | Skips retained-string scans, duplicate editor validation and per-frame constraint checks | Each owner must preserve the established invariant until the next mutation |
-| Image data admission owns accounting and copying | Queue submission only admits already-accounted work; retries reuse the reservation | Internal producers use `Image::set_data` before submission |
-| One capture-constraint completion flag | The first event of a new batch clears the old format; `done` enables frame requests | Initial constraints start incomplete with an unset format |
-| GUI-owned capture sessions and budgets | Window and workspace capture share construction, scheduling, image delivery and teardown; workspace capture survives catalog closure | Source buffers and retained images have separate 128 MiB budgets; handles occupy capture slots until closed |
-| Workspace proxies carry their target/group state | Group events update the associated target directly; completed name/output state resolves new captures | Protocol ordering guarantees workspace leaves before group removal; Lua construction revalidates ownership after allocation |
-| Single capture buffer with independent delivered images | The compositor can update the retained buffer while Lua and UI elements keep earlier frames | New or failed buffers request full damage; each completed frame is scaled synchronously into separately accounted immutable pixels |
-| Focus established by mutation and tree commit | Input, IME and painting share one definition of valid focus; debug assertions catch invalid internal assignments | Future focus-changing paths must maintain the same invariant |
-| Clipboard validation at Lua ingress | Editor selection copies reuse validated UTF-8 boundaries; both paths copy directly into seat-owned storage | Borrowed views remain local to the synchronous copy |
-| GUI functions receive their concrete owner | Invocation scheduling selects the optional GUI; each GUI phase receives its owner directly | GUI functions require a live owner supplied by their caller |
-| One owner for orphan-buffer collection | Removes repeated global surface lookups during rendering | Render follows GUI retirement in the event-loop order |
-| One-shot invocation cleanup | Repeated `close()` and destruction share completed teardown | Native resources and Lua storage still retire in separate lifetime phases |
-| Existing invocation + image worker topology | Direct calls and bounded work keep ordering, cancellation and ownership visible | Desktop scans/launch and serial service queries retain their current latency |
+| One invocation thread and a bounded image worker | Native readiness precedes direct, ordered Lua delivery; mutable UI state has one owner | Desktop scans/launch, serial service queries and PAM/helper operations can delay that thread |
+| Concrete connections and stable binding storage | Transport errors and teardown stay with their resource owner; Lua finalizers retain valid storage | Similar scheduling and marshalling code remains explicit for each integration |
+| Validation at ingress and mutation | Input processing uses an already-resolved surface; workers consume admitted image payloads | Every producer must preserve those invariants; callbacks and asynchronous completion require fresh ownership checks |
+| Borrowed editor text during synchronous replacement | IME commits and retained selections avoid temporary string copies | Views remain local to replacement; retained publications and asynchronous transfers own their data |
+| GUI-owned captures with independent delivered images | Window/workspace capture share scheduling and budgets; retained frames survive buffer reuse | Scaling runs synchronously and delivered images have separate memory accounting |
+| Level-triggered polling for desktop watches | Unread inotify events drive the next bounded batch directly | Buffered transports such as sd-bus still track pending userspace work |
 
 Core checks cover callback/finalizer reentrancy, cancellation, stale readiness,
 tree transactions, retained layout versus fresh layout, delayed buffer repair,

@@ -227,7 +227,7 @@ int main(int argc, char**) {
     focus(surface, -1);
     assert(xkb_compose_state_get_status(keyboard->compose) == XKB_COMPOSE_NOTHING);
     Input reverse_tab{.type = Input::Type::key, .surface = 1, .key = XKB_KEY_ISO_Left_Tab, .pressed = true};
-    assert(process_input(gui, reverse_tab) == -1 && surface.focused == 2);
+    assert(process_input(surface, reverse_tab) == -1 && surface.focused == 2);
     focus(surface, 1);
     keyboard->keymap = xkb_keymap_new_from_names(gui.xkb, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS);
     assert(keyboard->keymap);
@@ -241,24 +241,28 @@ int main(int argc, char**) {
     assert(fcntl(keymap_fd, F_GETFD) == -1 && errno == EBADF);
     input.cursor = input.anchor = 3;
     Input backspace{.type = Input::Type::key, .surface = 1, .key = XKB_KEY_BackSpace, .pressed = true};
-    assert(process_input(gui, backspace) == 1);
+    assert(process_input(surface, backspace) == 1);
     assert(input.text == "z");
     assert(surface.content_bytes <= max_content);
 
     Input stale{.type = Input::Type::ime, .surface = 1, .revision = surface.revision - 1};
     stale.element = 1; stale.commit_set = true; stale.text = "obsolete";
-    assert(process_input(gui, stale) == -1 && input.text == "z");
+    assert(process_input(surface, stale) == -1 && input.text == "z");
 
     Input ime{.type = Input::Type::ime, .surface = 1, .revision = surface.revision};
     ime.element = 1; ime.commit_set = true; ime.text = "日本";
-    assert(process_input(gui, ime) == 1 && input.text == "日本z");
+    assert(process_input(surface, ime) == 1 && input.text == "日本z");
     assert(not replace_text(surface, input, 1, 2, ""));
     assert(!replace_text(surface, input, 0, 0, std::string(16385, 'x')));
     input.cursor = 3; input.anchor = 6;
+    ime.before = 3; ime.after = 1; ime.commit_set = false;
+    assert(process_input(surface, ime) == 1 && input.text == "本" && input.cursor == 0 && input.anchor == 3);
+    script("assert(input:set {text = '日本z'})");
+    input.cursor = 3; input.anchor = 6; ime.commit_set = true;
     ime.before = 3; ime.after = 1; ime.text = "A";
-    assert(process_input(gui, ime) == 1 && input.text == "A");
+    assert(process_input(surface, ime) == 1 && input.text == "A");
     ime.before = 1; ime.after = 0; ime.text.assign(16385, 'x');
-    assert(process_input(gui, ime) == -1 && input.text == "A");
+    assert(process_input(surface, ime) == -1 && input.text == "A");
     const auto editing = input.edit_revision;
     script("assert(input:set {color = '#00ff00'})");
     assert(surface.elements[1].edit_revision == editing);
@@ -268,46 +272,46 @@ int main(int argc, char**) {
     ime.before = 0; ime.after = 0; ime.commit_set = false;
     ime.preedit_set = true; ime.preedit = "日本";
     ime.preedit_cursor = ime.preedit_end = 1;
-    assert(process_input(gui, ime) == -1 && input.text == "A");
+    assert(process_input(surface, ime) == -1 && input.text == "A");
     ime.preedit_cursor = ime.preedit_end = 6;
-    assert(process_input(gui, ime) == 1 && input.text.empty());
+    assert(process_input(surface, ime) == 1 && input.text.empty());
     assert(input.cursor == 0 && input.anchor == 0 && input.preedit == "日本");
-    assert(process_input(gui, ime) == -1 && input.text.empty());
+    assert(process_input(surface, ime) == -1 && input.text.empty());
     Input ime_leave{.type = Input::Type::ime_leave, .surface = 1, .revision = surface.revision, .seat = 12, .element = 1};
-    assert(process_input(gui, ime_leave) == -1 && input.preedit == "日本");
+    assert(process_input(surface, ime_leave) == -1 && input.preedit == "日本");
     ime_leave.seat = ime.seat;
-    assert(process_input(gui, ime_leave) == -1 && input.preedit.empty());
+    assert(process_input(surface, ime_leave) == -1 && input.preedit.empty());
     ime.preedit.clear(); ime.preedit_cursor = ime.preedit_end = 0;
-    assert(process_input(gui, ime) == -1 && input.text.empty() && input.preedit.empty());
+    assert(process_input(surface, ime) == -1 && input.text.empty() && input.preedit.empty());
     script("assert(input:set {text = 'narrow', width = 1, padding = 12})");
     layout(surface);
     const auto caret = input_cursor(input, true);
     assert(std::isfinite(input.scroll) && input.scroll >= 0 && input.scroll <= std::max(0.0, caret.x / double(PANGO_SCALE)));
     script("assert(input:set {text = 'é日本', password = true, width = 200})");
     layout(surface);
-    assert(process_input(gui, backspace) == 1 && input.text == "é日");
+    assert(process_input(surface, backspace) == 1 && input.text == "é日");
     Input left{.type = Input::Type::key, .surface = 1, .key = XKB_KEY_Left, .pressed = true};
-    assert(process_input(gui, left) == -1 && input.cursor == 2);
+    assert(process_input(surface, left) == -1 && input.cursor == 2);
     ime.commit_set = true; ime.text = "secret";
-    assert(process_input(gui, ime) == -1 && input.text == "é日");
+    assert(process_input(surface, ime) == -1 && input.text == "é日");
     script("assert(input:set {text = 'éz'})");
     input.cursor = input.anchor = 3;
-    assert(process_input(gui, backspace) == 1 && input.text == "z");
+    assert(process_input(surface, backspace) == 1 && input.text == "z");
     script("assert(input:set {password = false})");
 
     layout(surface);
     const auto button = surface.elements[2].box;
     Input press{.type = Input::Type::button, .surface = 1, .seat = 11, .serial = 42,
         .key = BTN_LEFT, .x = button.x + button.w / 2, .y = button.y + button.h / 2, .pressed = true};
-    assert(process_input(gui, press) == -1 && surface.pressed == 2);
+    assert(process_input(surface, press) == -1 && surface.pressed == 2);
     Input release = press; release.pressed = false; release.seat = 12;
-    assert(process_input(gui, release) == -1 && surface.pressed == 2);
+    assert(process_input(surface, release) == -1 && surface.pressed == 2);
     release.seat = 11; release.touch = true;
-    assert(process_input(gui, release) == -1 && surface.pressed == 2);
+    assert(process_input(surface, release) == -1 && surface.pressed == 2);
     Input leave{.type = Input::Type::leave, .surface = 1, .seat = 12};
-    assert(process_input(gui, leave) == -1 && surface.pressed == 2);
+    assert(process_input(surface, leave) == -1 && surface.pressed == 2);
     release.touch = false;
-    assert(process_input(gui, release) == 2 && surface.pressed == -1 && gui.event_serial == 42);
+    assert(process_input(surface, release) == 2 && surface.pressed == -1 && gui.event_serial == 42);
 
     const auto old_revision = surface.revision;
     focus(surface, 1);
@@ -319,19 +323,19 @@ int main(int argc, char**) {
 
     script("assert(surface:set_content {kind = 'slider', width = 200, height = 30})");
     press.x = 4; press.y = 15;
-    assert(process_input(gui, press) == -1 && surface.pressed == 0);
+    assert(process_input(surface, press) == -1 && surface.pressed == 0);
     Input motion{.type = Input::Type::motion, .surface = 1, .seat = 12, .x = 196, .y = 15};
     motion.x = surface.elements[0].box.x + surface.elements[0].box.w - 4;
-    assert(process_input(gui, motion) == -1 && surface.elements[0].value == 0);
+    assert(process_input(surface, motion) == -1 && surface.elements[0].value == 0);
     motion.seat = 11; motion.touch = true;
-    assert(process_input(gui, motion) == -1 && surface.elements[0].value == 0);
+    assert(process_input(surface, motion) == -1 && surface.elements[0].value == 0);
     motion.touch = false;
-    assert(process_input(gui, motion) == 0 && surface.elements[0].value == 1);
+    assert(process_input(surface, motion) == 0 && surface.elements[0].value == 1);
     push_handle(state.lua, {1, surface.revision, 0}, element_type); lua_setglobal(state.lua, "slider");
     script("assert(slider:set {enabled = false})");
     assert(surface.pressed == -1 && surface.focused == -1);
     motion.x = 4;
-    assert(process_input(gui, motion) == -1 && surface.elements[0].value == 1);
+    assert(process_input(surface, motion) == -1 && surface.elements[0].value == 1);
 
     script(R"(
         assert(surface:set_content {kind = "column", children = {
@@ -394,7 +398,7 @@ int main(int argc, char**) {
     assert(moved_editor.anchor == 1 && moved_editor.cursor == 6 && moved_editor.edit_revision == editor_revision);
     surface.width = 480; dirty(surface); layout(surface);
     Input typing{.type = Input::Type::key, .surface = 1, .key = XKB_KEY_x, .pressed = true, .text = "x"};
-    assert(process_input(gui, typing) == index_of("editor") && moved_editor.text == "axz");
+    assert(process_input(surface, typing) == index_of("editor") && moved_editor.text == "axz");
     script(R"(
         assert(surface:find("action"):focus())
         assert(surface:set_content(editor_tree(false), {preserve_state = true}))
@@ -427,7 +431,7 @@ int main(int argc, char**) {
     )");
     assert(surface.revision == transaction_revision && surface.focused == index_of("editor"));
     assert(surface.elements[static_cast<std::size_t>(surface.focused)].cursor == 3);
-    assert(process_input(gui, typing) == index_of("editor"));
+    assert(process_input(surface, typing) == index_of("editor"));
     assert(surface.elements[static_cast<std::size_t>(surface.focused)].text == "ax日z");
     script(R"(
         local tree = editor_tree(false)
@@ -447,19 +451,17 @@ int main(int argc, char**) {
             on_activate = function() activations = activations + 1 end})
     )");
     press.x = 20; press.y = 20;
-    process_input(gui, press);
+    process_input(surface, press);
     assert(surface.pressed == 0);
-    gui.events[0] = press; gui.events[1] = release; gui.events[1].surface = 1;
-    gui.events[2] = {.type = Input::Type::key, .surface = 1, .key = XKB_KEY_Return, .pressed = true};
-    gui.event_count = 3;
+    enqueue(*keyboard, press); enqueue(*keyboard, release);
+    enqueue(*keyboard, {.type = Input::Type::key, .surface = 1, .key = XKB_KEY_Return, .pressed = true});
     script(R"(
         assert(surface:set_content({kind = "button", id = "replacement",
             on_activate = function() activations = activations + 1 end}, {preserve_state = true}))
     )");
     assert(surface.pressed == -1 && surface.focused == -1);
-    for (std::size_t i = 0; i < gui.event_count; ++i) assert(process_input(gui, gui.events[i]) == -1);
-    gui.event_count = 0;
-    assert(process_input(gui, release) == -1);
+    assert(dispatch_input(gui) == 0 && gui.event_count == 0);
+    assert(process_input(surface, release) == -1);
     script("assert(activations == 0)");
 
     script(R"(
@@ -473,32 +475,32 @@ int main(int argc, char**) {
         .key = XKB_KEY_Return, .code = KEY_ENTER, .pressed = true};
     Input key_repeat = key_press; key_repeat.serial = 0; key_repeat.repeated = true;
     Input key_release = key_press; key_release.pressed = false;
-    assert(process_input(gui, key_press) == -1 && surface.key_pressed == index_of("key"));
-    assert(process_input(gui, key_repeat) == -1);
+    assert(process_input(surface, key_press) == -1 && surface.key_pressed == index_of("key"));
+    assert(process_input(surface, key_repeat) == -1);
     key_release.seat = 12;
-    assert(process_input(gui, key_release) == -1 && surface.key_pressed == index_of("key"));
+    assert(process_input(surface, key_release) == -1 && surface.key_pressed == index_of("key"));
     key_release.seat = 7; key_release.code = KEY_SPACE;
-    assert(process_input(gui, key_release) == -1 && surface.key_pressed == index_of("key"));
+    assert(process_input(surface, key_release) == -1 && surface.key_pressed == index_of("key"));
     key_release.code = KEY_ENTER; key_release.key = XKB_KEY_space;
-    assert(process_input(gui, key_release) == index_of("key") && surface.key_pressed == -1);
-    assert(process_input(gui, key_release) == -1);
-    assert(process_input(gui, key_repeat) == -1 && surface.key_pressed == -1);
-    process_input(gui, key_press);
+    assert(process_input(surface, key_release) == index_of("key") && surface.key_pressed == -1);
+    assert(process_input(surface, key_release) == -1);
+    assert(process_input(surface, key_repeat) == -1 && surface.key_pressed == -1);
+    process_input(surface, key_press);
     focus(surface, index_of("toggle")); focus(surface, index_of("key"));
-    assert(process_input(gui, key_release) == -1);
-    process_input(gui, key_press);
+    assert(process_input(surface, key_release) == -1);
+    process_input(surface, key_press);
     script("assert(surface:find('key'):set {enabled = false}); assert(surface:find('key'):set {enabled = true}); assert(surface:find('key'):focus())");
-    assert(process_input(gui, key_release) == -1);
-    process_input(gui, key_press);
+    assert(process_input(surface, key_release) == -1);
+    process_input(surface, key_press);
     Input key_blur{.type = Input::Type::blur, .surface = 1, .seat = 7};
-    process_input(gui, key_blur);
-    assert(process_input(gui, key_release) == -1);
-    process_input(gui, key_press);
+    process_input(surface, key_blur);
+    assert(process_input(surface, key_release) == -1);
+    process_input(surface, key_press);
     script(R"(
         assert(surface:set_content({kind = "button", id = "key",
             on_activate = function() activations = activations + 1 end}, {preserve_state = true}))
     )");
-    assert(surface.focused == 0 && process_input(gui, key_release) == -1);
+    assert(surface.focused == 0 && process_input(surface, key_release) == -1);
     script(R"(
         function consume_release(_, event) return event.kind == "key" and not event.pressed end
     )");
@@ -551,7 +553,7 @@ int main(int argc, char**) {
         }})
     )");
     Input nested_wheel{.type = Input::Type::axis, .surface = 1, .seat = 7, .x = 10, .y = 10, .delta = 35};
-    process_input(gui, nested_wheel);
+    process_input(surface, nested_wheel);
     assert(surface.elements[static_cast<std::size_t>(index_of("inner"))].scroll == 20);
     assert(surface.elements[static_cast<std::size_t>(index_of("outer"))].scroll == 15);
     assert(surface.elements[static_cast<std::size_t>(index_of("sibling"))].scroll == 0);
@@ -571,11 +573,11 @@ int main(int argc, char**) {
         assert(surface:set_content {kind = "box", children = {scroller(false)}})
     )");
     Input wheel{.type = Input::Type::axis, .surface = 1, .seat = 7, .x = 10, .y = 10, .delta = 30};
-    process_input(gui, wheel);
-    wheel.delta = 999; process_input(gui, wheel);
+    process_input(surface, wheel);
+    wheel.delta = 999; process_input(surface, wheel);
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 1 and scroll_events[1] == 300)");
-    process_input(gui, wheel);
+    process_input(surface, wheel);
     assert(dispatch_scroll(surface) == 0);
     script(R"(
         assert(#scroll_events == 1)
@@ -586,21 +588,21 @@ int main(int argc, char**) {
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 1)");
     wheel.delta = 20; wheel.horizontal = true;
-    process_input(gui, wheel);
-    wheel.delta = -20; process_input(gui, wheel);
+    process_input(surface, wheel);
+    wheel.delta = -20; process_input(surface, wheel);
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 1)");
-    wheel.delta = 50; process_input(gui, wheel);
+    wheel.delta = 50; process_input(surface, wheel);
     script(R"(
         assert(surface:set_content({kind = "box", children = {scroller(true)}}, {preserve_state = true}))
     )");
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 2 and scroll_events[2] == 60)");
-    process_input(gui, wheel);
+    process_input(surface, wheel);
     script("assert(surface:find('scroll'):set {scroll = 5})");
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 2)");
-    process_input(gui, wheel);
+    process_input(surface, wheel);
     script(R"(
         local tree = scroller(true)
         tree.width = 390
@@ -608,7 +610,7 @@ int main(int argc, char**) {
     )");
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 3 and scroll_events[3] == 10)");
-    process_input(gui, wheel);
+    process_input(surface, wheel);
     script("assert(surface:set_content {kind = 'box'})");
     assert(dispatch_scroll(surface) == 0);
     script(R"(
@@ -621,8 +623,8 @@ int main(int argc, char**) {
         assert(surface:set_content {kind = "row", children = {first, second}})
     )");
     wheel.horizontal = false; wheel.delta = 20;
-    process_input(gui, wheel);
-    wheel.x = 110; process_input(gui, wheel);
+    process_input(surface, wheel);
+    wheel.x = 110; process_input(surface, wheel);
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 3)");
     {

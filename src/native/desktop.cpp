@@ -54,11 +54,10 @@ struct DesktopEntries::State {
     bool status_pending = false, change_pending = false;
     std::optional<Clock::time_point> refresh_at;
     std::uint64_t generation = 0, revision = 0;
-    bool more = false;
 
     void release() noexcept {
         if (fd >= 0) ::close(std::exchange(fd, -1));
-        watches.clear(); apps.clear(); roots.clear(); refresh_at.reset(); more = false;
+        watches.clear(); apps.clear(); roots.clear(); refresh_at.reset();
     }
 
     void scan() {
@@ -177,7 +176,6 @@ struct DesktopEntries::State {
             fd = next_fd;
             watches = std::move(next_watches);
             refresh_at.reset();
-            more = false;
         } catch (...) { ::close(next_fd); throw; }
     }
 
@@ -217,7 +215,7 @@ WaitSet DesktopEntries::prepare_wait() {
     auto& state = *state_; WaitSet wait; wait.generation = ++state.generation;
     wait.fd = {state.fd, POLLIN, 0};
     wait.deadline = state.refresh_at;
-    if (state.more || state.status_pending || state.change_pending) wait.deadline = Clock::time_point::min();
+    if (state.status_pending || state.change_pending) wait.deadline = Clock::time_point::min();
     return wait;
 }
 
@@ -228,10 +226,8 @@ Update DesktopEntries::dispatch(const WaitSet& ready) {
     ++state.generation;
     if (state.fd >= 0) try {
         if (ready.fd.revents & (POLLERR | POLLHUP | POLLNVAL)) throw std::runtime_error("desktop directory watch failed");
-        const bool readable = (ready.fd.revents & POLLIN) || state.more;
-        state.more = false;
         alignas(inotify_event) std::array<char, 65536> events;
-        for (unsigned batch = 0; readable && batch < 4; ++batch) {
+        for (unsigned batch = 0; (ready.fd.revents & POLLIN) && batch < 4; ++batch) {
             const auto size = ::read(state.fd, events.data(), events.size());
             if (size < 0) {
                 if (errno == EAGAIN) break;
@@ -247,7 +243,6 @@ Update DesktopEntries::dispatch(const WaitSet& ready) {
                 }
                 offset += sizeof(inotify_event) + event.len;
             }
-            state.more = batch == 3;
         }
         if (state.refresh_at && Clock::now() >= *state.refresh_at) state.scan();
     } catch (const std::exception& error) { state.fail(error.what()); }

@@ -106,6 +106,9 @@ int open_module(lua_State* lua) {
 #ifdef HYPRWORKS_HAS_DESKTOP
     register_desktop(lua);
 #endif
+#ifdef HYPRWORKS_HAS_POLKIT
+    register_polkit(lua);
+#endif
 #ifdef HYPRWORKS_HAS_GUI
     open_gui(lua);
 #endif
@@ -236,6 +239,9 @@ void Invocation::close() noexcept {
     if (state.clock_fd >= 0) ::close(std::exchange(state.clock_fd, -1));
     state.timezone_watch.stop();
     state.clock_pending = false;
+#ifdef HYPRWORKS_HAS_POLKIT
+    if (state.polkit) { state.polkit->closed = true; state.polkit->agent.stop(); }
+#endif
 #ifdef HYPRWORKS_HAS_DBUS
     for (auto& bus : state.buses) { bus->closed = true; bus->connection.stop(); }
 #endif
@@ -286,6 +292,9 @@ void Invocation::close() noexcept {
     state.gui.reset();
 #endif
     state.workspaces.clear();
+#ifdef HYPRWORKS_HAS_POLKIT
+    state.polkit.reset();
+#endif
 #ifdef HYPRWORKS_HAS_DBUS
     state.buses.clear();
 #endif
@@ -481,6 +490,13 @@ void Invocation::prepare_wait() {
         if (binding.status_pending || !binding.requests.empty()) wait.deadline = native::TimePoint::min();
     }
 #endif
+#ifdef HYPRWORKS_HAS_POLKIT
+    if (state.polkit && !state.polkit->closed) {
+        auto& binding = *state.polkit;
+        append_wait(binding.wait = binding.agent.prepare_wait());
+        if (binding.status_pending || !binding.events.empty()) wait.deadline = native::TimePoint::min();
+    }
+#endif
     for (const auto& timer : state.timers) {
         if (timer->closed) continue;
         const auto deadline = timer->timer.deadline();
@@ -624,6 +640,13 @@ void Invocation::dispatch() {
         state.commands->status_pending |= update.status_changed; state.commands->requests = std::move(update.requests);
     }
 #endif
+#ifdef HYPRWORKS_HAS_POLKIT
+    if (state.polkit && !state.polkit->closed && consume_wait(state.polkit->wait)) {
+        auto update = state.polkit->agent.dispatch(state.polkit->wait);
+        state.polkit->status_pending |= update.status_changed;
+        state.polkit->events = std::move(update.events);
+    }
+#endif
     for (auto& timer : state.timers) if (!timer->closed) timer->pending += timer->timer.dispatch(now);
     for (const auto& process : state.processes) {
         if (!process->closed && process->process.running() && consume_wait(process->wait))
@@ -703,6 +726,10 @@ void Invocation::dispatch() {
 #ifdef HYPRWORKS_HAS_COMMANDS
     if (status >= 0 && state.commands)
         status = dispatch_commands(state.lua, *state.commands);
+#endif
+#ifdef HYPRWORKS_HAS_POLKIT
+    if (status >= 0 && state.polkit)
+        status = dispatch_polkit(state.lua, *state.polkit);
 #endif
     if (status >= 0)
         status = dispatch_utilities(state.lua, state);
