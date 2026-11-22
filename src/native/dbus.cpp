@@ -161,14 +161,15 @@ void write_value(sd_bus_message* message, const Value& value, Budget& budget, un
     }
 }
 
-std::string body_signature(const Body& body) {
-    std::string result;
+void write_body(sd_bus_message* message, const Body& body) {
+    Budget budget;
+    std::size_t signature_bytes = 0;
     for (const auto& value : body) {
         validate_value_signature(value.signature);
-        if (result.size() + value.signature.size() > 255) throw std::runtime_error("D-Bus signature exceeds 255 bytes");
-        result += value.signature;
+        signature_bytes += value.signature.size();
+        if (signature_bytes > 255) throw std::runtime_error("D-Bus signature exceeds 255 bytes");
+        write_value(message, value, budget, 0);
     }
-    return result;
 }
 
 }
@@ -328,7 +329,6 @@ std::expected<std::uint64_t, std::string> Connection::call(const Call& call) {
     auto& state = *state_;
     try {
         if (!state.bus) throw std::runtime_error("D-Bus connection is stopped");
-        std::erase_if(state.pending, [](const auto& request) { return request->done; });
         if (state.pending.size() >= 64) throw std::length_error("D-Bus outgoing request limit reached");
         if (call.timeout.count() < 1 || call.timeout > std::chrono::minutes(5)) throw std::runtime_error("D-Bus timeout must be 1..300000 milliseconds");
         if (!sd_bus_service_name_is_valid(call.destination.c_str()) || call.destination.contains('\0') ||
@@ -336,9 +336,7 @@ std::expected<std::uint64_t, std::string> Connection::call(const Call& call) {
             !sd_bus_interface_name_is_valid(call.interface.c_str()) || call.interface.contains('\0') ||
             !sd_bus_member_name_is_valid(call.member.c_str()) || call.member.contains('\0')) throw std::runtime_error("invalid D-Bus method address");
         auto message = dbus::method(state.bus, call.destination.c_str(), call.path.c_str(), call.interface.c_str(), call.member.c_str());
-        body_signature(call.arguments);
-        Budget budget;
-        for (const auto& value : call.arguments) write_value(message.get(), value, budget, 0);
+        write_body(message.get(), call.arguments);
         check(sd_bus_message_set_allow_interactive_authorization(message.get(), call.interactive));
         auto pending = std::make_unique<State::Pending>(&state, state.next_id());
         const auto id = pending->id;
@@ -410,11 +408,11 @@ std::expected<void, std::string> Connection::reply(std::uint64_t id, const Body&
     try {
         const auto found = std::ranges::find(state.incoming, id, &State::Incoming::id);
         if (found == state.incoming.end()) throw std::runtime_error("unknown or expired D-Bus incoming request");
-        if (body_signature(arguments) != found->output) throw std::runtime_error("D-Bus reply signature does not match exported method");
         sd_bus_message* raw = nullptr; check(sd_bus_message_new_method_return(found->message.get(), &raw));
         Message message(raw, sd_bus_message_unref);
-        Budget budget;
-        for (const auto& value : arguments) write_value(message.get(), value, budget, 0);
+        write_body(message.get(), arguments);
+        if (found->output != sd_bus_message_get_signature(message.get(), true))
+            throw std::runtime_error("D-Bus reply signature does not match exported method");
         check(sd_bus_send(state.bus, message.get(), nullptr));
         state.incoming.erase(found); ++state.generation;
         return {};

@@ -1,5 +1,4 @@
-#include <hyprworks/lua.hpp>
-#include <hyprworks/host.hpp>
+#include "../src/runtime/invocation.hpp"
 #include <cassert>
 #include <cerrno>
 #include <filesystem>
@@ -11,6 +10,73 @@
 using namespace hyprworks::lua;
 
 int main() {
+    {
+        InvocationState state;
+        state.lua = luaL_newstate();
+        assert(state.lua);
+        *static_cast<InvocationState**>(lua_getextraspace(state.lua)) = &state;
+        luaL_openlibs(state.lua);
+        lua_newtable(state.lua); register_host(state.lua); register_workspaces(state.lua);
+        lua_setglobal(state.lua, "hw");
+        const auto script = [&](const char* source) {
+            if (luaL_dostring(state.lua, source) != LUA_OK) {
+                std::cerr << lua_tostring(state.lua, -1) << '\n'; std::abort();
+            }
+        };
+        script(R"(
+            collectgarbage("stop")
+            delivered, finalized = 0, 0
+            callback_timer = hw.timer(0, function() error("obsolete callback delivered") end)
+            local garbage = setmetatable({}, {__gc = function()
+                finalized = finalized + 1
+                callback_timer:on_tick(function(timer, ticks)
+                    assert(timer == callback_timer and ticks == 1)
+                    delivered = delivered + 1
+                end)
+            end})
+        )");
+        auto& timer = *state.timers.back();
+        assert(dispatch_callback(state.lua, timer, timer.callback, timer.generation, [](lua_State* lua) {
+            lua_gc(lua, LUA_GCCOLLECT);
+            lua_pushinteger(lua, 1);
+            return 1;
+        }) == 0);
+        assert(lua_gettop(state.lua) == 0);
+        script("assert(finalized == 1 and delivered == 0)");
+        timer.pending = 1;
+        assert(dispatch_utilities(state.lua, state) == 0);
+        script(R"(
+            assert(delivered == 1)
+            local garbage = setmetatable({}, {__gc = function()
+                finalized = finalized + 1
+                callback_timer:close()
+            end})
+        )");
+        assert(dispatch_callback(state.lua, timer, timer.callback, timer.generation, [](lua_State* lua) {
+            lua_gc(lua, LUA_GCCOLLECT);
+            lua_pushinteger(lua, 1);
+            return 1;
+        }) == 0);
+        assert(timer.closed && lua_gettop(state.lua) == 0);
+        script("assert(finalized == 2 and delivered == 1); collectgarbage('restart')");
+
+        state.workspaces.push_back(std::make_unique<WorkspaceBinding>());
+        auto& workspace = *state.workspaces.back();
+        assert(retain_handle(state.lua, workspace, "hyprworks.workspaces") == 1);
+        lua_setglobal(state.lua, "workspace");
+        script(R"(
+            workspace:on_status(function(connection)
+                assert(connection:close().id == "17")
+            end)
+            workspace:on_change(function() error("closed snapshot delivered") end)
+            workspace:on_result(function() error("closed result delivered") end)
+        )");
+        workspace.result = native::SwitchResult{17, native::SwitchOutcome::cancelled, false, {}};
+        assert(dispatch_workspaces(state.lua, state) == 0);
+        assert(workspace.closed && !workspace.result && lua_gettop(state.lua) == 0);
+        state.closing = true;
+        lua_close(state.lua); state.lua = nullptr;
+    }
     auto path = (std::filesystem::temp_directory_path() / "hyprworks-invocation-XXXXXX").string();
     const int script = mkstemp(path.data());
     assert(script >= 0);
@@ -133,5 +199,5 @@ int main() {
         assert(process.result()->stdout_text == "ready");
     }
     close(pipe[0]); close(pipe[1]); close(script); unlink(path.c_str());
-    std::cout << "Invocation core: interruption, saturated wake pipe, termination precedence, cross-thread requests, callback failure and stale readiness passed\n";
+    std::cout << "Invocation core: finalizer reentrancy, result ownership, interruption, saturated wake pipe, termination precedence, cross-thread requests, callback failure and stale readiness passed\n";
 }

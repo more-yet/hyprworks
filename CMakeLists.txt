@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.5)
-project(hyprworks VERSION 0.1.8 LANGUAGES CXX)
+project(hyprworks VERSION 0.1.9 LANGUAGES CXX)
 
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
@@ -100,7 +100,8 @@ if(HYPRWORKS_BUILD_LUA)
     if(HYPRWORKS_BUILD_TESTS)
         enable_testing()
         add_executable(hyprworks-invocation-core tests/invocation_core.cpp)
-        target_link_libraries(hyprworks-invocation-core PRIVATE hyprworks-lua Threads::Threads)
+        target_link_libraries(hyprworks-invocation-core PRIVATE hyprworks-lua PkgConfig::HYPRWORKS_lua Threads::Threads)
+        target_compile_definitions(hyprworks-invocation-core PRIVATE $<$<BOOL:${HYPRWORKS_BUILD_GUI}>:HYPRWORKS_HAS_GUI>)
         target_compile_options(hyprworks-invocation-core PRIVATE -UNDEBUG -Wall -Wextra -Wpedantic)
         add_test(NAME invocation-core COMMAND hyprworks-invocation-core)
         set_tests_properties(invocation-core PROPERTIES TIMEOUT 15)
@@ -191,6 +192,12 @@ if(HYPRWORKS_BUILD_LUA)
         configure_file(cmake/hyprworks.service.in hyprworks.service @ONLY)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/hyprworks.service"
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/user")
+        if(HYPRWORKS_BUILD_POLKIT)
+            configure_file(cmake/hyprworks-polkit.service.in hyprworks-polkit.service @ONLY)
+            install(FILES "${CMAKE_CURRENT_BINARY_DIR}/hyprworks-polkit.service"
+                DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/user")
+            install(FILES share/polkit-agent.lua DESTINATION "${CMAKE_INSTALL_DATADIR}/hyprworks")
+        endif()
     endif()
 endif()
 

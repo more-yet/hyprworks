@@ -27,7 +27,8 @@ holds its owning invocation for callbacks, shutdown requests and wakeups.
 `CMakeLists.txt` selects native integrations, then builds the optional Lua
 library and CLI. Wayland scanner generates protocol bindings from the installed
 and repository XML definitions. Installed CMake targets expose the native and
-Lua libraries; the user service starts the CLI and sends SIGHUP for reload.
+Lua libraries; user services start the CLI and send SIGHUP for reload.
+The manually enabled Polkit service loads the installed standalone Lua prompt.
 
 ## Entry, scheduling and shutdown
 
@@ -56,7 +57,7 @@ backpressure adds write readiness.
 | `mpris.cpp` | Subscribe → list names → resolve owners → root/player properties → snapshot; action → owned async call → result | Owner changes invalidate targets and outstanding actions. Per-player failures stay with the player record. Transport failures complete pending actions and disconnect. |
 | `tray.cpp` | Subscribe/acquire optional watcher → resolve watcher → register host → list items → resolve owners/properties → snapshot | Registration ownership is checked against the sender. Removed owners retire items and requests. Item failures remain in records; watcher absence publishes unavailable state. |
 | `dbusmenu.cpp` | Subscribe to owner/layout/property changes → properties → recursive bounded layout → snapshot; show/event → async result | Refresh signals coalesce. Owner loss ends the connection. Activation requests have a bounded queue separate from command results. |
-| `dbus.cpp` | Lua values → typed body → native signature/value bounds → async call, subscription or export → owned events → Lua values | Calls cancel by ID. Exported methods retain their request until reply, error, expiration or close. Unknown/stale request IDs return operation errors. |
+| `dbus.cpp` | Typed body → validate and write bounded message → async call, subscription or export → owned events → Lua values | Calls cancel by ID. Exported methods retain their request until reply, error, expiration or close. Unknown/stale request IDs return operation errors. |
 | `notifications.cpp` | Acquire name → decode bounded notification → replace/append active record → event; deadline/action/close → removal and signal | String/binary/record budgets bound admission. Snapshot copies survive Lua finalizers. Name/transport failure releases the server; stop clears retained notifications/events. |
 | `commands.cpp` | Acquire name/export method → validate command/arguments → retain request and deadline → Lua callback → reply | Requests expire or receive a reply once. Callback errors stop the invocation. Close releases pending messages and bus resources. |
 | `polkit.cpp` | Discover login session → register over sd-bus → verify authority sender → retain one bounded request → UI identity choice → libpolkit-agent session → prompt/response → completion | Native code retries up to three attempts. Request/prompt IDs reject stale responses. Cancellation, deadline, authority loss and shutdown disconnect helper signals before releasing the session and retained D-Bus call. |
@@ -66,6 +67,10 @@ Observers publish complete `shared_ptr<const Snapshot>` values. Lua conversion
 holds that publication through allocation and finalization. Actions validate
 their target against current published state. Native validation also serves
 direct C++ callers.
+
+D-Bus calls and replies share one body-writing pass. Reply signatures come from
+the completed message; a rejected candidate leaves the incoming request available
+for another reply. Dispatch retires completed outgoing requests before delivery.
 
 Status, change and result delivery are explicit, in that order. A pending action
 result remains with its binding through earlier callbacks, allowing `close()`
@@ -119,8 +124,11 @@ also rejects embedded NUL bytes, combining both checks in one scan.
 
 Focus mutation and tree commit establish that a focused index names an enabled,
 focusable element. Disabling it clears focus. Input, IME and painting consume
-that invariant. Buffer retirement removes idle buffers with obsolete dimensions
-before render selects a writable buffer.
+that invariant. Element handles originate from live indices; structural mutations
+advance the tree revision before those handles can be reused. Image admission,
+decoding and capture scaling establish dimensions before pixel allocation.
+Buffer retirement removes idle buffers with obsolete dimensions before render
+selects a writable buffer.
 
 Native wait generations and descriptor identities protect different cases:
 generations reject old turns, while descriptors distinguish connections whose
@@ -152,11 +160,13 @@ the connection that owns its recovery state.
 | One invocation thread and a bounded image worker | Native readiness precedes direct, ordered Lua delivery; mutable UI state has one owner | Desktop scans/launch, serial service queries and PAM/helper operations can delay that thread |
 | Concrete connections and stable binding storage | Transport errors and teardown stay with their resource owner; Lua finalizers retain valid storage | Similar scheduling and marshalling code remains explicit for each integration |
 | Validation at ingress and mutation | Input processing uses an already-resolved surface; workers consume admitted image payloads | Every producer must preserve those invariants; callbacks and asynchronous completion require fresh ownership checks |
+| D-Bus body validation during encoding | Calls and replies share bounds and avoid a separate signature string/pass | Reply signature mismatches are detected after bounded message construction; the request remains available |
 | Borrowed editor text during synchronous replacement | IME commits and retained selections avoid temporary string copies | Views remain local to replacement; retained publications and asynchronous transfers own their data |
 | GUI-owned captures with independent delivered images | Window/workspace capture share scheduling and budgets; retained frames survive buffer reuse | Scaling runs synchronously and delivered images have separate memory accounting |
 | Level-triggered polling for desktop watches | Unread inotify events drive the next bounded batch directly | Buffered transports such as sd-bus still track pending userspace work |
 
-Core checks cover callback/finalizer reentrancy, cancellation, stale readiness,
+The invocation checks cover callback/finalizer reentrancy, result ownership,
+cancellation and stale readiness in GUI and headless builds. GUI checks cover
 tree transactions, retained layout versus fresh layout, delayed buffer repair,
 capture constraint changes/retries, retained frames, workspace removal,
 clipboard transport and worker publication. Image checks use a vector-sized

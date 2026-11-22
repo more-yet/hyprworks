@@ -215,7 +215,7 @@ and `ext-image-copy-capture-v1`, as provided by Hyprland 0.57.2.
 | [`src/gui/images.cpp`](src/gui/images.cpp) and [`icons.cpp`](src/gui/icons.cpp) | Image worker, storage accounting and icon lookup |
 | [`src/gui/windows.cpp`](src/gui/windows.cpp) | Synchronized window observation and shared window/workspace capture |
 | [`src/runner.cpp`](src/runner.cpp) | CLI configuration, process signals and reload loop |
-| [`protocols/`](protocols/) and [`cmake/`](cmake/) | Wayland definitions, installed targets and user service |
+| [`protocols/`](protocols/), [`cmake/`](cmake/) and [`share/`](share/) | Wayland definitions, installed targets, user services and default Polkit prompt |
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) for end-to-end execution paths,
 failure/cancellation branches, ownership and simplification tradeoffs.
@@ -228,9 +228,10 @@ the binding, and UI interaction state with the surface. Validate at ingress and
 mutation boundaries; consumers rely on the resulting invariants. Revalidate
 identities across callbacks, Lua allocation and asynchronous completion.
 
-The core checks exercise invocation teardown, callback-driven mutation,
-transactional replacement, clipboard ownership and image-worker synchronization.
-Live checks run against their corresponding desktop services:
+The invocation checks cover teardown, finalizer/callback mutation and result
+ownership in GUI and headless builds. GUI checks cover transactional replacement,
+clipboard ownership and image-worker synchronization. Live checks run against
+their corresponding desktop services:
 
 ```sh
 build/local/hyprworks --config tests/gui.lua
@@ -262,3 +263,10 @@ Set `CMAKE_INSTALL_PREFIX` for installation, then use `cmake --install`.
 Packages stage the same install with `DESTDIR`. The installed
 `hyprworks.service` follows the graphical session and supports
 `systemctl --user reload hyprworks.service`.
+
+GUI builds with Polkit also install `hyprworks-polkit.service` and a standalone
+Lua prompt at `/usr/share/hyprworks/polkit-agent.lua` (under the configured install
+prefix). The service loads this packaged default, including account selection,
+masked input and cancellation. Enable it manually with
+`systemctl --user enable --now hyprworks-polkit.service`. A service drop-in can
+override `ExecStart` to use a custom Lua entry file.

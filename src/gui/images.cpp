@@ -133,8 +133,7 @@ void Image::set_data(std::string_view data) {
 }
 
 void Image::allocate() {
-    if (width < 1 || height < 1 || width > 4096 || height > 4096)
-        throw std::runtime_error("image dimensions must be in 1..4096");
+    assert(width > 0 && width <= 4096 && height > 0 && height <= 4096 && !surface);
     reserve(*this, static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
     surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
     if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS)

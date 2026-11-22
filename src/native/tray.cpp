@@ -92,7 +92,7 @@ struct TrayConnection::State {
     unsigned installed = 0;
     enum class Step { watcher_owner, register_host, list, item_owner, item_properties } step = Step::watcher_owner;
     bool own = false, acquired = false, more = false;
-    std::string watcher_owner, host_name;
+    std::string watcher_owner;
     std::optional<Clock::time_point> deadline, refresh_at;
     std::exception_ptr callback_error;
     std::vector<ItemKey> registrations, hosts;
@@ -131,8 +131,13 @@ struct TrayConnection::State {
             owner ? "org.freedesktop.DBus" : step == Step::register_host ? watcher : properties,
             owner ? "GetNameOwner" : step == Step::register_host ? "RegisterStatusNotifierHost" : step == Step::list ? "Get" : "GetAll");
         if (step == Step::list) check(sd_bus_message_append(message.get(), "ss", watcher, "RegisteredStatusNotifierItems"));
+        else if (step == Step::register_host) {
+            const char* name;
+            check(sd_bus_get_unique_name(bus, &name));
+            check(sd_bus_message_append(message.get(), "s", name));
+        }
         else check(sd_bus_message_append(message.get(), "s", step == Step::watcher_owner ? watcher : step == Step::item_owner ? pending.items[item].key.service.c_str() :
-                                            step == Step::register_host ? host_name.c_str() : item_interface));
+                                            item_interface));
         check(sd_bus_call_async(bus, &query, message.get(), reply, this, 2000000));
     }
     void next_item() {
@@ -426,7 +431,6 @@ Update TrayConnection::dispatch(const WaitSet& ready) {
         const auto now = Clock::now();
         if (state.deadline && now >= *state.deadline) throw std::runtime_error("tray synchronization timed out");
         if (state.refresh_at && !state.query && state.installed == 4 && state.acquired && now >= *state.refresh_at) {
-            const char* unique; check(sd_bus_get_unique_name(state.bus, &unique)); state.host_name = unique;
             state.refresh_at.reset(); state.pending = {}; state.item = state.bytes = state.binary = 0;
             state.step = State::Step::watcher_owner; state.status = {Phase::synchronizing, {}};
             if (!state.deadline) state.deadline = now + std::chrono::seconds(10);

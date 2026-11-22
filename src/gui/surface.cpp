@@ -196,7 +196,7 @@ static Handle handle(lua_State* lua, int index, const char* type) {
 static Surface& live_surface(Gui& gui, Handle value) {
     auto* surface = find_surface(gui, value.surface);
     if (!surface) throw std::runtime_error("surface is closed");
-    if (value.element >= 0 && (value.revision != surface->revision || static_cast<std::size_t>(value.element) >= surface->elements.size()))
+    if (value.element >= 0 && value.revision != surface->revision)
         throw std::runtime_error("element belongs to a replaced tree");
     return *surface;
 }

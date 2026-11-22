@@ -139,7 +139,7 @@ int main(int argc, char**) {
     auto& surface = *gui.surfaces[0];
     surface.gui = &gui; surface.id = ++gui.next_surface;
     surface.width = 320; surface.height = 160; surface.configured = true;
-    lua_newtable(state.lua); open_gui(state.lua); register_host(state.lua); register_workspaces(state.lua);
+    lua_newtable(state.lua); open_gui(state.lua);
     register_windows(state.lua); lua_setglobal(state.lua, "hw");
     push_handle(state.lua, {1, 0, -1}, surface_type); lua_setglobal(state.lua, "surface");
     const auto script = [&](const char* source) {
@@ -147,58 +147,6 @@ int main(int argc, char**) {
             std::cerr << lua_tostring(state.lua, -1) << '\n'; std::abort();
         }
     };
-
-    script(R"(
-        collectgarbage("stop")
-        delivered, finalized = 0, 0
-        callback_timer = hw.timer(0, function() error("obsolete callback delivered") end)
-        local garbage = setmetatable({}, {__gc = function()
-            finalized = finalized + 1
-            callback_timer:on_tick(function(timer, ticks)
-                assert(timer == callback_timer and ticks == 1)
-                delivered = delivered + 1
-            end)
-        end})
-    )");
-    auto& callback_timer = *state.timers.back();
-    assert(dispatch_callback(state.lua, callback_timer, callback_timer.callback, callback_timer.generation, [](lua_State* lua) {
-        lua_gc(lua, LUA_GCCOLLECT);
-        lua_pushinteger(lua, 1);
-        return 1;
-    }) == 0);
-    assert(lua_gettop(state.lua) == 0);
-    script("assert(finalized == 1 and delivered == 0)");
-    callback_timer.pending = 1;
-    assert(dispatch_utilities(state.lua, state) == 0);
-    script(R"(
-        assert(delivered == 1)
-        local garbage = setmetatable({}, {__gc = function()
-            finalized = finalized + 1
-            callback_timer:close()
-        end})
-    )");
-    assert(dispatch_callback(state.lua, callback_timer, callback_timer.callback, callback_timer.generation, [](lua_State* lua) {
-        lua_gc(lua, LUA_GCCOLLECT);
-        lua_pushinteger(lua, 1);
-        return 1;
-    }) == 0);
-    assert(callback_timer.closed && lua_gettop(state.lua) == 0);
-    script("assert(finalized == 2 and delivered == 1); collectgarbage('restart')");
-
-    state.workspaces.push_back(std::make_unique<WorkspaceBinding>());
-    auto& workspace = *state.workspaces.back();
-    assert(retain_handle(state.lua, workspace, "hyprworks.workspaces") == 1);
-    lua_setglobal(state.lua, "workspace");
-    script(R"(
-        workspace:on_status(function(connection)
-            assert(connection:close().id == "17")
-        end)
-        workspace:on_change(function() error("closed snapshot delivered") end)
-        workspace:on_result(function() error("closed result delivered") end)
-    )");
-    workspace.result = native::SwitchResult{17, native::SwitchOutcome::cancelled, false, {}};
-    assert(dispatch_workspaces(state.lua, state) == 0);
-    assert(workspace.closed && !workspace.result && lua_gettop(state.lua) == 0);
 
     script(R"(
         notifications = 0

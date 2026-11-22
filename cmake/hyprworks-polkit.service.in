@@ -1,0 +1,16 @@
+[Unit]
+Description=Hyprworks Polkit authentication agent
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=exec
+ExecStart="@CMAKE_INSTALL_FULL_BINDIR@/hyprworks" --config "@CMAKE_INSTALL_FULL_DATADIR@/hyprworks/polkit-agent.lua"
+ExecReload=/usr/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

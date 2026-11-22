@@ -10,23 +10,7 @@ local window = assert(hw.window {
     end,
 })
 
-local function content(label)
-    return {
-        kind = "column", gap = 4, padding = 8, background = "#20242aff",
-        children = {
-            {kind = "text", id = "label", text = label},
-            {kind = "input", id = "entry", text = "Unicode: é — العربية"},
-            {kind = "row", children = {
-                {kind = "button", text = "Action"},
-                {kind = "toggle", text = "Toggle"},
-                {kind = "slider", id = "slider", value = 0.5, grow = 1},
-            }},
-        },
-    }
-end
-
-assert(window:set_content(content("original")))
-assert(window:find("entry"):focus())
+assert(window:set_content {kind = "text", text = "Lifecycle check", background = "#20242aff"})
 
 local obsolete = assert(hw.window {width = 32, height = 32})
 assert(obsolete:set_content {
@@ -60,9 +44,7 @@ hw.timer(50, function(timer)
         end
     elseif cycles == 2 then
         assert(window:close())
-        assert(window:close())
         assert(popup:state().closed)
-        assert(not window:set_content(content("closed")))
         if layer then layer:close() end
         image:close()
     elseif cycles < 45 then
