@@ -435,8 +435,7 @@ void properties(lua_State* lua, int table, Element& element, Gui& gui) {
             field(lua, -1, "data");
             if (!lua_isnil(lua, -1)) {
                 std::size_t length; const char* bytes = luaL_checklstring(lua, -1, &length);
-                image.reserve_input(length);
-                image.encoded.assign(bytes, length);
+                image.set_data({bytes, length});
             }
             lua_pop(lua, 1);
             if (int(!image.path.empty()) + int(!image.icon.empty()) + int(!image.encoded.empty()) != 1)

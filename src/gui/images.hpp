@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <cairo.h>
 
@@ -24,7 +25,7 @@ struct Image {
     std::atomic<bool> ready{false};
     explicit Image(ImageWork& owner) : work(owner) {}
     void allocate();
-    void reserve_input(std::size_t size);
+    void set_data(std::string_view data);
     ~Image();
 };
 

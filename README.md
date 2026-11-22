@@ -93,6 +93,49 @@ failures return `nil, error`; malformed arguments raise Lua errors.
 The [live fixtures](tests/) demonstrate surface lifecycle, window capture and
 asynchronous D-Bus request ownership.
 
+### Workspace captures
+
+`hw.capabilities().workspace_capture` reports native workspace-capture support.
+In a GUI invocation, capture a normal workspace by its display name and output:
+
+```lua
+local capture = assert(hw.hyprland.capture_workspace({
+    name = "1", output = "DP-1", mode = "everything",
+    max_width = 320, max_height = 180, max_fps = 1,
+}, function(handle, event)
+    if event.kind == "frame" then
+        preview:set {source = event.source}
+    else
+        handle:close()
+    end
+end))
+```
+
+The compositor renders active and inactive workspaces. `mode = "windows_only"`
+(the default) includes windows and decorations over transparency; `"everything"`
+also includes the output's wallpaper, panels, pinned windows and layer surfaces.
+This includes preview UI on that output unless the compositor excludes it.
+Matching uses the workspace's current name and output, rejects ambiguous names,
+and then retains the native workspace identity across renames and moves.
+
+Frames use the same immutable image sources and event fields as window captures:
+`source`, `width`, `height`, `source_width`, `source_height`. Terminal events are
+`"unavailable"` or `"error"` with an `error` string. `capture:close()` cancels
+delivery and releases the session; already delivered image sources remain valid.
+Workspace removal ends capture with `"unavailable"`. Workspace captures remain
+active across window-catalog restarts and closure.
+
+Window and workspace captures share eight active slots and 128 MiB of capture
+buffers per invocation, with a 64 MiB per-buffer limit. Dimensions default to
+448×252 and are bounded to 1–1024; `max_fps` defaults to 1 and accepts 1–30.
+Frames preserve aspect ratio and are downscaled after capture: these dimensions
+bound delivered images, while compositor buffers retain their native size.
+Retained frame sources share the image subsystem's separate 128 MiB budget.
+Release captures when their previews leave the viewport.
+
+This requires `ext-workspace-v1`, `hyprland-workspace-image-capture-source-v1`
+and `ext-image-copy-capture-v1`, as provided by Hyprland 0.57.2.
+
 ## Find the code
 
 | Path | Responsibility |
@@ -107,7 +150,7 @@ asynchronous D-Bus request ownership.
 | [`src/gui/input.cpp`](src/gui/input.cpp) | Seat events, editing, clipboard transfers and input delivery |
 | [`src/gui/render.cpp`](src/gui/render.cpp) | Text geometry, layout, painting and presentation buffers |
 | [`src/gui/images.cpp`](src/gui/images.cpp) and [`icons.cpp`](src/gui/icons.cpp) | Image worker, storage accounting and icon lookup |
-| [`src/gui/windows.cpp`](src/gui/windows.cpp) | Synchronized window observation and capture |
+| [`src/gui/windows.cpp`](src/gui/windows.cpp) | Synchronized window observation and shared window/workspace capture |
 | [`src/runner.cpp`](src/runner.cpp) | CLI configuration, process signals and reload loop |
 | [`protocols/`](protocols/) and [`cmake/`](cmake/) | Wayland definitions, installed targets and user service |
 
@@ -129,6 +172,7 @@ Live checks run against their corresponding desktop services:
 ```sh
 build/local/hyprworks --config tests/gui.lua
 build/local/hyprworks --config tests/windows.lua
+build/local/hyprworks --config tests/workspace_capture.lua
 dbus-run-session -- build/local/hyprworks --headless --config tests/dbus.lua
 ```
 

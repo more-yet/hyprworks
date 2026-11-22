@@ -12,7 +12,7 @@ CLI: signals and reload loop
     └── Gui: display, globals, outputs, seats
         ├── surfaces: element arrays, focus, presses, editor state
         ├── presentation buffers and clipboard transfers
-        ├── window catalog and captures
+        ├── window catalog, workspace targets and shared captures
         └── image worker, queue and icon cache
 ```
 
@@ -101,7 +101,7 @@ Event batches transfer to local storage before callbacks can mutate the owner.
 | Presentation | Damage → configured/frame-ready surface → reusable buffer or bounded allocation → repair region → attach/commit | Busy buffers accumulate repair metadata and remain immutable. Release permits reuse; capacity exhaustion waits. GUI retirement collects orphaned buffers once per turn; render retires resized buffers for its own surface. |
 | `images.cpp`, `icons.cpp` | Account source → bounded queue → cached icon lookup → decode/premultiply → release/acquire completion → invalidate layout and notify | Superseded jobs are discarded. Queue exhaustion retries after completion wakes the loop. Errors publish with the image. Shutdown joins the worker before releasing its owner. |
 | `windows.cpp`: catalog | Foreign-toplevel events → coalesced Hyprland query → Wayland synchronization → generation comparison → immutable records | A changed invalidation generation schedules another query. Session/generation identity prevents old targets from addressing restarted subscriptions. |
-| Window capture | Resolve published identity → create session → collect constraints → allocate buffer → request frame → scale into independent image → callback | Validate constraints on buffer replacement. Changed constraints discard an incompatible completion; bounded retries handle constraint failures. Frame/rate deadlines pace requests. Close releases protocol/storage ownership while delivered images retain their pixels. |
+| Window/workspace capture | Resolve published window identity or completed workspace name/output → create session → collect constraints → allocate buffer → request frame → scale into independent image → callback | GUI owns the shared eight-slot/128 MiB budget. Workspace targets belong to its Wayland connection; catalog closure cancels only its window captures. Workspace removal and protocol loss deliver terminal unavailability. Changed constraints discard incompatible completions; bounded retries handle constraint failures. Close releases protocol/storage ownership while delivered images retain their pixels. |
 
 Layout calls at input, callback and presentation boundaries share a dirty gate.
 Intermediate callbacks can change geometry, so those calls observe distinct
@@ -146,6 +146,11 @@ the connection that owns its recovery state.
 | Direct ordered callback calls | Removes synthetic event entries, kind switches and repeated selection branches | A few similar calls remain beside each binding's concrete payload conversion |
 | Resolve action handles after parsing | Uses one current handle check after argument conversion and its possible finalizers | Malformed arguments can be reported before a closed-handle error |
 | Validation at mutation/allocation boundaries | Skips retained-string scans, duplicate editor validation and per-frame constraint checks | Each owner must preserve the established invariant until the next mutation |
+| Image data admission owns accounting and copying | Queue submission only admits already-accounted work; retries reuse the reservation | Internal producers use `Image::set_data` before submission |
+| One capture-constraint completion flag | The first event of a new batch clears the old format; `done` enables frame requests | Initial constraints start incomplete with an unset format |
+| GUI-owned capture sessions and budgets | Window and workspace capture share construction, scheduling, image delivery and teardown; workspace capture survives catalog closure | Source buffers and retained images have separate 128 MiB budgets; handles occupy capture slots until closed |
+| Workspace proxies carry their target/group state | Group events update the associated target directly; completed name/output state resolves new captures | Protocol ordering guarantees workspace leaves before group removal; Lua construction revalidates ownership after allocation |
+| Single capture buffer with independent delivered images | The compositor can update the retained buffer while Lua and UI elements keep earlier frames | New or failed buffers request full damage; each completed frame is scaled synchronously into separately accounted immutable pixels |
 | Focus established by mutation and tree commit | Input, IME and painting share one definition of valid focus; debug assertions catch invalid internal assignments | Future focus-changing paths must maintain the same invariant |
 | Clipboard validation at Lua ingress | Editor selection copies reuse validated UTF-8 boundaries; both paths copy directly into seat-owned storage | Borrowed views remain local to the synchronous copy |
 | GUI functions receive their concrete owner | Invocation scheduling selects the optional GUI; each GUI phase receives its owner directly | GUI functions require a live owner supplied by their caller |
@@ -155,6 +160,7 @@ the connection that owns its recovery state.
 
 Core checks cover callback/finalizer reentrancy, cancellation, stale readiness,
 tree transactions, retained layout versus fresh layout, delayed buffer repair,
+capture constraint changes/retries, retained frames, workspace removal,
 clipboard transport and worker publication. Image checks use a vector-sized
 block plus a scalar tail through raw RGB/RGBA and in-place PNG conversion.
 Live fixtures cover Wayland and D-Bus boundaries.

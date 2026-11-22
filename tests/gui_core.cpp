@@ -24,14 +24,16 @@ int main(int argc, char**) {
         std::vector<std::shared_ptr<Image>> pending;
         for (int i = 0; i < 33; ++i) {
             auto job = std::make_shared<Image>(work);
-            job->encoded.assign("\xff\0\0\x80", 4);
+            job->set_data({"\xff\0\0\x80", 4});
             job->width = job->height = 1; job->channels = 4;
             assert(work.submit(job) == (i < 32));
             pending.push_back(std::move(job));
         }
+        assert(work.bytes.load() == 33 * 4);
         auto image = pending.back();
         pending.clear();
         assert(work.submit(image));
+        assert(work.bytes.load() == 4);
         work.start(wake);
         const auto deadline = Clock::now() + std::chrono::seconds(3);
         while (!image->ready.load(std::memory_order_acquire)) {
@@ -59,15 +61,15 @@ int main(int argc, char**) {
             }
             auto decoded = std::make_shared<Image>(work);
             decoded->width = 5; decoded->height = 1; decoded->channels = channels;
-            if (channels) decoded->encoded = source;
+            if (channels) decoded->set_data(source);
             else {
                 png_image png{};
                 png.version = PNG_IMAGE_VERSION; png.width = 5; png.height = 1; png.format = PNG_FORMAT_RGBA;
                 png_alloc_size_t size = 0;
                 assert(png_image_write_to_memory(&png, nullptr, &size, 0, source.data(), 0, nullptr));
-                decoded->encoded.resize(size);
-                assert(png_image_write_to_memory(&png, decoded->encoded.data(), &size, 0, source.data(), 0, nullptr));
-                decoded->encoded.resize(size);
+                std::string encoded(size, '\0');
+                assert(png_image_write_to_memory(&png, encoded.data(), &size, 0, source.data(), 0, nullptr));
+                decoded->set_data(std::string_view(encoded).substr(0, size));
                 png_image_free(&png);
             }
             assert(work.submit(decoded));
@@ -89,7 +91,7 @@ int main(int argc, char**) {
         }
         for (int i = 0; i < 200; ++i) {
             auto job = std::make_shared<Image>(work);
-            job->encoded.assign("\xff\0\0\xff", 4);
+            job->set_data({"\xff\0\0\xff", 4});
             job->width = job->height = 1; job->channels = 4;
             assert(work.submit(job));
         }
@@ -99,7 +101,7 @@ int main(int argc, char**) {
         while (read(wake, &value, sizeof(value)) > 0) {}
         ImageWork canceled;
         auto abandoned = std::make_shared<Image>(canceled);
-        abandoned->encoded.assign(4, '\0');
+        abandoned->set_data({"\0\0\0\0", 4});
         assert(canceled.submit(abandoned));
         abandoned.reset();
         canceled.start(wake);
@@ -137,7 +139,8 @@ int main(int argc, char**) {
     auto& surface = *gui.surfaces[0];
     surface.gui = &gui; surface.id = ++gui.next_surface;
     surface.width = 320; surface.height = 160; surface.configured = true;
-    lua_newtable(state.lua); open_gui(state.lua); register_host(state.lua); register_workspaces(state.lua); lua_setglobal(state.lua, "hw");
+    lua_newtable(state.lua); open_gui(state.lua); register_host(state.lua); register_workspaces(state.lua);
+    register_windows(state.lua); lua_setglobal(state.lua, "hw");
     push_handle(state.lua, {1, 0, -1}, surface_type); lua_setglobal(state.lua, "surface");
     const auto script = [&](const char* source) {
         if (luaL_dostring(state.lua, source) != LUA_OK) {
@@ -786,6 +789,13 @@ int main(int argc, char**) {
         close(sockets[1]);
         finish_query();
         assert(!catalog.change_pending && catalog.revision == 1 && catalog.records == published);
+        auto window_capture = std::make_shared<Capture>();
+        window_capture->gui = &gui; window_capture->catalog = &catalog;
+        auto workspace_capture = std::make_shared<Capture>();
+        workspace_capture->gui = &gui;
+        workspace_capture->next_frame = Clock::now();
+        workspace_capture->constraints = true;
+        gui.captures[0] = window_capture; gui.captures[1] = workspace_capture;
         wait = begin_query();
         assert(write(sockets[1], "invalid", 7) == 7);
         close(sockets[1]);
@@ -793,7 +803,132 @@ int main(int argc, char**) {
         assert(catalog.phase == WindowCatalog::Phase::failed && !catalog.records);
         assert(published->front().id == "session:1:abc" && published->front().width == 640);
         assert(catalog.change_pending && catalog.status_pending);
+        assert(window_capture->pending && window_capture->unavailable && window_capture->catalog == nullptr);
+        assert(!workspace_capture->closed && !workspace_capture->error && workspace_capture->next_frame);
+        WaitSet capture_wait;
+        prepare_captures(gui, capture_wait);
+        assert(capture_wait.deadline == Clock::time_point::min());
         close_windows(catalog);
+        assert(!workspace_capture->closed && window_capture->pending);
+        close_captures(gui);
+        assert(workspace_capture->closed && window_capture->closed && !gui.captures[0] && !gui.captures[1]);
+        auto* registry = wl_display_get_registry(gui.display);
+        bind_captures(gui, registry, 91, "ext_image_copy_capture_manager_v1");
+        bind_captures(gui, registry, 92, "hyprland_workspace_image_capture_source_manager_v1");
+        bind_captures(gui, registry, 93, "ext_workspace_manager_v1");
+        const auto manager_id = wl_proxy_get_id(reinterpret_cast<wl_proxy*>(gui.capture_workspaces));
+        const std::uint32_t target_events[] = {
+            manager_id, 12u << 16, 0xff000000u,
+            manager_id, (12u << 16) | 1u, 0xff000001u,
+        };
+        assert(write(wayland[1], target_events, sizeof(target_events)) == sizeof(target_events));
+        assert(wl_display_dispatch(gui.display) >= 0);
+        assert(gui.capture_groups.size() == 1 && gui.capture_targets.size() == 1);
+        auto* group = gui.capture_groups.front().get();
+        auto* target = gui.capture_targets.front().get();
+        const auto& group_events = *reinterpret_cast<const ext_workspace_group_handle_v1_listener*>(
+            wl_proxy_get_listener(reinterpret_cast<wl_proxy*>(group->native)));
+        const auto& workspace_events = *reinterpret_cast<const ext_workspace_handle_v1_listener*>(
+            wl_proxy_get_listener(reinterpret_cast<wl_proxy*>(target->native)));
+        const auto& manager_events = *reinterpret_cast<const ext_workspace_manager_v1_listener*>(
+            wl_proxy_get_listener(reinterpret_cast<wl_proxy*>(gui.capture_workspaces)));
+        auto& output = gui.outputs.emplace_back(std::make_unique<Output>());
+        output->id = 94; output->state.name = "screen";
+        output->native = reinterpret_cast<wl_output*>(wl_proxy_create(reinterpret_cast<wl_proxy*>(gui.display), &wl_output_interface));
+        gui.shm = reinterpret_cast<wl_shm*>(wl_proxy_create(reinterpret_cast<wl_proxy*>(gui.display), &wl_shm_interface));
+        assert(output->native && gui.shm);
+        group_events.output_enter(group, group->native, output->native);
+        group_events.workspace_enter(group, group->native, target->native);
+        workspace_events.name(target, target->native, "test");
+        script(R"(
+            capture_options = {name = "test", output = "screen", max_width = 8, max_height = 8}
+            capture_frames, capture_ended = 0, 0
+            function captured(handle, event)
+                if event.kind == "frame" then
+                    capture_frames = capture_frames + 1
+                    retained_source = retained_source or event.source
+                else
+                    assert(event.kind == "unavailable")
+                    capture_ended = capture_ended + 1
+                    handle:close()
+                end
+            end
+            assert(not hw.capture_workspace(capture_options, captured))
+        )");
+        manager_events.done(&gui, gui.capture_workspaces);
+        script("capture = assert(hw.capture_workspace(capture_options, captured))");
+        auto capture = gui.captures[0];
+        const auto& session_events = *reinterpret_cast<const ext_image_copy_capture_session_v1_listener*>(
+            wl_proxy_get_listener(reinterpret_cast<wl_proxy*>(capture->session)));
+        session_events.shm_format(capture.get(), capture->session, WL_SHM_FORMAT_ARGB8888);
+        session_events.buffer_size(capture.get(), capture->session, 8, 4);
+        session_events.shm_format(capture.get(), capture->session, WL_SHM_FORMAT_XRGB8888);
+        assert(!capture->constraints && capture->format == WL_SHM_FORMAT_ARGB8888);
+        session_events.done(capture.get(), capture->session);
+        assert(dispatch_captures(gui) == 0 && capture->frame && gui.capture_bytes == 128);
+        const auto& frame_events = *reinterpret_cast<const ext_image_copy_capture_frame_v1_listener*>(
+            wl_proxy_get_listener(reinterpret_cast<wl_proxy*>(capture->frame)));
+        std::fill_n(static_cast<std::uint32_t*>(capture->pixels), 32, 0x80402010u);
+        frame_events.ready(capture.get(), capture->frame);
+        assert(dispatch_captures(gui) == 0 && capture->image && !capture->deadline);
+        auto retained = capture->image;
+        const auto* retained_pixels = reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(retained->surface));
+        assert(retained_pixels[0] == 0x80402010u);
+        capture->next_frame = Clock::now();
+        assert(dispatch_captures(gui) == 0 && capture->frame);
+        session_events.buffer_size(capture.get(), capture->session, 4, 8);
+        assert(!capture->constraints && capture->format == UINT32_MAX);
+        frame_events.ready(capture.get(), capture->frame);
+        assert(dispatch_captures(gui) == 0 && !capture->frame && capture->image == retained);
+        script("assert(capture_frames == 1)");
+        session_events.shm_format(capture.get(), capture->session, WL_SHM_FORMAT_XRGB8888);
+        session_events.done(capture.get(), capture->session);
+        assert(dispatch_captures(gui) == 0 && capture->frame && capture->buffer_width == 4 && capture->buffer_height == 8);
+        for (unsigned failure = 1; failure <= 3; ++failure) {
+            frame_events.failed(capture.get(), capture->frame, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
+            assert(!capture->error && capture->constraint_failures == failure && capture->next_frame);
+            capture->next_frame = Clock::now();
+            assert(dispatch_captures(gui) == 0 && capture->frame);
+        }
+        std::fill_n(static_cast<std::uint32_t*>(capture->pixels), 32, 0x00204060u);
+        frame_events.ready(capture.get(), capture->frame);
+        assert(dispatch_captures(gui) == 0 && capture->image != retained && capture->constraint_failures == 0);
+        assert(*reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(capture->image->surface)) == 0xff204060u);
+        assert(retained_pixels[0] == 0x80402010u);
+        script("assert(capture_frames == 2)");
+        script(R"(
+            retry_capture = assert(hw.capture_workspace(capture_options, function(handle, event)
+                assert(event.kind == "error")
+                retry_failed = true
+                handle:close()
+            end))
+        )");
+        auto retry = gui.captures[1];
+        session_events.buffer_size(retry.get(), retry->session, 8, 4);
+        session_events.shm_format(retry.get(), retry->session, WL_SHM_FORMAT_ARGB8888);
+        session_events.done(retry.get(), retry->session);
+        for (unsigned failure = 1; failure <= 4; ++failure) {
+            retry->next_frame = Clock::now();
+            assert(dispatch_captures(gui) == 0 && retry->frame && gui.capture_bytes == 256);
+            frame_events.failed(retry.get(), retry->frame, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
+        }
+        assert(retry->pending && retry->error && !retry->session && gui.capture_bytes == 128);
+        assert(dispatch_captures(gui) == 0 && retry->closed);
+        script("assert(retry_failed); retry_capture = nil");
+        group_events.workspace_leave(group, group->native, target->native);
+        group_events.removed(group, group->native);
+        assert(!target->group && gui.capture_groups.empty());
+        workspace_events.removed(target, target->native);
+        assert(gui.capture_targets.empty() && capture->pending && capture->unavailable && gui.capture_bytes == 0);
+        assert(dispatch_captures(gui) == 0 && capture->closed);
+        script("assert(capture_ended == 1); capture = nil; retained_source = nil; collectgarbage('collect')");
+        assert(retained_pixels[0] == 0x80402010u);
+        retained.reset();
+        assert(gui.images.bytes.load() == 0);
+        close_captures(gui);
+        wl_shm_destroy(std::exchange(gui.shm, nullptr));
+        wl_output_destroy(output->native); gui.outputs.clear();
+        wl_registry_destroy(registry);
         surface.configured = false;
         script(R"(
             assert(surface:set_content {kind = "row", children = {

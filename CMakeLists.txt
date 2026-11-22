@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.5)
-project(hyprworks VERSION 0.1.6 LANGUAGES CXX)
+project(hyprworks VERSION 0.1.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
@@ -116,6 +116,8 @@ if(HYPRWORKS_BUILD_LUA)
             "${WAYLAND_PROTOCOLS_DIR}/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"
             "${WAYLAND_PROTOCOLS_DIR}/staging/ext-image-capture-source/ext-image-capture-source-v1.xml"
             "${WAYLAND_PROTOCOLS_DIR}/staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml"
+            "${WAYLAND_PROTOCOLS_DIR}/staging/ext-workspace/ext-workspace-v1.xml"
+            "${CMAKE_CURRENT_SOURCE_DIR}/protocols/hyprland-workspace-image-capture-source-v1.xml"
             "${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-layer-shell-unstable-v1.xml"
             "${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-foreign-toplevel-management-unstable-v1.xml"
             "${CMAKE_CURRENT_SOURCE_DIR}/protocols/hyprland-focus-grab-v1.xml")

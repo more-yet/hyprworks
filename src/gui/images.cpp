@@ -3,6 +3,7 @@
 #include <librsvg/rsvg.h>
 #include <png.h>
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -126,9 +127,11 @@ void decode(Image& image) {
 
 }
 
-void Image::reserve_input(std::size_t size) {
-    if (size > input_limit) throw std::runtime_error("image input exceeds 8 MiB");
-    reserve(*this, size);
+void Image::set_data(std::string_view data) {
+    assert(!submitted && !bytes);
+    if (data.size() > input_limit) throw std::runtime_error("image input exceeds 8 MiB");
+    reserve(*this, data.size());
+    encoded.assign(data);
 }
 
 void Image::allocate() {
@@ -146,11 +149,10 @@ Image::~Image() {
 }
 
 bool ImageWork::submit(const std::shared_ptr<Image>& image) {
+    assert(!image->submitted && image->bytes == image->encoded.size());
     std::lock_guard lock(mutex);
     std::erase_if(queue, [](const auto& job) { return job.use_count() == 1; });
     if (stopping || queue.size() >= 32) return false;
-    if (image->encoded.size() > input_limit) throw std::runtime_error("image input exceeds 8 MiB");
-    if (!image->bytes) image->reserve_input(image->encoded.size());
     queue.push_back(image);
     image->submitted = true;
     changed.notify_one();

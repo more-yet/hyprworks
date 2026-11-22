@@ -1,7 +1,6 @@
 #pragma once
 
 #include <chrono>
-#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,12 +12,15 @@
 #include "ext-foreign-toplevel-list-v1-client.h"
 #include "ext-image-capture-source-v1-client.h"
 #include "ext-image-copy-capture-v1-client.h"
+#include "ext-workspace-v1-client.h"
+#include "hyprland-workspace-image-capture-source-v1-client.h"
 
 namespace hyprworks::lua {
 
 struct Gui;
 struct WaitSet;
 struct WindowCatalog;
+struct WorkspaceCaptureGroup;
 struct Image;
 inline constexpr char captured_image_type[] = "hyprworks.captured_image";
 struct CaptureTarget {
@@ -26,8 +28,10 @@ struct CaptureTarget {
     ext_foreign_toplevel_handle_v1* native = nullptr;
     std::string id;
 };
-struct WindowCapture {
+struct Capture {
+    Gui* gui = nullptr;
     WindowCatalog* catalog = nullptr;
+    ext_workspace_handle_v1* workspace = nullptr;
     std::string capture_id;
     int callback = LUA_NOREF, handle = LUA_NOREF;
     ext_image_copy_capture_session_v1* session = nullptr;
@@ -43,7 +47,19 @@ struct WindowCapture {
     std::shared_ptr<Image> image;
     const char* error = nullptr;
     unsigned constraint_failures = 0;
-    bool closed = false, unavailable = false, constraints = false, collecting = false, ready = false, pending = false;
+    bool closed = false, unavailable = false, constraints = false, ready = false, pending = false;
+};
+struct WorkspaceCaptureTarget {
+    Gui* gui = nullptr;
+    ext_workspace_handle_v1* native = nullptr;
+    WorkspaceCaptureGroup* group = nullptr;
+    std::string name;
+    bool hidden = false;
+};
+struct WorkspaceCaptureGroup {
+    Gui* gui = nullptr;
+    ext_workspace_group_handle_v1* native = nullptr;
+    std::vector<wl_output*> outputs;
 };
 struct WindowRecord {
     std::string id, address, capture_id, app_class, title;
@@ -61,12 +77,9 @@ struct WindowCatalog {
     zwlr_foreign_toplevel_manager_v1* manager = nullptr;
     ext_foreign_toplevel_list_v1* capture_list = nullptr;
     ext_foreign_toplevel_image_capture_source_manager_v1* capture_sources = nullptr;
-    ext_image_copy_capture_manager_v1* capture_manager = nullptr;
-    std::uint32_t manager_name = 0, capture_list_name = 0, capture_sources_name = 0, capture_manager_name = 0;
+    std::uint32_t manager_name = 0, capture_list_name = 0, capture_sources_name = 0;
     std::vector<zwlr_foreign_toplevel_handle_v1*> signals;
     std::vector<std::unique_ptr<CaptureTarget>> targets;
-    std::array<std::shared_ptr<WindowCapture>, 8> captures;
-    std::size_t capture_bytes = 0;
     std::shared_ptr<const std::vector<WindowRecord>> records;
     std::string socket_path, identity_prefix, reply, error;
     const char* protocol_error = nullptr;
@@ -87,5 +100,10 @@ void close_windows(WindowCatalog& catalog) noexcept;
 void prepare_windows(WindowCatalog& catalog, WaitSet& wait);
 void read_windows(WindowCatalog& catalog, const WaitSet& wait);
 int dispatch_windows(WindowCatalog& catalog);
+void bind_captures(Gui& gui, wl_registry* registry, std::uint32_t name, const char* interface);
+void remove_capture_global(Gui& gui, std::uint32_t name);
+void close_captures(Gui& gui) noexcept;
+void prepare_captures(Gui& gui, WaitSet& wait);
+int dispatch_captures(Gui& gui);
 
 }

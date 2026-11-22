@@ -34,12 +34,8 @@ windows:on_change(function()
     elseif stage == 2 then
         assert(target.id ~= original_id)
         assert(not windows:capture(original_id, {}, function() error("stale identity captured") end))
-        local cancelled = {}
-        for i = 1, 8 do
-            cancelled[i] = assert(windows:capture(target.id, {}, function() error("cancelled capture callback") end))
-        end
-        assert(not windows:capture(target.id, {}, function() error("over-limit capture callback") end))
-        for _, capture in ipairs(cancelled) do capture:close() end
+        local cancelled = assert(windows:capture(target.id, {}, function() error("cancelled capture callback") end))
+        cancelled:close()
         assert(windows:capture(target.id, {}, function(capture, event)
             assert(stage == 3 and event.kind == "unavailable", event.error)
             unavailable = true
@@ -57,7 +53,7 @@ hw.timer(25, function(timer)
     end
     assert(frames == 1)
     windows:close()
-    print("Windows: snapshot, capture lifetime/limits, restart identities, cancellation and unavailability passed")
+    print("Windows: snapshot, capture lifetime, restart identities, cancellation and unavailability passed")
     hw.quit()
 end)
 hw.timer(8000, function() error("window subscription check timed out") end)

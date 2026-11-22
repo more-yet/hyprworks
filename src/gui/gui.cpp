@@ -91,6 +91,7 @@ const wl_registry_listener registry_listener{
             bind(gui.data, wl_data_device_manager_interface, 3, 3);
             bind(gui.focus_grabs, hyprland_focus_grab_manager_v1_interface, 1);
             bind(gui.output_manager, zxdg_output_manager_v1_interface, 3, 3);
+            bind_captures(gui, registry, name, interface);
             if (!std::strcmp(interface, wl_output_interface.name) && version >= 4) {
                 if (gui.outputs.size() >= 128) throw std::runtime_error("output limit reached");
                 auto& output = gui.outputs.emplace_back(std::make_unique<Output>());
@@ -118,6 +119,7 @@ const wl_registry_listener registry_listener{
     },
     .global_remove = [](void* data, wl_registry*, std::uint32_t name) {
         auto& gui = *static_cast<Gui*>(data);
+        remove_capture_global(gui, name);
         const auto removed_outputs = std::erase_if(gui.outputs, [&](auto& output) {
             if (output->id != name) return false;
             for (auto& surface : gui.surfaces) if (surface) {
@@ -233,7 +235,9 @@ int capabilities(lua_State* lua) {
     auto& gui = gui_state(lua);
     const bool layer = gui.layers, fraction = gui.fractions && gui.viewporter, ime = gui.text_input, clipboard = gui.data, grab = gui.focus_grabs;
     const bool logical = gui.output_manager;
-    lua_createtable(lua, 0, 7);
+    const bool workspace_capture = gui.capture_manager && gui.workspace_capture_manager && gui.capture_workspaces;
+    lua_createtable(lua, 0, 8);
+    lua_pushboolean(lua, workspace_capture); lua_setfield(lua, -2, "workspace_capture");
     lua_pushboolean(lua, layer); lua_setfield(lua, -2, "layer_shell");
     lua_pushboolean(lua, fraction); lua_setfield(lua, -2, "fractional_scale");
     lua_pushboolean(lua, ime); lua_setfield(lua, -2, "text_input");
@@ -280,6 +284,7 @@ void close_gui(Gui& gui) noexcept {
         close_windows(*gui.windows);
         unref(state.lua, gui.windows->on_change); unref(state.lua, gui.windows->on_status);
     }
+    close_captures(gui);
     for (auto& surface : gui.surfaces) if (surface) destroy_surface(*surface);
     for (auto& transfer : gui.transfers) {
         if (transfer.fd >= 0) close(transfer.fd);
@@ -346,6 +351,7 @@ void prepare_gui(Gui& gui, WaitSet& wait) {
         }
     }
     if (gui.windows) prepare_windows(*gui.windows, wait);
+    prepare_captures(gui, wait);
     if (wl_display_prepare_read(gui.display) == 0) gui.read_prepared = true;
     else deadline(Clock::time_point::min());
     if (wl_display_flush(gui.display) < 0) {
@@ -398,6 +404,7 @@ int dispatch_gui(Gui& gui) {
     for (auto& surface : gui.surfaces)
         if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
     if (gui.windows && dispatch_windows(*gui.windows) < 0) return -1;
+    if (dispatch_captures(gui) < 0) return -1;
     if (std::exchange(gui.outputs_pending, false) && notify(gui, 0, -1, gui.on_outputs) < 0) return -1;
     if (dispatch_input(gui) < 0) return -1;
     for (auto& surface : gui.surfaces)

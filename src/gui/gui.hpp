@@ -235,6 +235,15 @@ struct Gui {
     PangoContext* text_context = nullptr;
     std::array<std::unique_ptr<Surface>, 32> surfaces;
     std::unique_ptr<WindowCatalog> windows;
+    ext_image_copy_capture_manager_v1* capture_manager = nullptr;
+    hyprland_workspace_image_capture_source_manager_v1* workspace_capture_manager = nullptr;
+    ext_workspace_manager_v1* capture_workspaces = nullptr;
+    std::uint32_t capture_manager_name = 0, workspace_capture_manager_name = 0, capture_workspaces_name = 0;
+    std::vector<std::unique_ptr<WorkspaceCaptureTarget>> capture_targets;
+    std::vector<std::unique_ptr<WorkspaceCaptureGroup>> capture_groups;
+    std::array<std::shared_ptr<Capture>, 8> captures;
+    std::size_t capture_bytes = 0;
+    bool capture_workspaces_ready = false;
     std::vector<std::unique_ptr<Buffer>> buffers;
     std::vector<std::unique_ptr<Output>> outputs;
     std::vector<std::unique_ptr<Seat>> seats;

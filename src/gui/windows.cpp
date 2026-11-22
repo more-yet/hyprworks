@@ -16,7 +16,7 @@ namespace hyprworks::lua {
 namespace {
 
 constexpr char window_type[] = "hyprworks.hyprland.windows";
-constexpr char capture_type[] = "hyprworks.window_capture";
+constexpr char capture_type[] = "hyprworks.capture";
 constexpr std::size_t max_reply = 4 * 1024 * 1024, max_windows = 4096;
 constexpr std::size_t capture_limit = 128 * 1024 * 1024;
 constexpr std::string_view request = "[[BATCH]]j/clients;j/activewindow";
@@ -33,27 +33,28 @@ void close_query(WindowCatalog& catalog) {
     catalog.reply.clear();
 }
 
-void capture_error(WindowCapture& capture, const char* message, bool unavailable = false);
+void capture_error(Capture& capture, const char* message, bool unavailable = false);
 
 void fail(WindowCatalog& catalog, std::string message) {
-    auto captures = std::exchange(catalog.captures, {});
-    for (auto& capture : captures) if (capture) capture_error(*capture, "window catalog disconnected", true);
+    for (auto& capture : catalog.gui->captures) if (capture && capture->catalog == &catalog && !capture->closed) {
+        capture_error(*capture, "window catalog disconnected", true);
+        capture->catalog = nullptr;
+    }
     close_windows(catalog);
-    catalog.captures = std::move(captures);
     catalog.phase = WindowCatalog::Phase::failed;
     catalog.closed = false;
     catalog.error = std::move(message);
     catalog.change_pending = catalog.status_pending = true;
 }
 
-void release_buffer(WindowCapture& capture) {
+void release_buffer(Capture& capture) {
     if (capture.buffer) wl_buffer_destroy(std::exchange(capture.buffer, nullptr));
     if (capture.pixels) munmap(std::exchange(capture.pixels, nullptr), capture.bytes);
-    capture.catalog->capture_bytes -= capture.bytes;
+    capture.gui->capture_bytes -= capture.bytes;
     capture.bytes = 0;
 }
 
-void stop_capture(WindowCapture& capture) {
+void stop_capture(Capture& capture) {
     if (capture.frame) ext_image_copy_capture_frame_v1_destroy(std::exchange(capture.frame, nullptr));
     if (capture.session) ext_image_copy_capture_session_v1_destroy(std::exchange(capture.session, nullptr));
     release_buffer(capture);
@@ -61,16 +62,17 @@ void stop_capture(WindowCapture& capture) {
     capture.ready = capture.pending = false;
 }
 
-void close_capture(WindowCapture& capture) {
+void close_capture(Capture& capture) {
     if (capture.closed) return;
     stop_capture(capture); capture.closed = true;
-    auto* lua = capture.catalog->gui->owner.lua;
+    auto* lua = capture.gui->owner.lua;
     unref(lua, capture.callback); unref(lua, capture.handle);
 }
 
-void capture_error(WindowCapture& capture, const char* message, bool unavailable) {
-    if (capture.closed) return;
+void capture_error(Capture& capture, const char* message, bool unavailable) {
+    if (capture.closed || capture.error) return;
     stop_capture(capture);
+    capture.workspace = nullptr;
     capture.error = message; capture.unavailable = unavailable; capture.pending = true;
 }
 
@@ -78,8 +80,9 @@ const ext_foreign_toplevel_handle_v1_listener target_listener{
     .closed = [](void* data, auto* native) {
         auto& target = *static_cast<CaptureTarget*>(data);
         auto& catalog = *target.catalog;
-        for (auto& capture : catalog.captures)
-            if (capture && capture->capture_id == target.id) capture_error(*capture, "window is no longer mapped", true);
+        for (auto& capture : catalog.gui->captures)
+            if (capture && capture->catalog == &catalog && capture->capture_id == target.id)
+                capture_error(*capture, "window is no longer mapped", true);
         ext_foreign_toplevel_handle_v1_destroy(native);
         std::erase_if(catalog.targets, [data](const auto& entry) { return entry.get() == data; });
         invalidate(catalog);
@@ -118,51 +121,145 @@ const ext_foreign_toplevel_list_v1_listener target_list_listener{
 
 const ext_image_copy_capture_session_v1_listener capture_session_listener{
     .buffer_size = [](void* data, auto*, std::uint32_t width, std::uint32_t height) {
-        auto& capture = *static_cast<WindowCapture*>(data);
-        if (!std::exchange(capture.collecting, true)) capture.format = UINT32_MAX;
-        capture.constraints = false;
+        auto& capture = *static_cast<Capture*>(data);
+        if (std::exchange(capture.constraints, false)) capture.format = UINT32_MAX;
         capture.width = width; capture.height = height;
     },
     .shm_format = [](void* data, auto*, std::uint32_t format) {
-        auto& capture = *static_cast<WindowCapture*>(data);
-        if (!std::exchange(capture.collecting, true)) capture.format = UINT32_MAX;
-        capture.constraints = false;
-        if (format == WL_SHM_FORMAT_ARGB8888 || format == WL_SHM_FORMAT_XRGB8888) capture.format = format;
+        auto& capture = *static_cast<Capture*>(data);
+        if (std::exchange(capture.constraints, false)) capture.format = UINT32_MAX;
+        if (format == WL_SHM_FORMAT_ARGB8888 || (format == WL_SHM_FORMAT_XRGB8888 && capture.format == UINT32_MAX))
+            capture.format = format;
     },
     .dmabuf_device = [](void* data, auto*, wl_array*) {
-        auto& capture = *static_cast<WindowCapture*>(data);
-        if (!std::exchange(capture.collecting, true)) capture.format = UINT32_MAX;
-        capture.constraints = false;
+        auto& capture = *static_cast<Capture*>(data);
+        if (std::exchange(capture.constraints, false)) capture.format = UINT32_MAX;
     },
     .dmabuf_format = [](void* data, auto*, std::uint32_t, wl_array*) {
-        auto& capture = *static_cast<WindowCapture*>(data);
-        if (!std::exchange(capture.collecting, true)) capture.format = UINT32_MAX;
-        capture.constraints = false;
+        auto& capture = *static_cast<Capture*>(data);
+        if (std::exchange(capture.constraints, false)) capture.format = UINT32_MAX;
     },
     .done = [](void* data, auto*) {
-        auto& capture = *static_cast<WindowCapture*>(data);
-        capture.constraints = true; capture.collecting = false;
+        auto& capture = *static_cast<Capture*>(data);
+        capture.constraints = true;
         if (!capture.frame && !capture.ready && !capture.next_frame) capture.next_frame = Clock::now();
-        invalidate(*capture.catalog);
     },
-    .stopped = [](void* data, auto*) { capture_error(*static_cast<WindowCapture*>(data), "window capture unavailable", true); },
+    .stopped = [](void* data, auto*) { capture_error(*static_cast<Capture*>(data), "capture unavailable", true); },
 };
 
 const ext_image_copy_capture_frame_v1_listener capture_frame_listener{
-    .transform = [](void* data, auto*, std::uint32_t transform) { static_cast<WindowCapture*>(data)->transform = transform; },
+    .transform = [](void* data, auto*, std::uint32_t transform) { static_cast<Capture*>(data)->transform = transform; },
     .damage = [](void*, auto*, std::int32_t, std::int32_t, std::int32_t, std::int32_t) {},
     .presentation_time = [](void*, auto*, std::uint32_t, std::uint32_t, std::uint32_t) {},
     .ready = [](void* data, auto* frame) {
-        auto& capture = *static_cast<WindowCapture*>(data);
+        auto& capture = *static_cast<Capture*>(data);
         ext_image_copy_capture_frame_v1_destroy(frame); capture.frame = nullptr;
         capture.ready = true; capture.constraint_failures = 0;
     },
     .failed = [](void* data, auto* frame, std::uint32_t reason) {
-        auto& capture = *static_cast<WindowCapture*>(data);
+        auto& capture = *static_cast<Capture*>(data);
         ext_image_copy_capture_frame_v1_destroy(frame); capture.frame = nullptr;
         if (reason == EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS && ++capture.constraint_failures <= 3)
             capture.next_frame = Clock::now() + capture.interval;
-        else capture_error(capture, "window frame capture failed", reason == EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_STOPPED);
+        else capture_error(capture, "frame capture failed", reason == EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_STOPPED);
+    },
+};
+
+const ext_workspace_handle_v1_listener workspace_listener{
+    .id = [](void*, auto*, const char*) {},
+    .name = [](void* data, auto*, const char* name) {
+        auto& target = *static_cast<WorkspaceCaptureTarget*>(data);
+        target.gui->capture_workspaces_ready = false;
+        protocol(*target.gui, [&] {
+            if (std::strlen(name) > 4096) throw std::runtime_error("workspace name exceeds limit");
+            target.name = name;
+        });
+    },
+    .coordinates = [](void*, auto*, wl_array*) {},
+    .state = [](void* data, auto*, std::uint32_t state) {
+        auto& target = *static_cast<WorkspaceCaptureTarget*>(data);
+        target.gui->capture_workspaces_ready = false;
+        target.hidden = state & EXT_WORKSPACE_HANDLE_V1_STATE_HIDDEN;
+    },
+    .capabilities = [](void*, auto*, std::uint32_t) {},
+    .removed = [](void* data, auto* native) {
+        auto& gui = *static_cast<WorkspaceCaptureTarget*>(data)->gui;
+        gui.capture_workspaces_ready = false;
+        for (auto& capture : gui.captures)
+            if (capture && capture->workspace == native) capture_error(*capture, "workspace removed", true);
+        ext_workspace_handle_v1_destroy(native);
+        std::erase_if(gui.capture_targets, [data](const auto& target) { return target.get() == data; });
+    },
+};
+
+const ext_workspace_group_handle_v1_listener workspace_group_listener{
+    .capabilities = [](void*, auto*, std::uint32_t) {},
+    .output_enter = [](void* data, auto*, wl_output* output) {
+        auto& group = *static_cast<WorkspaceCaptureGroup*>(data);
+        group.gui->capture_workspaces_ready = false;
+        protocol(*group.gui, [&] {
+            if (std::ranges::find(group.outputs, output) != group.outputs.end()) return;
+            if (group.outputs.size() == 128) throw std::runtime_error("workspace output limit exceeded");
+            group.outputs.push_back(output);
+        });
+    },
+    .output_leave = [](void* data, auto*, wl_output* output) {
+        auto& group = *static_cast<WorkspaceCaptureGroup*>(data);
+        group.gui->capture_workspaces_ready = false;
+        std::erase(group.outputs, output);
+    },
+    .workspace_enter = [](void* data, auto*, ext_workspace_handle_v1* workspace) {
+        auto& group = *static_cast<WorkspaceCaptureGroup*>(data);
+        group.gui->capture_workspaces_ready = false;
+        static_cast<WorkspaceCaptureTarget*>(ext_workspace_handle_v1_get_user_data(workspace))->group = &group;
+    },
+    .workspace_leave = [](void* data, auto*, ext_workspace_handle_v1* workspace) {
+        auto& gui = *static_cast<WorkspaceCaptureGroup*>(data)->gui;
+        gui.capture_workspaces_ready = false;
+        static_cast<WorkspaceCaptureTarget*>(ext_workspace_handle_v1_get_user_data(workspace))->group = nullptr;
+    },
+    .removed = [](void* data, auto* native) {
+        auto& gui = *static_cast<WorkspaceCaptureGroup*>(data)->gui;
+        gui.capture_workspaces_ready = false;
+        ext_workspace_group_handle_v1_destroy(native);
+        std::erase_if(gui.capture_groups, [data](const auto& group) { return group.get() == data; });
+    },
+};
+
+const ext_workspace_manager_v1_listener workspace_manager_listener{
+    .workspace_group = [](void* data, auto*, ext_workspace_group_handle_v1* native) {
+        auto& gui = *static_cast<Gui*>(data);
+        gui.capture_workspaces_ready = false;
+        try {
+            if (gui.capture_groups.size() == 128) throw std::runtime_error("workspace group limit exceeded");
+            auto group = std::make_unique<WorkspaceCaptureGroup>();
+            group->gui = &gui; group->native = native;
+            ext_workspace_group_handle_v1_add_listener(native, &workspace_group_listener, group.get());
+            gui.capture_groups.push_back(std::move(group));
+        } catch (...) {
+            ext_workspace_group_handle_v1_destroy(native);
+            gui.error = "cannot retain workspace capture group";
+        }
+    },
+    .workspace = [](void* data, auto*, ext_workspace_handle_v1* native) {
+        auto& gui = *static_cast<Gui*>(data);
+        gui.capture_workspaces_ready = false;
+        try {
+            if (gui.capture_targets.size() == 4096) throw std::runtime_error("workspace target limit exceeded");
+            auto target = std::make_unique<WorkspaceCaptureTarget>();
+            target->gui = &gui; target->native = native;
+            ext_workspace_handle_v1_add_listener(native, &workspace_listener, target.get());
+            gui.capture_targets.push_back(std::move(target));
+        } catch (...) {
+            ext_workspace_handle_v1_destroy(native);
+            gui.error = "cannot retain workspace capture target";
+        }
+    },
+    .done = [](void* data, auto*) { static_cast<Gui*>(data)->capture_workspaces_ready = true; },
+    .finished = [](void* data, auto* native) {
+        auto& gui = *static_cast<Gui*>(data);
+        ext_workspace_manager_v1_destroy(native); gui.capture_workspaces = nullptr;
+        remove_capture_global(gui, gui.capture_workspaces_name);
     },
 };
 
@@ -212,12 +309,6 @@ const wl_registry_listener registry_listener{
                 wl_registry_bind(registry, name, &ext_foreign_toplevel_image_capture_source_manager_v1_interface, 1));
             return;
         }
-        if (!std::strcmp(interface, ext_image_copy_capture_manager_v1_interface.name) && !catalog.capture_manager) {
-            catalog.capture_manager_name = name;
-            catalog.capture_manager = static_cast<ext_image_copy_capture_manager_v1*>(
-                wl_registry_bind(registry, name, &ext_image_copy_capture_manager_v1_interface, 1));
-            return;
-        }
         if (std::strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) || catalog.manager) return;
         catalog.manager_name = name;
         catalog.manager = static_cast<zwlr_foreign_toplevel_manager_v1*>(
@@ -228,7 +319,7 @@ const wl_registry_listener registry_listener{
     .global_remove = [](void* data, wl_registry*, std::uint32_t name) {
         auto& catalog = *static_cast<WindowCatalog*>(data);
         if (name == catalog.manager_name || name == catalog.capture_list_name ||
-            name == catalog.capture_sources_name || name == catalog.capture_manager_name)
+            name == catalog.capture_sources_name)
             catalog.protocol_error = "window protocol removed";
     },
 };
@@ -421,13 +512,13 @@ int shutdown(lua_State* lua) {
 }
 
 int capture_close(lua_State* lua) {
-    auto& capture = *static_cast<std::shared_ptr<WindowCapture>*>(luaL_checkudata(lua, 1, capture_type));
+    auto& capture = *static_cast<std::shared_ptr<Capture>*>(luaL_checkudata(lua, 1, capture_type));
     close_capture(*capture);
     return 0;
 }
 
 int capture_gc(lua_State* lua) {
-    auto* capture = static_cast<std::shared_ptr<WindowCapture>*>(luaL_checkudata(lua, 1, capture_type));
+    auto* capture = static_cast<std::shared_ptr<Capture>*>(luaL_checkudata(lua, 1, capture_type));
     if (*capture) close_capture(**capture);
     capture->~shared_ptr();
     return 0;
@@ -438,32 +529,64 @@ int image_gc(lua_State* lua) {
     return 0;
 }
 
+template<bool workspace>
 int capture_open(lua_State* lua) {
-    auto& value = catalog(lua);
+    const int options = workspace ? 1 : 3, callback = workspace ? 2 : 4;
     std::size_t length = 0;
-    const char* id = luaL_checklstring(lua, 2, &length);
-    luaL_checktype(lua, 3, LUA_TTABLE); luaL_checktype(lua, 4, LUA_TFUNCTION);
-    const auto max_width = static_cast<int>(integer_field(lua, 3, "max_width", 448, 1, 1024));
-    const auto max_height = static_cast<int>(integer_field(lua, 3, "max_height", 252, 1, 1024));
-    const auto max_fps = integer_field(lua, 3, "max_fps", 1, 1, 30);
-    if (!value.capture_manager || !value.capture_sources || !value.capture_list)
-        throw std::runtime_error("native window capture is unavailable");
-    if (!value.records) throw std::runtime_error("window catalog is not synchronized");
-    auto record = std::ranges::find(*value.records, std::string_view(id, length), &WindowRecord::id);
-    if (record == value.records->end() || !record->mapped)
-        throw std::runtime_error("window identity is no longer mapped");
-    auto target = std::ranges::find_if(value.targets, [&](const auto& target) { return target->id == record->capture_id; });
-    if (target == value.targets.end()) throw std::runtime_error("window capture target is unavailable");
-    auto slot = std::ranges::find_if(value.captures, [](const auto& capture) { return !capture || capture->closed; });
-    if (slot == value.captures.end()) throw std::runtime_error("at most eight window captures may be active");
-    auto capture = std::make_shared<WindowCapture>();
-    capture->catalog = &value; capture->capture_id = record->capture_id;
+    const char* id = workspace ? nullptr : luaL_checklstring(lua, 2, &length);
+    luaL_checktype(lua, options, LUA_TTABLE); luaL_checktype(lua, callback, LUA_TFUNCTION);
+    const auto max_width = static_cast<int>(integer_field(lua, options, "max_width", 448, 1, 1024));
+    const auto max_height = static_cast<int>(integer_field(lua, options, "max_height", 252, 1, 1024));
+    const auto max_fps = integer_field(lua, options, "max_fps", 1, 1, 30);
+    auto& gui = gui_state(lua);
+    auto* window_catalog = workspace ? nullptr : &catalog(lua);
+    std::string name, output;
+    int mode = 0;
+    if (workspace) {
+        lua_pushvalue(lua, options);
+        const int parsed = protected_call(lua, [&](lua_State* lua) {
+            text_field(lua, 2, "name", name, 4096);
+            text_field(lua, 2, "output", output, 256);
+            static const char* modes[] = {"windows_only", "everything", nullptr};
+            mode = enum_field(lua, 2, "mode", "windows_only", modes);
+            if (name.empty() || output.empty()) return luaL_error(lua, "workspace capture requires name and output");
+            return 0;
+        }, 0, 0, 1);
+        if (parsed < 0) return parsed;
+    }
+    if (!gui.capture_manager) throw std::runtime_error("native image capture is unavailable");
+    auto capture = std::make_shared<Capture>();
+    capture->gui = &gui;
+    std::uint64_t generation = 0;
+    if (workspace) {
+        if (!gui.workspace_capture_manager || !gui.capture_workspaces)
+            throw std::runtime_error("native workspace capture is unavailable");
+        if (!gui.capture_workspaces_ready) throw std::runtime_error("workspace capture targets are not synchronized");
+        const auto monitor = std::ranges::find_if(gui.outputs, [&](const auto& item) { return item->state.name == output; });
+        if (monitor == gui.outputs.end()) throw std::runtime_error("workspace output is unavailable");
+        for (const auto& target : gui.capture_targets) {
+            if (target->hidden || target->name != name) continue;
+            if (!target->group || std::ranges::find(target->group->outputs, (*monitor)->native) == target->group->outputs.end()) continue;
+            if (capture->workspace) throw std::runtime_error("workspace capture name is ambiguous on this output");
+            capture->workspace = target->native;
+        }
+        if (!capture->workspace) throw std::runtime_error("workspace capture target is unavailable");
+    } else {
+        auto& value = *window_catalog;
+        if (!value.capture_sources || !value.capture_list) throw std::runtime_error("native window capture is unavailable");
+        if (!value.records) throw std::runtime_error("window catalog is not synchronized");
+        const auto record = std::ranges::find(*value.records, std::string_view(id, length), &WindowRecord::id);
+        if (record == value.records->end() || !record->mapped) throw std::runtime_error("window identity is no longer mapped");
+        capture->catalog = &value; capture->capture_id = record->capture_id;
+        generation = value.generation;
+    }
+    auto slot = std::ranges::find_if(gui.captures, [](const auto& item) { return !item || item->closed; });
+    if (slot == gui.captures.end()) throw std::runtime_error("at most eight captures may be active");
     capture->max_width = max_width; capture->max_height = max_height;
     capture->interval = std::chrono::milliseconds((1000 + max_fps - 1) / max_fps);
-    const auto generation = value.generation;
-    lua_pushvalue(lua, 4);
+    lua_pushvalue(lua, callback);
     const int result = protected_call(lua, [&](lua_State* lua) {
-        auto* handle = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<WindowCapture>), 0)) std::shared_ptr<WindowCapture>();
+        auto* handle = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<Capture>), 0)) std::shared_ptr<Capture>();
         luaL_setmetatable(lua, capture_type);
         *handle = capture;
         lua_pushvalue(lua, -1); capture->handle = luaL_ref(lua, LUA_REGISTRYINDEX);
@@ -471,13 +594,26 @@ int capture_open(lua_State* lua) {
         return 1;
     }, 1, 0, 1);
     if (result < 0) { close_capture(*capture); return result; }
-    if (capture->closed || value.generation != generation || (*slot && !(*slot)->closed)) {
+    if (capture->closed || gui.owner.closing || (capture->catalog && capture->catalog->generation != generation) ||
+        (*slot && !(*slot)->closed)) {
         close_capture(*capture);
-        throw std::runtime_error("window subscription changed while opening capture");
+        throw std::runtime_error("capture owner changed while opening capture");
     }
-    auto* source = ext_foreign_toplevel_image_capture_source_manager_v1_create_source(value.capture_sources, (*target)->native);
+    ext_image_capture_source_v1* source = nullptr;
+    if (workspace) {
+        source = hyprland_workspace_image_capture_source_manager_v1_create_source(
+            gui.workspace_capture_manager, capture->workspace, static_cast<std::uint32_t>(mode));
+    } else {
+        const auto& value = *capture->catalog;
+        const auto target = std::ranges::find_if(value.targets, [&](const auto& item) { return item->id == capture->capture_id; });
+        if (target == value.targets.end()) {
+            close_capture(*capture);
+            throw std::runtime_error("window capture target is unavailable");
+        }
+        source = ext_foreign_toplevel_image_capture_source_manager_v1_create_source(value.capture_sources, (*target)->native);
+    }
     if (!source) { close_capture(*capture); throw std::runtime_error("cannot create capture source"); }
-    capture->session = ext_image_copy_capture_manager_v1_create_session(value.capture_manager, source, 0);
+    capture->session = ext_image_copy_capture_manager_v1_create_session(gui.capture_manager, source, 0);
     ext_image_capture_source_v1_destroy(source);
     if (!capture->session) { close_capture(*capture); throw std::runtime_error("cannot create capture session"); }
     ext_image_copy_capture_session_v1_add_listener(capture->session, &capture_session_listener, capture.get());
@@ -486,11 +622,11 @@ int capture_open(lua_State* lua) {
     return 1;
 }
 
-void advance_capture(WindowCapture& capture) {
+void advance_capture(Capture& capture) {
     if (capture.closed || capture.error || !capture.session) return;
     const auto now = Clock::now();
     if (capture.deadline && now >= *capture.deadline) {
-        capture_error(capture, "initial window frame timed out", true);
+        capture_error(capture, "initial capture frame timed out", true);
         return;
     }
     try {
@@ -501,10 +637,10 @@ void advance_capture(WindowCapture& capture) {
                 return;
             }
             if (capture.transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-                capture_error(capture, "unsupported window capture transform");
+                capture_error(capture, "unsupported capture transform");
                 return;
             }
-            auto image = std::make_shared<Image>(capture.catalog->gui->images);
+            auto image = std::make_shared<Image>(capture.gui->images);
             const double scale = std::min({1.0, static_cast<double>(capture.max_width) / capture.buffer_width,
                 static_cast<double>(capture.max_height) / capture.buffer_height});
             image->width = std::max(1, static_cast<int>(std::floor(capture.buffer_width * scale)));
@@ -528,21 +664,22 @@ void advance_capture(WindowCapture& capture) {
             capture.next_frame = now + capture.interval;
         }
         if (!capture.constraints || capture.frame || capture.pending || !capture.next_frame || now < *capture.next_frame) return;
-        if (!capture.buffer || capture.buffer_width != capture.width || capture.buffer_height != capture.height ||
-            capture.buffer_format != capture.format) {
+        const bool replace = !capture.buffer || capture.buffer_width != capture.width || capture.buffer_height != capture.height ||
+            capture.buffer_format != capture.format;
+        if (replace) {
             if (!capture.width || !capture.height || capture.width > 8192 || capture.height > 8192 ||
                 static_cast<std::uint64_t>(capture.width) * capture.height * 4 > 64 * 1024 * 1024) {
-                capture_error(capture, "window capture buffer exceeds 64 MiB");
+                capture_error(capture, "capture buffer exceeds 64 MiB");
                 return;
             }
             if (capture.format == UINT32_MAX) {
-                capture_error(capture, "window capture requires ARGB8888 or XRGB8888 shared memory", true);
+                capture_error(capture, "capture requires ARGB8888 or XRGB8888 shared memory", true);
                 return;
             }
             release_buffer(capture);
             const auto bytes = static_cast<std::size_t>(capture.width) * capture.height * 4;
-            if (bytes > capture_limit - capture.catalog->capture_bytes) {
-                capture_error(capture, "window capture memory limit reached (128 MiB)");
+            if (bytes > capture_limit - capture.gui->capture_bytes) {
+                capture_error(capture, "capture memory limit reached (128 MiB)");
                 return;
             }
             const int fd = memfd_create("hyprworks-capture", MFD_CLOEXEC);
@@ -550,8 +687,8 @@ void advance_capture(WindowCapture& capture) {
             if (ftruncate(fd, static_cast<off_t>(bytes)) < 0) { close(fd); throw std::runtime_error("cannot size capture buffer"); }
             void* pixels = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             if (pixels == MAP_FAILED) { close(fd); throw std::runtime_error("cannot map capture buffer"); }
-            capture.pixels = pixels; capture.bytes = bytes; capture.catalog->capture_bytes += bytes;
-            auto* pool = wl_shm_create_pool(capture.catalog->gui->shm, fd, static_cast<int>(bytes));
+            capture.pixels = pixels; capture.bytes = bytes; capture.gui->capture_bytes += bytes;
+            auto* pool = wl_shm_create_pool(capture.gui->shm, fd, static_cast<int>(bytes));
             close(fd);
             if (!pool) throw std::runtime_error("cannot create capture pool");
             capture.buffer = wl_shm_pool_create_buffer(pool, 0, static_cast<int>(capture.width), static_cast<int>(capture.height),
@@ -564,30 +701,86 @@ void advance_capture(WindowCapture& capture) {
         if (!capture.frame) throw std::runtime_error("cannot create capture frame");
         ext_image_copy_capture_frame_v1_add_listener(capture.frame, &capture_frame_listener, &capture);
         ext_image_copy_capture_frame_v1_attach_buffer(capture.frame, capture.buffer);
-        ext_image_copy_capture_frame_v1_damage_buffer(capture.frame, 0, 0,
-            static_cast<int>(capture.buffer_width), static_cast<int>(capture.buffer_height));
+        if (replace || capture.constraint_failures)
+            ext_image_copy_capture_frame_v1_damage_buffer(capture.frame, 0, 0,
+                static_cast<int>(capture.buffer_width), static_cast<int>(capture.buffer_height));
         ext_image_copy_capture_frame_v1_capture(capture.frame);
         capture.next_frame.reset();
-    } catch (const std::exception&) { capture_error(capture, "cannot allocate or scale window capture"); }
+    } catch (const std::exception&) { capture_error(capture, "cannot allocate or scale captured frame"); }
 }
 
+}
+
+void bind_captures(Gui& gui, wl_registry* registry, std::uint32_t name, const char* interface) {
+    if (!std::strcmp(interface, ext_image_copy_capture_manager_v1_interface.name) && !gui.capture_manager) {
+        gui.capture_manager = static_cast<ext_image_copy_capture_manager_v1*>(
+            wl_registry_bind(registry, name, &ext_image_copy_capture_manager_v1_interface, 1));
+        if (!gui.capture_manager) throw std::runtime_error("cannot bind image capture");
+        gui.capture_manager_name = name;
+    }
+    if (!std::strcmp(interface, hyprland_workspace_image_capture_source_manager_v1_interface.name) && !gui.workspace_capture_manager) {
+        gui.workspace_capture_manager = static_cast<hyprland_workspace_image_capture_source_manager_v1*>(
+            wl_registry_bind(registry, name, &hyprland_workspace_image_capture_source_manager_v1_interface, 1));
+        if (!gui.workspace_capture_manager) throw std::runtime_error("cannot bind workspace capture");
+        gui.workspace_capture_manager_name = name;
+    }
+    if (!std::strcmp(interface, ext_workspace_manager_v1_interface.name) && !gui.capture_workspaces) {
+        gui.capture_workspaces = static_cast<ext_workspace_manager_v1*>(wl_registry_bind(registry, name, &ext_workspace_manager_v1_interface, 1));
+        if (!gui.capture_workspaces) throw std::runtime_error("cannot bind workspace capture targets");
+        gui.capture_workspaces_name = name;
+        ext_workspace_manager_v1_add_listener(gui.capture_workspaces, &workspace_manager_listener, &gui);
+    }
+}
+
+void remove_capture_global(Gui& gui, std::uint32_t name) {
+    for (const auto& output : gui.outputs) if (output->id == name)
+        for (auto& group : gui.capture_groups) std::erase(group->outputs, output->native);
+    if (name != gui.capture_manager_name && name != gui.workspace_capture_manager_name && name != gui.capture_workspaces_name) return;
+    for (auto& capture : gui.captures)
+        if (capture && (name == gui.capture_manager_name || capture->workspace))
+            capture_error(*capture, "capture protocol removed", true);
+    if (name == gui.capture_manager_name) {
+        ext_image_copy_capture_manager_v1_destroy(std::exchange(gui.capture_manager, nullptr));
+        gui.capture_manager_name = 0;
+    }
+    if (name == gui.workspace_capture_manager_name) {
+        hyprland_workspace_image_capture_source_manager_v1_destroy(std::exchange(gui.workspace_capture_manager, nullptr));
+        gui.workspace_capture_manager_name = 0;
+    }
+    if (name == gui.capture_workspaces_name) {
+        if (gui.capture_workspaces) {
+            ext_workspace_manager_v1_stop(gui.capture_workspaces);
+            ext_workspace_manager_v1_destroy(std::exchange(gui.capture_workspaces, nullptr));
+        }
+        for (auto& target : gui.capture_targets) ext_workspace_handle_v1_destroy(target->native);
+        for (auto& group : gui.capture_groups) ext_workspace_group_handle_v1_destroy(group->native);
+        gui.capture_targets.clear(); gui.capture_groups.clear();
+        gui.capture_workspaces_ready = false; gui.capture_workspaces_name = 0;
+    }
+}
+
+void close_captures(Gui& gui) noexcept {
+    for (auto& capture : gui.captures) if (capture) close_capture(*capture);
+    gui.captures.fill(nullptr);
+    if (gui.capture_manager_name) remove_capture_global(gui, gui.capture_manager_name);
+    if (gui.workspace_capture_manager_name) remove_capture_global(gui, gui.workspace_capture_manager_name);
+    if (gui.capture_workspaces_name) remove_capture_global(gui, gui.capture_workspaces_name);
 }
 
 void close_windows(WindowCatalog& catalog) noexcept {
-    for (auto& capture : catalog.captures) if (capture) close_capture(*capture);
-    catalog.captures.fill(nullptr);
+    for (auto& capture : catalog.gui->captures)
+        if (capture && capture->catalog == &catalog) { close_capture(*capture); capture.reset(); }
     for (auto& target : catalog.targets) ext_foreign_toplevel_handle_v1_destroy(target->native);
     catalog.targets.clear();
     if (catalog.capture_list) ext_foreign_toplevel_list_v1_destroy(std::exchange(catalog.capture_list, nullptr));
     if (catalog.capture_sources) ext_foreign_toplevel_image_capture_source_manager_v1_destroy(std::exchange(catalog.capture_sources, nullptr));
-    if (catalog.capture_manager) ext_image_copy_capture_manager_v1_destroy(std::exchange(catalog.capture_manager, nullptr));
     close_query(catalog);
     if (catalog.sync) wl_callback_destroy(std::exchange(catalog.sync, nullptr));
     for (auto* signal : catalog.signals) zwlr_foreign_toplevel_handle_v1_destroy(signal);
     catalog.signals.clear();
     if (catalog.manager) zwlr_foreign_toplevel_manager_v1_destroy(std::exchange(catalog.manager, nullptr));
     if (catalog.registry) wl_registry_destroy(std::exchange(catalog.registry, nullptr));
-    catalog.manager_name = catalog.capture_list_name = catalog.capture_sources_name = catalog.capture_manager_name = 0;
+    catalog.manager_name = catalog.capture_list_name = catalog.capture_sources_name = 0;
     catalog.protocol_error = nullptr; catalog.error.clear();
     catalog.registered = catalog.subscribed = false;
     catalog.change_pending = catalog.status_pending = false;
@@ -602,7 +795,11 @@ void prepare_windows(WindowCatalog& catalog, WaitSet& wait) {
     if (catalog.protocol_error || catalog.change_pending || catalog.status_pending) deadline(Clock::time_point::min());
     if (catalog.deadline) deadline(*catalog.deadline);
     if (catalog.subscribed && catalog.query == WindowCatalog::Query::idle && catalog.refresh_at) deadline(*catalog.refresh_at);
-    for (auto& capture : catalog.captures) if (capture && !capture->closed) {
+}
+
+void prepare_captures(Gui& gui, WaitSet& wait) {
+    const auto deadline = [&](Clock::time_point time) { if (!wait.deadline || time < *wait.deadline) wait.deadline = time; };
+    for (auto& capture : gui.captures) if (capture && !capture->closed) {
         if (capture->ready || capture->pending) deadline(Clock::time_point::min());
         if (capture->constraints && capture->next_frame) deadline(*capture->next_frame);
         if (capture->deadline) deadline(*capture->deadline);
@@ -689,8 +886,13 @@ int dispatch_windows(WindowCatalog& catalog) {
     const bool change = std::exchange(catalog.change_pending, false);
     if (status && dispatch_callback(lua, catalog, catalog.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
     if (change && dispatch_callback(lua, catalog, catalog.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    for (auto capture : catalog.captures) {
-        if (!capture || capture->closed || catalog.gui->owner.requests.load(std::memory_order_relaxed)) continue;
+    return 0;
+}
+
+int dispatch_captures(Gui& gui) {
+    auto* lua = gui.owner.lua;
+    for (auto capture : gui.captures) {
+        if (!capture || capture->closed || gui.owner.requests.load(std::memory_order_relaxed)) continue;
         advance_capture(*capture);
         if (!std::exchange(capture->pending, false) || capture->callback < 0) continue;
         const auto image = capture->image;
@@ -723,17 +925,18 @@ void register_windows(lua_State* lua) {
     luaL_newmetatable(lua, window_type);
     const luaL_Reg methods[] = {{"snapshot", guarded<get_snapshot>}, {"status", guarded<get_status>},
         {"on_change", guarded<on_change>}, {"on_status", guarded<on_status>},
-        {"restart", guarded<restart>}, {"close", guarded<shutdown>}, {"capture", operation_call<capture_open>}, {nullptr, nullptr}};
+        {"restart", guarded<restart>}, {"close", guarded<shutdown>}, {"capture", operation_call<capture_open<false>>}, {nullptr, nullptr}};
     luaL_setfuncs(lua, methods, 0); lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
     lua_pushcfunction(lua, guarded<shutdown>); lua_setfield(lua, -2, "__close");
     lua_pushliteral(lua, "hyprworks window catalog"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);
     lua_pushcfunction(lua, guarded<open>); lua_setfield(lua, -2, "windows");
+    lua_pushcfunction(lua, operation_call<capture_open<true>>); lua_setfield(lua, -2, "capture_workspace");
     luaL_newmetatable(lua, capture_type);
     lua_pushcfunction(lua, guarded<capture_close>); lua_setfield(lua, -2, "close");
     lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
     lua_pushcfunction(lua, guarded<capture_close>); lua_setfield(lua, -2, "__close");
     lua_pushcfunction(lua, guarded<capture_gc>); lua_setfield(lua, -2, "__gc");
-    lua_pushliteral(lua, "hyprworks window capture"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);
+    lua_pushliteral(lua, "hyprworks capture"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);
     luaL_newmetatable(lua, captured_image_type);
     lua_pushcfunction(lua, guarded<image_gc>); lua_setfield(lua, -2, "__gc");
     lua_pushliteral(lua, "hyprworks captured image"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);
