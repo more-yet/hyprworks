@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.5)
-project(hyprworks VERSION 0.1.5 LANGUAGES CXX)
+project(hyprworks VERSION 0.1.6 LANGUAGES CXX)
 
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 

@@ -506,7 +506,7 @@ void Invocation::prepare_wait() {
     if (state.reload_watch.running()) wait.fds.push_back(state.reload_watch.prepare_wait());
     if (state.reload_at && (!wait.deadline || *state.reload_at < *wait.deadline)) wait.deadline = state.reload_at;
 #ifdef HYPRWORKS_HAS_GUI
-    if (state.gui) prepare_gui(state, wait);
+    if (state.gui) prepare_gui(*state.gui, wait);
 #endif
 }
 
@@ -514,7 +514,7 @@ void Invocation::dispatch() {
     auto& state = *state_;
     const auto& ready = state.wait;
 #ifdef HYPRWORKS_HAS_GUI
-    if (state.gui) read_gui(state, ready);
+    if (state.gui) read_gui(*state.gui, ready);
 #endif
     if (ready.fds[0].revents) {
         std::uint64_t wake;
@@ -707,8 +707,8 @@ void Invocation::dispatch() {
     if (status >= 0)
         status = dispatch_utilities(state.lua, state);
 #ifdef HYPRWORKS_HAS_GUI
-    if (status >= 0 && !state.requests.load(std::memory_order_relaxed))
-        status = dispatch_gui(state);
+    if (status >= 0 && state.gui && !state.requests.load(std::memory_order_relaxed))
+        status = dispatch_gui(*state.gui);
 #endif
     if (status < 0 && lua_touserdata(state.lua, -1) != &interrupted)
         throw std::runtime_error(error_message(state.lua));

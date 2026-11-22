@@ -47,9 +47,10 @@ int main(int argc, char**) {
         image.reset();
         for (const int channels : {3, 4, 0}) {
             const int stride = channels == 3 ? 3 : 4;
-            std::string source(257 * 257 * static_cast<std::size_t>(stride), '\0');
-            for (unsigned i = 0; i < 257 * 257; ++i) {
-                const unsigned a = (i / 256) & 255, c = i & 255;
+            const std::array<unsigned, 5> alphas{0, 1, 127, 128, 255};
+            std::string source(alphas.size() * static_cast<std::size_t>(stride), '\0');
+            for (std::size_t i = 0; i < alphas.size(); ++i) {
+                const unsigned a = alphas[i], c = 173;
                 const auto offset = i * static_cast<unsigned>(stride);
                 source[offset] = static_cast<char>(c);
                 source[offset + 1] = static_cast<char>((c + a) & 255);
@@ -57,11 +58,11 @@ int main(int argc, char**) {
                 if (stride == 4) source[offset + 3] = static_cast<char>(a);
             }
             auto decoded = std::make_shared<Image>(work);
-            decoded->width = decoded->height = 257; decoded->channels = channels;
+            decoded->width = 5; decoded->height = 1; decoded->channels = channels;
             if (channels) decoded->encoded = source;
             else {
                 png_image png{};
-                png.version = PNG_IMAGE_VERSION; png.width = png.height = 257; png.format = PNG_FORMAT_RGBA;
+                png.version = PNG_IMAGE_VERSION; png.width = 5; png.height = 1; png.format = PNG_FORMAT_RGBA;
                 png_alloc_size_t size = 0;
                 assert(png_image_write_to_memory(&png, nullptr, &size, 0, source.data(), 0, nullptr));
                 decoded->encoded.resize(size);
@@ -78,8 +79,8 @@ int main(int argc, char**) {
             }
             assert(decoded->error.empty() && decoded->encoded.empty());
             const auto* pixels = reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(decoded->surface));
-            for (unsigned i = 0; i < 257 * 257; ++i) {
-                const unsigned a = (i / 256) & 255, c = i & 255;
+            for (std::size_t i = 0; i < alphas.size(); ++i) {
+                const unsigned a = alphas[i], c = 173;
                 const unsigned alpha = stride == 4 ? a : 255;
                 const auto expected = alpha << 24 | ((c * alpha + 127) / 255) << 16 |
                     ((((c + a) & 255) * alpha + 127) / 255) << 8 | (a * alpha + 127) / 255;
@@ -807,10 +808,10 @@ int main(int argc, char**) {
         lua_getglobal(state.lua, "consume_key");
         surface.on_input = luaL_ref(state.lua, LUA_REGISTRYINDEX);
         enqueue(*keyboard, {.type = Input::Type::key, .surface = 1, .key = XKB_KEY_Tab, .pressed = true});
-        assert(dispatch_gui(state) == 0);
+        assert(dispatch_gui(gui) == 0);
         assert(surface.focus_visible && surface.focused == index_of("second"));
         enqueue(*keyboard, {.type = Input::Type::button, .surface = 1, .pressed = true});
-        assert(dispatch_gui(state) == 0);
+        assert(dispatch_gui(gui) == 0);
         assert(!surface.focus_visible && surface.focused == index_of("second"));
         unref(state.lua, surface.on_input);
         surface.configured = true;

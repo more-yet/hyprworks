@@ -29,6 +29,8 @@ SurfaceFocus surface_focus(const Surface& surface) {
 }
 
 void focus(Surface& surface, int index) {
+    assert(index == -1 || (index >= 0 && static_cast<std::size_t>(index) < surface.elements.size() &&
+        focusable(surface.elements[static_cast<std::size_t>(index)])));
     if (surface.focused == index) return;
     surface.key_pressed = -1;
     if (surface.focused >= 0) {

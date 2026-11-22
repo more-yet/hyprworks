@@ -17,6 +17,7 @@ server:on_event(function(_, event)
         methods = methods + 1
         if event.member == "Echo" then
             assert(not server:reply(event.id, "", {}))
+            assert(not server:reply(event.id, "a{sv}t", {{bad = {signature = "y", value = 256}}, "0"}))
             assert(server:reply(event.id, "a{sv}t", event.arguments))
             assert(not server:reply(event.id, "a{sv}t", event.arguments))
         end

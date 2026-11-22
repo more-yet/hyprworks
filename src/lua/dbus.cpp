@@ -129,11 +129,13 @@ void push_value(lua_State* lua, const dbus::Value& value) {
     else if (const auto* data = std::get_if<std::string>(&value.data)) lua_pushlstring(lua, data->data(), data->size());
     else {
         const auto& body = std::get<dbus::Body>(value.data);
-        lua_createtable(lua, value.signature.starts_with("a{") ? 0 : static_cast<int>(body.size()), 0);
-        if (value.signature == "v") {
+        const bool variant = value.signature == "v", dictionary = value.signature.starts_with("a{");
+        lua_createtable(lua, variant || dictionary ? 0 : static_cast<int>(body.size()),
+            variant ? 2 : dictionary ? static_cast<int>(body.size()) : 0);
+        if (variant) {
             string_field(lua, "signature", body[0].signature);
             push_value(lua, body[0]); lua_setfield(lua, -2, "value");
-        } else if (value.signature.starts_with("a{")) {
+        } else if (dictionary) {
             for (const auto& entry : body) {
                 const auto& pair = std::get<dbus::Body>(entry.data);
                 push_value(lua, pair[0]); push_value(lua, pair[1]); lua_rawset(lua, -3);

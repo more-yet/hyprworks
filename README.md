@@ -78,7 +78,7 @@ role from the element kind. Names default to control labels or input placeholder
 `element:accessibility()` returns effective metadata, ancestor-inherited
 hidden state, enabled/focus state, and a toggle's checked or slider's value state.
 Metadata updates use the same validated transactions and content budgets as
-visual properties. Native AT-SPI exposure is a subsequent integration step.
+visual properties.
 
 Observers such as `hw.audio()`, `hw.upower()` and `hw.hyprland.workspaces()`
 publish snapshots. Read them in `on_change`; use `on_status` for connection
@@ -118,8 +118,9 @@ failure/cancellation branches, ownership and simplification tradeoffs.
 
 Follow a change from its input through native state, publication, Lua delivery
 and cleanup. Keep protocol validation with the connection, Lua conversion with
-the binding, and UI interaction state with the surface. Add checks where
-ownership, cancellation, concurrency or transactional integrity can change.
+the binding, and UI interaction state with the surface. Validate at ingress and
+mutation boundaries; consumers rely on the resulting invariants. Revalidate
+identities across callbacks, Lua allocation and asynchronous completion.
 
 The core checks exercise invocation teardown, callback-driven mutation,
 transactional replacement, clipboard ownership and image-worker synchronization.

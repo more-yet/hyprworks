@@ -256,9 +256,9 @@ struct Gui {
 
 void start_gui(InvocationState& state);
 void open_gui(lua_State* lua);
-void prepare_gui(InvocationState& state, WaitSet& wait);
-void read_gui(InvocationState& state, const WaitSet& wait);
-int dispatch_gui(InvocationState& state);
+void prepare_gui(Gui& gui, WaitSet& wait);
+void read_gui(Gui& gui, const WaitSet& wait);
+int dispatch_gui(Gui& gui);
 void close_gui(Gui& gui) noexcept;
 
 template<class Function>

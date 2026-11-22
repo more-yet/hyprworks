@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <sys/stat.h>
 
 namespace hyprworks::lua {
 namespace {
@@ -17,8 +18,8 @@ bool component(const std::string& name) {
 }
 
 bool file_exists(const std::string& path) {
-    std::error_code error;
-    return std::filesystem::is_regular_file(path, error);
+    struct stat status;
+    return ::stat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode);
 }
 
 IconTheme read_theme(const std::string& name) {
@@ -63,6 +64,8 @@ IconTheme read_theme(const std::string& name) {
             return g_key_file_has_key(index.get(), group, key, nullptr) ?
                 g_key_file_get_double(index.get(), group, key, nullptr) : fallback;
         };
+        const auto root_begin = result.search_roots.size();
+        for (const auto& root : roots) result.search_roots.push_back(root + "/" + theme);
         for (const char* key : {"Directories", "ScaledDirectories"}) {
             const std::unique_ptr<gchar*, decltype(&g_strfreev)> directories(
                 g_key_file_get_string_list(index.get(), "Icon Theme", key, nullptr, nullptr), g_strfreev);
@@ -85,9 +88,10 @@ IconTheme read_theme(const std::string& name) {
                 minimum *= scale;
                 maximum *= scale;
                 if (size <= 0 || scale <= 0 || !std::isfinite(minimum) || !std::isfinite(maximum) || minimum < 0 || maximum < minimum) continue;
-                for (const auto& root : roots) {
+                for (std::size_t root = root_begin; root < result.search_roots.size(); ++root) {
                     if (result.directories.size() == 16384) throw std::runtime_error("icon theme exceeds 16384 directories");
-                    result.directories.push_back({root + "/" + theme + "/" + relative.string(), minimum, maximum, visited.size()});
+                    result.directories.push_back({result.search_roots[root] + "/" + relative.string(),
+                        minimum, maximum, visited.size(), root});
                 }
             }
         }
@@ -115,11 +119,18 @@ std::string icon_path(std::optional<IconTheme>& cache, const std::string& theme,
     double best = std::numeric_limits<double>::max();
     std::size_t selected_theme = 0;
     bool upscaled = true;
+    std::vector<std::optional<bool>> roots_present(cache->search_roots.size());
     for (const auto& directory : cache->directories) {
         if (!path.empty() && directory.theme != selected_theme) break;
         const double distance = std::max({0.0, directory.minimum - pixels, pixels - directory.maximum});
         const bool upscale = pixels > directory.maximum;
         if (distance > best || (distance == best && (upscale || !upscaled))) continue;
+        auto& present = roots_present[directory.root];
+        if (!present) {
+            struct stat status;
+            present = ::stat(cache->search_roots[directory.root].c_str(), &status) == 0 && S_ISDIR(status.st_mode);
+        }
+        if (!*present) continue;
         for (const char* extension : {".svg", ".png"}) {
             auto candidate = directory.path + "/" + name + extension;
             if (!file_exists(candidate)) continue;

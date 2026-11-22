@@ -118,7 +118,7 @@ const wl_registry_listener registry_listener{
     },
     .global_remove = [](void* data, wl_registry*, std::uint32_t name) {
         auto& gui = *static_cast<Gui*>(data);
-        std::erase_if(gui.outputs, [&](auto& output) {
+        const auto removed_outputs = std::erase_if(gui.outputs, [&](auto& output) {
             if (output->id != name) return false;
             for (auto& surface : gui.surfaces) if (surface) {
                 if (surface->layer && surface->output == name) request_surface_close(*surface, "output_removed");
@@ -127,7 +127,8 @@ const wl_registry_listener registry_listener{
             if (output->logical) zxdg_output_v1_destroy(output->logical);
             wl_output_release(output->native); gui.outputs_pending = true; return true;
         });
-        for (auto& surface : gui.surfaces) if (surface) update_scale(*surface);
+        if (removed_outputs)
+            for (auto& surface : gui.surfaces) if (surface) update_scale(*surface);
         std::erase_if(gui.seats, [&](auto& seat) {
             if (seat->id != name) return false;
             for (auto& surface : gui.surfaces)
@@ -316,8 +317,7 @@ void close_gui(Gui& gui) noexcept {
 
 Gui::~Gui() { close_gui(*this); }
 
-void prepare_gui(InvocationState& state, WaitSet& wait) {
-    auto& gui = *state.gui;
+void prepare_gui(Gui& gui, WaitSet& wait) {
     if (gui.read_prepared) { wl_display_cancel_read(gui.display); gui.read_prepared = false; }
     wl_display_dispatch_pending(gui.display);
     check_display(gui);
@@ -358,8 +358,7 @@ void prepare_gui(InvocationState& state, WaitSet& wait) {
     }
 }
 
-void read_gui(InvocationState& state, const WaitSet& wait) {
-    auto& gui = *state.gui;
+void read_gui(Gui& gui, const WaitSet& wait) {
     if (gui.wait_offset >= wait.fds.size()) {
         if (gui.read_prepared) { wl_display_cancel_read(gui.display); gui.read_prepared = false; }
         return;
@@ -380,9 +379,8 @@ void read_gui(InvocationState& state, const WaitSet& wait) {
     if (gui.windows) read_windows(*gui.windows, wait);
 }
 
-int dispatch_gui(InvocationState& state) {
-    if (!state.gui) return 0;
-    auto& gui = *state.gui;
+int dispatch_gui(Gui& gui) {
+    auto& state = gui.owner;
     check_display(gui);
     for (auto& surface : gui.surfaces)
         if (surface && !surface->closed && !surface->close_pending && surface->dismiss_focus_loss &&

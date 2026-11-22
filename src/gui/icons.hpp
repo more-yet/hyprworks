@@ -12,9 +12,10 @@ struct IconTheme {
     struct Directory {
         std::string path;
         double minimum, maximum;
-        std::size_t theme;
+        std::size_t theme, root;
     };
     std::string name;
+    std::vector<std::string> search_roots;
     std::vector<Directory> directories;
     std::vector<std::string> fallback_paths;
     std::map<std::pair<std::string, int>, std::string> paths;

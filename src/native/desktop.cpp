@@ -6,7 +6,6 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
-#include <set>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -81,7 +80,6 @@ struct DesktopEntries::State {
                 }
             }
             std::size_t visited = 0, directories = 0, files = 0;
-            std::set<std::string> claimed;
             std::vector<std::pair<std::string, fs::path>> candidates;
             for (const auto& root : roots) {
                 std::vector<fs::path> paths;
@@ -99,11 +97,12 @@ struct DesktopEntries::State {
                     for (; iterator != fs::directory_iterator{}; iterator.increment(error)) {
                         if (++visited > 32768) throw std::runtime_error("desktop traversal limit exceeded (32768 entries)");
                         const auto& item = *iterator;
-                        const auto status = item.status(error);
+                        const bool directory = item.is_directory(error);
+                        const bool entry = !error && !directory && item.path().extension() == ".desktop" && item.is_regular_file(error);
                         if (error == std::errc::no_such_file_or_directory || error == std::errc::too_many_symbolic_link_levels) { error.clear(); continue; }
                         if (error) throw fs::filesystem_error("inspect desktop entry", item.path(), error);
-                        if (fs::is_directory(status)) visit(visit, item.path());
-                        else if (fs::is_regular_file(status) && item.path().extension() == ".desktop") {
+                        if (directory) visit(visit, item.path());
+                        else if (entry) {
                             if (++files > 8192) throw std::runtime_error("desktop entry limit exceeded (8192)");
                             paths.push_back(item.path());
                         }
@@ -116,10 +115,13 @@ struct DesktopEntries::State {
                 for (auto& path : paths) {
                     auto id = path.lexically_relative(root).string();
                     std::ranges::replace(id, '/', '-');
-                    if (claimed.insert(id).second) candidates.emplace_back(std::move(id), std::move(path));
+                    candidates.emplace_back(std::move(id), std::move(path));
                 }
             }
-            std::ranges::sort(candidates, {}, [](const auto& candidate) -> const std::string& { return candidate.first; });
+            const auto entry_id = [](const auto& candidate) -> const std::string& { return candidate.first; };
+            std::ranges::stable_sort(candidates, {}, entry_id);
+            const auto duplicates = std::ranges::unique(candidates, {}, entry_id);
+            candidates.erase(duplicates.begin(), duplicates.end());
             Snapshot next;
             std::vector<App> next_apps;
             next.entries.reserve(candidates.size()); next_apps.reserve(candidates.size());
@@ -226,9 +228,10 @@ Update DesktopEntries::dispatch(const WaitSet& ready) {
     ++state.generation;
     if (state.fd >= 0) try {
         if (ready.fd.revents & (POLLERR | POLLHUP | POLLNVAL)) throw std::runtime_error("desktop directory watch failed");
+        const bool readable = (ready.fd.revents & POLLIN) || state.more;
         state.more = false;
         alignas(inotify_event) std::array<char, 65536> events;
-        for (unsigned batch = 0; batch < 4; ++batch) {
+        for (unsigned batch = 0; readable && batch < 4; ++batch) {
             const auto size = ::read(state.fd, events.data(), events.size());
             if (size < 0) {
                 if (errno == EAGAIN) break;

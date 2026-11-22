@@ -82,7 +82,7 @@ void measure(Surface& surface, int index, double width) {
         auto& item = elements[static_cast<std::size_t>(child)];
         double child_width = item.width >= 0 ? item.width : item.halign ? item.intrinsic_w : inner;
         if (element.kind == Kind::row)
-            child_width = item.grow > 0 && growth > 0 ? std::max(0.0, inner - used - gaps) * item.grow / growth : item.intrinsic_w;
+            child_width = item.grow > 0 ? std::max(0.0, inner - used - gaps) * item.grow / growth : item.intrinsic_w;
         else if (horizontal) child_width = item.intrinsic_w;
         measure(surface, child, child_width);
         if (vertical) height += item.measured_height;
@@ -157,6 +157,7 @@ void rounded(cairo_t* cr, Box box, double radius) {
 }
 
 void paint(Surface& surface, cairo_t* cr, Box damaged) {
+    const int outlined = surface.focus_visible ? surface.focused : -1;
     for (std::size_t index = 0; index < surface.elements.size(); ++index) {
         auto& element = surface.elements[index];
         const auto box = element.box;
@@ -164,7 +165,7 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
         if (visible.w <= 0 || visible.h <= 0) continue;
         const auto background = element.kind == Kind::toggle && element.value != 0 ? element.accent : element.background;
         const bool border = element.border_width > 0 && (element.border_color & 255);
-        const bool outline = surface.focus_visible && static_cast<int>(index) == surface.focused && focusable(element);
+        const bool outline = static_cast<int>(index) == outlined;
         if (!(background & 255) && !border && !outline && !element.layout &&
             element.kind != Kind::slider && element.kind != Kind::image) continue;
         cairo_save(cr);
@@ -430,7 +431,7 @@ void render(Surface& surface) {
     for (auto& item : gui.buffers) {
         if (item->surface != surface.id) continue;
         ++count;
-        if (!item->busy && item->width == width && item->height == height &&
+        if (!item->busy &&
             (!buffer || item->damage.w * item->damage.h < buffer->damage.w * buffer->damage.h)) buffer = item.get();
     }
     if (!buffer) {

@@ -39,6 +39,12 @@ struct Budget {
     }
 };
 
+void validate_value_signature(std::string_view signature) {
+    if (signature.size() > 255) throw std::runtime_error("D-Bus signature exceeds 255 bytes");
+    if (type_end(signature, 0, 0, false) != signature.size())
+        throw std::runtime_error("D-Bus value requires one complete type");
+}
+
 Value read_value(sd_bus_message* message, Budget& budget, unsigned depth) {
     budget.add(depth);
     char type;
@@ -90,8 +96,7 @@ Value read_value(sd_bus_message* message, Budget& budget, unsigned depth) {
 
 void write_value(sd_bus_message* message, const Value& value, Budget& budget, unsigned depth) {
     budget.add(depth);
-    const auto types = split_signature(value.signature, true);
-    if (types.size() != 1) throw std::runtime_error("D-Bus value requires one complete type");
+    // Root and variant signatures are validated; other children match their parent's type.
     const char type = value.signature[0];
     switch (type) {
         case 'b': { const int data = std::get<bool>(value.data); check(sd_bus_message_append_basic(message, type, &data)); break; }
@@ -135,15 +140,22 @@ void write_value(sd_bus_message* message, const Value& value, Budget& budget, un
             std::string contents;
             if (type == 'a') contents = value.signature.substr(1);
             else if (type == '(' || type == '{') contents = value.signature.substr(1, value.signature.size() - 2);
-            else if (type == 'v' && body.size() == 1) contents = body[0].signature;
-            else throw std::runtime_error("invalid D-Bus container");
-            const auto expected = split_signature(contents, type == 'a');
-            if (type != 'a' && body.size() != expected.size()) throw std::runtime_error("D-Bus container arity mismatch");
-            check(sd_bus_message_open_container(message, type == '(' ? 'r' : type == '{' ? 'e' : type, contents.c_str()));
-            for (std::size_t i = 0; i < body.size(); ++i) {
-                if (body[i].signature != expected[type == 'a' ? 0 : i]) throw std::runtime_error("D-Bus container type mismatch");
-                write_value(message, body[i], budget, depth + 1);
+            else if (type == 'v' && body.size() == 1) {
+                validate_value_signature(body[0].signature);
+                contents = body[0].signature;
             }
+            else throw std::runtime_error("invalid D-Bus container");
+            check(sd_bus_message_open_container(message, type == '(' ? 'r' : type == '{' ? 'e' : type, contents.c_str()));
+            std::size_t at = 0;
+            for (const auto& child : body) {
+                if (at == contents.size()) throw std::runtime_error("D-Bus container arity mismatch");
+                const auto end = type == 'a' || type == 'v' ? contents.size() : type_end(contents, at, 0, false);
+                if (child.signature != std::string_view(contents).substr(at, end - at))
+                    throw std::runtime_error("D-Bus container type mismatch");
+                write_value(message, child, budget, depth + 1);
+                if (type != 'a') at = end;
+            }
+            if (type != 'a' && at != contents.size()) throw std::runtime_error("D-Bus container arity mismatch");
             check(sd_bus_message_close_container(message));
         }
     }
@@ -151,15 +163,18 @@ void write_value(sd_bus_message* message, const Value& value, Budget& budget, un
 
 std::string body_signature(const Body& body) {
     std::string result;
-    for (const auto& value : body) result += value.signature;
-    split_signature(result);
+    for (const auto& value : body) {
+        validate_value_signature(value.signature);
+        if (result.size() + value.signature.size() > 255) throw std::runtime_error("D-Bus signature exceeds 255 bytes");
+        result += value.signature;
+    }
     return result;
 }
 
 }
 
 std::vector<std::string> split_signature(const std::string& signature, bool dictionary) {
-    if (signature.size() > 255 || signature.contains('\0')) throw std::runtime_error("D-Bus signature exceeds 255 bytes");
+    if (signature.size() > 255) throw std::runtime_error("D-Bus signature exceeds 255 bytes");
     std::vector<std::string> result;
     for (std::size_t at = 0; at < signature.size();) {
         const auto end = type_end(signature, at, 0, dictionary);

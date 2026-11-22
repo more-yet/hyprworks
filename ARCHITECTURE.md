@@ -21,6 +21,8 @@ CLI: signals and reload loop
 `src/lua/` translates arguments and results and retains callbacks.
 `src/runtime/` owns their construction, scheduling and shutdown.
 GUI files operate directly on their shared owner in `src/gui/gui.hpp`.
+The invocation passes that `Gui` to readiness and delivery functions; the GUI
+holds its owning invocation for callbacks, shutdown requests and wakeups.
 
 `CMakeLists.txt` selects native integrations, then builds the optional Lua
 library and CLI. Wayland scanner generates protocol bindings from the installed
@@ -93,7 +95,7 @@ Event batches transfer to local storage before callbacks can mutate the owner.
 | Element update | Copy candidate → apply supplied properties → resolve live handle → validate identity/budget → swap → invalidate affected geometry/paint | Retained strings keep their validated state; changed strings are checked at parsing. Unchanged shaping survives paint-only updates. |
 | `input.cpp`: input | Queue native packet → validate seat/target generation → Lua input callback → resolve target again → mutate interaction/editor state → interaction callback | Consumed events cancel matching presses. Keyboard activation retains physical key, seat, serial and target until release. Focus changes/tree commits retire presses. |
 | IME/paste | Retain tree/editor identity → receive text → resolve current editor → validate insertion and UTF-8 boundaries → replace → callback | Stale transactions are ignored. Preedit validates independently. Clipboard callbacks validate received text at delivery; editor insertion owns validation on the editing branch. |
-| Clipboard transport | Retain offer → pipe → bounded nonblocking local I/O → completion/timeout → delivery | The source application receives a blocking writer. Transfers own endpoints and deadlines; SIGPIPE handling preserves the caller's signal state. |
+| Clipboard transport | Validate Lua text or borrow a validated editor selection → copy into seat-owned storage → offer/pipe → bounded nonblocking local I/O → completion/timeout → delivery | Selection views last through the ownership copy. The source application receives a blocking writer. Transfers own endpoints and deadlines; SIGPIPE handling preserves the caller's signal state. |
 | Scrolling/focus | Hit-test → walk matching-axis ancestors → consume available range → layout clamp → coalesced change | Focus reveal uses the same geometry. Callback-driven tree replacement requires resolving the next pending target again. |
 | `render.cpp`: layout | Dirty ancestry → intrinsic measurement → width-dependent measurement → arrangement | Retained Pango configuration/natural sizes avoid shaping unchanged text. Hit testing, caret, IME rectangles and painting share arrangement. |
 | Presentation | Damage → configured/frame-ready surface → reusable buffer or bounded allocation → repair region → attach/commit | Busy buffers accumulate repair metadata and remain immutable. Release permits reuse; capacity exhaustion waits. GUI retirement collects orphaned buffers once per turn; render retires resized buffers for its own surface. |
@@ -108,6 +110,16 @@ new submission, the other permits writing storage.
 
 Length-bounded [GLib UTF-8 validation](https://docs.gtk.org/glib/func.utf8_validate.html)
 also rejects embedded NUL bytes, combining both checks in one scan.
+
+Focus mutation and tree commit establish that a focused index names an enabled,
+focusable element. Disabling it clears focus. Input, IME and painting consume
+that invariant. Buffer retirement removes idle buffers with obsolete dimensions
+before render selects a writable buffer.
+
+Native wait generations and descriptor identities protect different cases:
+generations reject old turns, while descriptors distinguish connections whose
+generation counters happen to match. Public native calls validate their own
+inputs; Lua parsing also bounds the allocations needed to construct those inputs.
 
 ## Lua lifetime boundary
 
@@ -134,10 +146,15 @@ the connection that owns its recovery state.
 | Direct ordered callback calls | Removes synthetic event entries, kind switches and repeated selection branches | A few similar calls remain beside each binding's concrete payload conversion |
 | Resolve action handles after parsing | Uses one current handle check after argument conversion and its possible finalizers | Malformed arguments can be reported before a closed-handle error |
 | Validation at mutation/allocation boundaries | Skips retained-string scans, duplicate editor validation and per-frame constraint checks | Each owner must preserve the established invariant until the next mutation |
+| Focus established by mutation and tree commit | Input, IME and painting share one definition of valid focus; debug assertions catch invalid internal assignments | Future focus-changing paths must maintain the same invariant |
+| Clipboard validation at Lua ingress | Editor selection copies reuse validated UTF-8 boundaries; both paths copy directly into seat-owned storage | Borrowed views remain local to the synchronous copy |
+| GUI functions receive their concrete owner | Invocation scheduling selects the optional GUI; each GUI phase receives its owner directly | GUI functions require a live owner supplied by their caller |
 | One owner for orphan-buffer collection | Removes repeated global surface lookups during rendering | Render follows GUI retirement in the event-loop order |
 | One-shot invocation cleanup | Repeated `close()` and destruction share completed teardown | Native resources and Lua storage still retire in separate lifetime phases |
 | Existing invocation + image worker topology | Direct calls and bounded work keep ordering, cancellation and ownership visible | Desktop scans/launch and serial service queries retain their current latency |
 
 Core checks cover callback/finalizer reentrancy, cancellation, stale readiness,
-tree transactions, shared rendering state, clipboard transport and worker
-publication. Live fixtures cover Wayland and D-Bus boundaries.
+tree transactions, retained layout versus fresh layout, delayed buffer repair,
+clipboard transport and worker publication. Image checks use a vector-sized
+block plus a scalar tail through raw RGB/RGBA and in-place PNG conversion.
+Live fixtures cover Wayland and D-Bus boundaries.

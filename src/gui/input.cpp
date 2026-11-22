@@ -9,6 +9,7 @@
 #include <linux/input-event-codes.h>
 #include <pthread.h>
 #include <signal.h>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -421,7 +422,7 @@ void update_ime(Seat& seat) {
     if (!seat.ime) return;
     auto* surface = find_surface(*seat.gui, seat.ime_surface);
     Element* element = surface && surface->focused >= 0 ? &surface->elements[static_cast<std::size_t>(surface->focused)] : nullptr;
-    if (!element || element->kind != Kind::input || !element->enabled || element->password) {
+    if (!element || element->kind != Kind::input || element->password) {
         if (seat.ime_enabled) {
             zwp_text_input_v3_disable(seat.ime); zwp_text_input_v3_commit(seat.ime); ++seat.ime_serial;
         }
@@ -497,10 +498,8 @@ static int adjacent_cursor(Element& element, int position, int direction) {
     return direction < 0 ? 0 : static_cast<int>(element.text.size());
 }
 
-static void copy_selection(Seat& seat, const std::string& text) {
+static void copy_selection(Seat& seat, std::string_view text) {
     if (!seat.gui->data || !seat.data_device || !seat.serial) throw std::runtime_error("clipboard write requires seat input");
-    if (text.size() > 1024 * 1024 || !g_utf8_validate(text.data(), static_cast<gssize>(text.size()), nullptr))
-        throw std::runtime_error("clipboard text must be UTF-8 and at most 1 MiB");
     seat.clipboard = text;
     if (seat.source) wl_data_source_destroy(seat.source);
     seat.source = wl_data_device_manager_create_data_source(seat.gui->data);
@@ -547,8 +546,10 @@ static int clipboard_write(lua_State* lua) {
     auto& gui = gui_state(lua);
     std::size_t length; const char* text = luaL_checklstring(lua, 1, &length);
     if (length > 1024 * 1024) luaL_error(lua, "clipboard text exceeds 1 MiB");
+    if (!g_utf8_validate(text, static_cast<gssize>(length), nullptr))
+        throw std::runtime_error("clipboard text must be valid UTF-8 without NUL");
     if (!gui.event_seat) throw std::runtime_error("clipboard write requires an input callback");
-    copy_selection(*gui.event_seat, std::string(text, length)); lua_pushboolean(lua, true); return 1;
+    copy_selection(*gui.event_seat, {text, length}); lua_pushboolean(lua, true); return 1;
 }
 
 ssize_t write_pipe(int fd, const char* data, std::size_t size) {
@@ -722,7 +723,6 @@ int process_input(Gui& gui, Input& event) {
     }
     if (s.focused < 0) return -1;
     auto& element = s.elements[static_cast<std::size_t>(s.focused)];
-    if (!focusable(element)) return -1;
     if (event.type == Input::Type::ime_leave) {
         if (event.revision == s.revision && event.element == s.focused &&
             !element.preedit.empty() && element.preedit_seat == event.seat) {
@@ -805,7 +805,7 @@ int process_input(Gui& gui, Input& event) {
         if (event.key == XKB_KEY_c || event.key == XKB_KEY_C || event.key == XKB_KEY_x || event.key == XKB_KEY_X) {
             if (element.password) return -1;
             if (begin != end) {
-                copy_selection(*seat, element.text.substr(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
+                copy_selection(*seat, std::string_view(element.text).substr(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
                 if (event.key == XKB_KEY_x || event.key == XKB_KEY_X)
                     return replace_text(s, element, begin, end, "") ? s.focused : -1;
             }
