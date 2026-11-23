@@ -51,7 +51,7 @@ int search_configuration_module(lua_State* lua) {
 }
 
 int quit(lua_State* lua) {
-    const auto code = luaL_optinteger(lua, 1, 0);
+    const auto code = check_integer(lua, 1);
     luaL_argcheck(lua, code >= 0 && code <= 255, 1, "exit code must be between 0 and 255");
     auto& state = invocation(lua);
     state.exit_code = static_cast<int>(code);

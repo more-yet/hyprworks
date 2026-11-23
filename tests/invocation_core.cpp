@@ -24,6 +24,25 @@ int main() {
             }
         };
         script(R"(
+            for _, value in ipairs({"1", 1.0, true}) do
+                assert(not pcall(hw.timer, value, function() end))
+            end
+            assert(not pcall(hw.read_file, 42, 1024))
+            assert(not pcall(hw.read_file, "/unused", "1024"))
+            assert(not pcall(hw.timer, 1, function() end, 1))
+        )");
+        lua_pushcfunction(state.lua, guarded<+[](lua_State* lua) {
+            identifier(lua, check_uint64(lua, 1, 1));
+            return 1;
+        }>);
+        lua_setglobal(state.lua, "identifier");
+        script(R"(
+            assert(identifier("18446744073709551615") == "18446744073709551615")
+            for _, value in ipairs({"0", "-1", "18446744073709551616", "1x", "1\0", 1}) do
+                assert(not pcall(identifier, value))
+            end
+        )");
+        script(R"(
             collectgarbage("stop")
             delivered, finalized = 0, 0
             callback_timer = hw.timer(0, function() error("obsolete callback delivered") end)
@@ -117,7 +136,7 @@ int main() {
     }
     char bytes[4096];
     while (read(pipe[0], bytes, sizeof(bytes)) > 0) {}
-    config("require('hyprworks').quit()");
+    config("require('hyprworks').quit(0)");
     {
         Invocation invocation(EventLoop::headless, &signals);
         request(SignalSource::reload);
@@ -142,14 +161,17 @@ int main() {
     config(R"(
         local hw = require('hyprworks')
         local finished, ticks = 0, 0
-        local first = assert(hw.process {"/bin/sh", "-c", "exec 1>&- 2>&-; sleep 0.03"})
-        local second = assert(hw.process {"/bin/sh", "-c", "sleep 0.01; printf ready"})
+        local options = setmetatable({timeout = 1000, output_limit = 1024}, {
+            __index = function() error("option lookup invoked author code") end,
+        })
+        local first = assert(hw.process({"/bin/sh", "-c", "exec 1>&- 2>&-; sleep 0.03"}, options))
+        local second = assert(hw.process({"/bin/sh", "-c", "sleep 0.01; printf ready"}, options))
         local function exited(process)
             local result = process:result()
             assert(result.outcome == "exited" and result.exit_code == 0)
             if process == second then assert(result.stdout == "ready") end
             finished = finished + 1
-            if finished == 2 then assert(ticks > 0); hw.quit() end
+            if finished == 2 then assert(ticks > 0); hw.quit(0) end
         end
         first:on_exit(exited)
         second:on_exit(exited)
@@ -168,7 +190,7 @@ int main() {
         assert(hw.on_clock_change(function()
             assert(hw.on_clock_change(function()
                 assert(hw.on_clock_change(nil))
-                hw.quit()
+                hw.quit(0)
             end))
         end))
         hw.timer(1000, function() error('clock callback timeout') end)
@@ -181,7 +203,7 @@ int main() {
     {
         hyprworks::host::Process process;
         const std::string arguments[]{"/bin/sh", "-c", "printf ready"};
-        assert(process.start(arguments));
+        assert(process.start(arguments, {.directory = {}, .timeout = std::chrono::seconds(3), .output_limit = 1024}));
         const auto deadline = hyprworks::host::Clock::now() + std::chrono::seconds(3);
         while (process.running()) {
             assert(hyprworks::host::Clock::now() < deadline);

@@ -128,16 +128,16 @@ int audio_refresh(lua_State* lua) {
 
 int audio_set_volume(lua_State* lua) {
     static const char* directions[] = {"output", "input", nullptr};
-    const auto direction = luaL_checkoption(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
+    const auto direction = check_option(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
     std::size_t length = 0;
-    const auto* name = luaL_checklstring(lua, 3, &length);
+    const auto* name = check_string(lua, 3, &length);
     std::array<double, 32> volumes{};
     luaL_checktype(lua, 4, LUA_TTABLE);
     const auto count = lua_rawlen(lua, 4);
     luaL_argcheck(lua, count > 0 && count <= volumes.size(), 4, "expected 1..32 channel volumes");
     for (std::size_t i = 0; i < count; ++i) {
         lua_rawgeti(lua, 4, static_cast<lua_Integer>(i + 1));
-        volumes[i] = luaL_checknumber(lua, -1);
+        volumes[i] = check_number(lua, -1);
         lua_pop(lua, 1);
     }
     auto& binding = audio_handle(lua);
@@ -148,9 +148,9 @@ int audio_set_volume(lua_State* lua) {
 
 int audio_set_mute(lua_State* lua) {
     static const char* directions[] = {"output", "input", nullptr};
-    const auto direction = luaL_checkoption(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
+    const auto direction = check_option(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
     std::size_t length;
-    const char* name = luaL_checklstring(lua, 3, &length);
+    const char* name = check_string(lua, 3, &length);
     luaL_checktype(lua, 4, LUA_TBOOLEAN);
     const bool mute = lua_toboolean(lua, 4);
     auto& binding = audio_handle(lua);
@@ -161,9 +161,9 @@ int audio_set_mute(lua_State* lua) {
 
 int audio_set_default(lua_State* lua) {
     static const char* directions[] = {"output", "input", nullptr};
-    const auto direction = luaL_checkoption(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
+    const auto direction = check_option(lua, 2, nullptr, directions) == 0 ? audio::Direction::output : audio::Direction::input;
     std::size_t length;
-    const char* name = luaL_checklstring(lua, 3, &length);
+    const char* name = check_string(lua, 3, &length);
     auto& binding = audio_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an audio result awaits delivery"); return 2; }
     const auto result = binding.connection.set_default(direction, std::string(name, length));

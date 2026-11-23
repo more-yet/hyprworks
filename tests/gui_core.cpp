@@ -89,6 +89,24 @@ int main(int argc, char**) {
                 assert(pixels[i] == expected);
             }
         }
+        for (const int pixels : {0, 12}) {
+            auto svg = std::make_shared<Image>(work);
+            svg->pixels = pixels;
+            svg->set_data(R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 2"><path fill="red" d="M0 0h4v2H0z"/></svg>)");
+            assert(work.submit(svg));
+            while (!svg->ready.load(std::memory_order_acquire)) {
+                pollfd fd{wake, POLLIN, 0};
+                assert(poll(&fd, 1, 3000) > 0);
+                std::uint64_t value;
+                assert(read(wake, &value, sizeof(value)) == sizeof(value));
+            }
+            assert(svg->encoded.empty());
+            if (pixels) {
+                assert(svg->error.empty() && svg->surface && svg->width == 12 && svg->height == 6);
+            } else {
+                assert(!svg->error.empty() && !svg->surface && svg->bytes == 0);
+            }
+        }
         for (int i = 0; i < 200; ++i) {
             auto job = std::make_shared<Image>(work);
             job->set_data({"\xff\0\0\xff", 4});
@@ -144,7 +162,7 @@ int main(int argc, char**) {
     push_handle(state.lua, {1, 0, -1}, surface_type); lua_setglobal(state.lua, "surface");
     const auto script = [&](const char* source) {
         if (luaL_dostring(state.lua, source) != LUA_OK) {
-            std::cerr << lua_tostring(state.lua, -1) << '\n'; std::abort();
+            std::cerr << lua_tostring(state.lua, -1) << '\n' << source << '\n'; std::abort();
         }
     };
 
@@ -153,11 +171,11 @@ int main(int argc, char**) {
         assert(surface:set_content {
             kind = "column", background = "#ff0000",
             children = {
-                {kind = "input", id = "input", text = "éz", on_change = function()
+                {kind = "input", id = "input", font = "Sans 12", text = "éz", on_change = function()
                     notifications = notifications + 1
                 end},
-                {kind = "button", id = "replace", text = "replace", on_activate = function()
-                    assert(surface:set_content {kind = "text", id = "new", text = "new tree"})
+                {kind = "button", id = "replace", font = "Sans 12", text = "replace", on_activate = function()
+                    assert(surface:set_content {kind = "text", id = "new", font = "Sans 12", text = "new tree"})
                 end},
             },
         })
@@ -235,7 +253,7 @@ int main(int argc, char**) {
     layout(surface);
     const auto caret = input_cursor(input, true);
     assert(std::isfinite(input.scroll) && input.scroll >= 0 && input.scroll <= std::max(0.0, caret.x / double(PANGO_SCALE)));
-    script("assert(input:set {text = 'é日本', password = true, width = 200})");
+    script("assert(input:set {text = 'é日本', password = true, mask = '•', width = 200})");
     layout(surface);
     assert(process_input(surface, backspace) == 1 && input.text == "é日");
     Input left{.type = Input::Type::key, .surface = 1, .key = XKB_KEY_Left, .pressed = true};
@@ -269,11 +287,11 @@ int main(int argc, char**) {
     assert(xkb_compose_state_get_status(keyboard->compose) == XKB_COMPOSE_NOTHING);
     script("assert(not input:set {text = 'stale'}); assert(notifications == 0)");
 
-    script("assert(surface:set_content {kind = 'slider', width = 200, height = 30})");
-    press.x = 4; press.y = 15;
+    script("assert(surface:set_content {kind = 'slider', horizontal = true, jump = true, width = 200, height = 30})");
+    press.x = 0; press.y = 15;
     assert(process_input(surface, press) == -1 && surface.pressed == 0);
     Input motion{.type = Input::Type::motion, .surface = 1, .seat = 12, .x = 196, .y = 15};
-    motion.x = surface.elements[0].box.x + surface.elements[0].box.w - 4;
+    motion.x = surface.elements[0].box.x + surface.elements[0].box.w;
     assert(process_input(surface, motion) == -1 && surface.elements[0].value == 0);
     motion.seat = 11; motion.touch = true;
     assert(process_input(surface, motion) == -1 && surface.elements[0].value == 0);
@@ -287,8 +305,8 @@ int main(int argc, char**) {
 
     script(R"(
         assert(surface:set_content {kind = "column", children = {
-            {kind = "box", id = "branch", children = {{kind = "text", id = "removed", text = "old"}}},
-            {kind = "input", id = "retained", text = "selection"},
+            {kind = "box", id = "branch", children = {{kind = "text", id = "removed", font = "Sans 12", text = "old"}}},
+            {kind = "input", id = "retained", font = "Sans 12", text = "selection"},
         }})
         branch = assert(surface:find("branch"))
         retained = assert(surface:find("retained"))
@@ -297,8 +315,8 @@ int main(int argc, char**) {
         assert(surface:find("removed"))
         assert(retained:state().text == "selection")
         assert(branch:replace_children {
-            {kind = "button", id = "new", children = {{kind = "text", text = "new"}}},
-            {kind = "text", id = "tail", text = "tail"},
+            {kind = "button", id = "new", children = {{kind = "text", font = "Sans 12", text = "new"}}},
+            {kind = "text", id = "tail", font = "Sans 12", text = "tail"},
         })
         assert(not retained:set {text = "stale"})
         assert(not surface:find("removed"))
@@ -309,7 +327,7 @@ int main(int argc, char**) {
     script(R"(
         assert(surface:find("branch"):replace_children {})
         assert(surface:find("retained"):state().text == "selection")
-        assert(surface:find("branch"):replace_children {{kind = "text", id = "inserted", text = "inserted"}})
+        assert(surface:find("branch"):replace_children {{kind = "text", id = "inserted", font = "Sans 12", text = "inserted"}})
     )");
     assert(surface.focused == 3 && surface.elements[0].end == 4 && surface.elements[1].end == 3);
     const auto index_of = [&](std::string_view id) {
@@ -319,10 +337,10 @@ int main(int argc, char**) {
     };
     script(R"(
         function editor_tree(reordered)
-            local editor = {kind = "input", id = "editor", text = "aé日z"}
-            local button = {kind = "button", id = "action", text = "Action"}
+            local editor = {kind = "input", id = "editor", font = "Sans 12", text = "aé日z"}
+            local button = {kind = "button", id = "action", font = "Sans 12", text = "Action"}
             return {kind = "column", id = "root", children = reordered and {
-                {kind = "text", text = "inserted"}, button, editor,
+                {kind = "text", font = "Sans 12", text = "inserted"}, button, editor,
             } or {editor, button}}
         end
         assert(surface:set_content(editor_tree(false)))
@@ -371,11 +389,13 @@ int main(int argc, char**) {
     const auto transaction_revision = surface.revision;
     script(R"(
         assert(not surface:set_content({kind = "column", children = {
-            {kind = "input", id = "editor", text = "changed"}, {kind = "button", id = "editor"},
+            {kind = "input", id = "editor", font = "Sans 12", text = "changed"}, {kind = "button", id = "editor"},
         }}, {preserve_state = true}))
         assert(not pcall(function()
             surface:find("root"):replace_children({{kind = "input", text = "\255"}}, {preserve_state = true})
         end))
+        assert(not pcall(function() surface:find("editor"):set {text = "\0"} end))
+        assert(not pcall(function() surface:find("editor"):set {accessibility = {name = "\255"}} end))
     )");
     assert(surface.revision == transaction_revision && surface.focused == index_of("editor"));
     assert(surface.elements[static_cast<std::size_t>(surface.focused)].cursor == 3);
@@ -414,7 +434,7 @@ int main(int argc, char**) {
 
     script(R"(
         assert(surface:set_content {kind = "row", children = {
-            {kind = "button", id = "key", text = "Activate", on_activate = function() activations = activations + 1 end},
+            {kind = "button", id = "key", font = "Sans 12", text = "Activate", on_activate = function() activations = activations + 1 end},
             {kind = "toggle", id = "toggle"},
         }})
         assert(surface:find("key"):focus())
@@ -445,7 +465,7 @@ int main(int argc, char**) {
     assert(process_input(surface, key_release) == -1);
     process_input(surface, key_press);
     script(R"(
-        assert(surface:set_content({kind = "button", id = "key",
+        assert(surface:set_content({kind = "button", id = "key", font = "Sans 12",
             on_activate = function() activations = activations + 1 end}, {preserve_state = true}))
     )");
     assert(surface.focused == 0 && process_input(surface, key_release) == -1);
@@ -489,14 +509,14 @@ int main(int argc, char**) {
         nested_events = 0
         local function changed() nested_events = nested_events + 1 end
         assert(surface:set_content {kind = "box", children = {
-            {kind = "scroll", id = "outer", width = 100, height = 100, on_change = changed, children = {
+            {kind = "scroll", id = "outer", horizontal = false, width = 100, height = 100, on_change = changed, children = {
                 {kind = "column", height = 300, children = {
-                    {kind = "scroll", id = "inner", width = 100, height = 80, on_change = changed,
+                    {kind = "scroll", id = "inner", horizontal = false, width = 100, height = 80, on_change = changed,
                         children = {{kind = "box", height = 100}}},
                     {kind = "box", height = 220},
                 }},
             }},
-            {kind = "scroll", id = "sibling", x = 150, width = 100, height = 100,
+            {kind = "scroll", id = "sibling", horizontal = false, x = 150, width = 100, height = 100,
                 children = {{kind = "box", height = 300}}},
         }})
     )");
@@ -576,14 +596,137 @@ int main(int argc, char**) {
     assert(dispatch_scroll(surface) == 0);
     script("assert(#scroll_events == 3)");
     {
+        script(R"(
+            drag_events = 0
+            function drag_tree(horizontal)
+                return {kind = "box", children = {
+                    {kind = "slider", id = "drag", scroll_target = "viewport", horizontal = horizontal,
+                        x = 130, y = 20, width = horizontal and 100 or 20, height = horizontal and 20 or 100,
+                        jump = true, children = {{kind = "box", id = "thumb", thumb = true}}},
+                    {kind = "scroll", id = "viewport", x = 30, y = 20,
+                        width = 100, height = 100, horizontal = horizontal,
+                        children = {{kind = "box", width = 400, height = 400}},
+                        on_change = function(element)
+                            drag_events = drag_events + 1
+                            assert(element:replace_children({{kind = "box", width = 400, height = 400}}))
+                        end},
+                }}
+            end
+            assert(surface:set_content {kind = "box", id = "root", children = {drag_tree(false)}})
+        )");
+        layout(surface);
+        const auto thumb = surface.elements[static_cast<std::size_t>(index_of("thumb"))].box;
+        Input hover{.type = Input::Type::motion, .surface = 1, .seat = 7,
+            .x = thumb.x + 1, .y = thumb.y + thumb.h / 2};
+        Input grab = hover;
+        grab.type = Input::Type::button; grab.key = BTN_LEFT; grab.pressed = true;
+        process_input(surface, grab);
+        assert(surface.pressed == index_of("drag"));
+        const auto drag_revision = surface.revision;
+        script(R"(
+            local tree = drag_tree(false)
+            tree.children[1].scroll_target = "missing"
+            assert(not surface:set_content(tree, {preserve_state = true}))
+            assert(not surface:find("drag"):replace_children {
+                {kind = "box", thumb = true}, {kind = "box", thumb = true},
+            })
+            assert(not surface:find("drag"):replace_children {
+                {kind = "box", thumb = true, children = {
+                    {kind = "scroll", horizontal = false},
+                }},
+            })
+        )");
+        assert(surface.revision == drag_revision && surface.pressed == index_of("drag"));
+        auto drag = hover;
+        drag.x += 100; drag.y += 35;
+        drag.seat = 8;
+        process_input(surface, drag);
+        assert(surface.elements[static_cast<std::size_t>(index_of("viewport"))].scroll == 0);
+        drag.seat = 7; drag.touch = true;
+        process_input(surface, drag);
+        assert(surface.elements[static_cast<std::size_t>(index_of("viewport"))].scroll == 0);
+        drag.touch = false;
+        process_input(surface, drag);
+        assert(surface.elements[static_cast<std::size_t>(index_of("viewport"))].scroll > 0);
+        assert(dispatch_scroll(surface) == 0);
+        assert(surface.pressed == index_of("drag"));
+        script("assert(drag_events == 1)");
+        drag.y += 500;
+        process_input(surface, drag);
+        assert(dispatch_scroll(surface) == 0);
+        layout(surface);
+        const auto& scrolled = surface.elements[static_cast<std::size_t>(index_of("viewport"))];
+        assert(scrolled.scroll == scrolled.scroll_limit);
+        Input drop = drag;
+        drop.type = Input::Type::button; drop.key = BTN_LEFT; drop.pressed = false;
+        enqueue(*keyboard, drop);
+        script(R"(
+            assert(surface:find("root"):replace_children({
+                {kind = "box", width = 1, height = 1}, drag_tree(false),
+            }, {preserve_state = true}))
+        )");
+        assert(surface.pressed == index_of("drag") && gui.events[0].surface == 1);
+        assert(dispatch_input(gui) == 0 && surface.pressed == -1);
+        const auto stopped = surface.elements[static_cast<std::size_t>(index_of("viewport"))].scroll;
+        drag.y = 0;
+        process_input(surface, drag);
+        assert(surface.elements[static_cast<std::size_t>(index_of("viewport"))].scroll == stopped);
+
+        script("assert(surface:find('viewport'):set {scroll = 0})");
+        grab.y = 119;
+        process_input(surface, grab);
+        assert(surface.pressed == index_of("drag"));
+        assert(surface.elements[static_cast<std::size_t>(index_of("viewport"))].scroll > 0);
+        script("assert(surface:find('viewport'):set {enabled = false})");
+        assert(surface.pressed == -1);
+        process_input(surface, grab);
+        assert(surface.pressed == -1);
+
+        script("assert(surface:set_content {kind = 'box', children = {drag_tree(true)}})");
+        layout(surface);
+        const auto horizontal = surface.elements[static_cast<std::size_t>(index_of("thumb"))].box;
+        grab.x = horizontal.x + horizontal.w / 2; grab.y = horizontal.y + 1;
+        process_input(surface, grab);
+        assert(surface.pressed == index_of("drag"));
+        drag.x = 500; drag.y = grab.y;
+        process_input(surface, drag);
+        assert(dispatch_scroll(surface) == 0);
+        const auto& horizontal_scroll = surface.elements[static_cast<std::size_t>(index_of("viewport"))];
+        assert(horizontal_scroll.scroll == horizontal_scroll.scroll_limit);
+        Input cancel{.type = Input::Type::blur, .surface = 1, .seat = 7};
+        process_input(surface, cancel);
+        assert(surface.pressed == -1);
+
+        script(R"(
+            assert(surface:set_content {kind = "box", children = {
+                drag_tree(false),
+                {kind = "button", id = "cover", x = 130, y = 20, width = 20, height = 100},
+            }})
+        )");
+        grab.x = thumb.x + 1; grab.y = thumb.y + 1;
+        process_input(surface, grab);
+        assert(surface.pressed == index_of("cover"));
+        script("assert(surface:set_content {kind = 'box', children = {{kind = 'box', width = 80, children = {drag_tree(false)}}}})");
+        process_input(surface, grab);
+        assert(surface.pressed == -1);
+        script(R"(
+            local tree = drag_tree(false)
+            tree.children[2].children = {{kind = "box", height = 10}}
+            assert(surface:set_content(tree))
+        )");
+        process_input(surface, grab);
+        process_input(surface, drag);
+        assert(surface.elements[static_cast<std::size_t>(index_of("viewport"))].scroll == 0);
+    }
+    {
         surface.width = 480; surface.height = 160; surface.scale = 1.25;
         script(R"(
             assert(surface:set_content {kind = "box", background = "#203040", children = {
                 {kind = "column", width = 120, children = {
-                    {kind = "text", id = "paint", text = "Paint", width = 100, wrap = true},
-                    {kind = "button", id = "below", text = "Below"},
+                    {kind = "text", id = "paint", font = "Sans 12", color = "#ffffff", text = "Paint", width = 100, wrap = true},
+                    {kind = "button", id = "below", font = "Sans 12", color = "#ffffff", text = "Below"},
                 }},
-                {kind = "text", id = "stable", text = "Unchanged shaping", x = 200, width = 220},
+                {kind = "text", id = "stable", font = "Sans 12", color = "#ffffff", text = "Unchanged shaping", x = 200, width = 220},
                 {kind = "box", x = 30, y = 10, width = 40, height = 40, background = "#ff000060"},
             }})
         )");
@@ -635,10 +778,10 @@ int main(int argc, char**) {
         for (std::size_t i = 0; i < boxes.size(); ++i) assert(surface.elements[i].box == boxes[i]);
         paint_buffer(surface, first); compare(first);
         script(R"(
-            assert(surface:set_content {kind = "scroll", id = "viewport", background = "#203040", children = {
+            assert(surface:set_content {kind = "scroll", id = "viewport", horizontal = false, background = "#203040", children = {
                 {kind = "column", children = {
-                    {kind = "text", id = "moving", text = "Scroll contents", height = 100},
-                    {kind = "input", id = "edit", text = "Editor", height = 100},
+                    {kind = "text", id = "moving", font = "Sans 12", color = "#ffffff", text = "Scroll contents", height = 100},
+                    {kind = "input", id = "edit", font = "Sans 12", color = "#ffffff", text = "Editor", height = 100},
                     {kind = "box", height = 100, background = "#ff000080"},
                 }},
             }})
@@ -654,16 +797,16 @@ int main(int argc, char**) {
             lua_pushstring(state.lua, kind); lua_setglobal(state.lua, "cached_kind");
             script(R"(
                 cached_tree = {kind = "column", padding = 5, children = {
-                    {kind = cached_kind, id = "cached", text = "aé日", placeholder = "Placeholder"},
-                    {kind = "text", id = "wrapped", text = "Words that wrap onto multiple lines",
+                    {kind = cached_kind, id = "cached", font = "Sans 12", color = "#ffffff", text = "aé日", placeholder = "Placeholder"},
+                    {kind = "text", id = "wrapped", font = "Sans 12", color = "#ffffff", text = "Words that wrap onto multiple lines",
                         width = 90, wrap = true},
                 }}
                 assert(surface:set_content(cached_tree))
             )");
             paint_buffer(surface, first);
             for (const auto* change : {
-                "{}", "{text = 'A longer replacement'}", "{font = 'Serif 18'}",
-                "{text = '', placeholder = 'Changed placeholder'}", "{text = 'é日', password = true}",
+                "{text = 'A longer replacement'}", "{font = 'Serif 18'}",
+                "{text = '', placeholder = 'Changed placeholder'}", "{text = 'é日', password = true, mask = '•'}",
                 "{password = false, padding = 12, width = 80}", "{align = 'right', wrap = true}",
             }) {
                 script((std::string("change = ") + change + R"(
@@ -791,7 +934,7 @@ int main(int argc, char**) {
         group_events.workspace_enter(group, group->native, target->native);
         workspace_events.name(target, target->native, "test");
         script(R"(
-            capture_options = {name = "test", output = "screen", max_width = 8, max_height = 8}
+            capture_options = {name = "test", output = "screen", mode = "windows_only", max_width = 8, max_height = 8, max_fps = 1}
             capture_frames, capture_ended = 0, 0
             function captured(handle, event)
                 if event.kind == "frame" then
@@ -955,7 +1098,7 @@ int main(int argc, char**) {
 
     script(R"(
         assert(surface:set_content {
-            kind = "button", text = "close",
+            kind = "button", text = "close", font = "Sans 12",
             on_activate = function() surface:close() end,
         })
     )");

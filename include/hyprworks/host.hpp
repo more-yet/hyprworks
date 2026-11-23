@@ -29,8 +29,8 @@ private:
 
 struct ProcessOptions {
     std::string directory;
-    std::chrono::milliseconds timeout{30000};
-    std::size_t output_limit = 1024 * 1024;
+    std::chrono::milliseconds timeout{};
+    std::size_t output_limit = 0;
 };
 
 enum class ProcessOutcome { exited, signalled, cancelled, timed_out, failed };
@@ -57,7 +57,7 @@ public:
     ~Process();
     Process(const Process&) = delete;
     Process& operator=(const Process&) = delete;
-    std::expected<void, std::string> start(std::span<const std::string> arguments, const ProcessOptions& options = {});
+    std::expected<void, std::string> start(std::span<const std::string> arguments, const ProcessOptions& options);
     void cancel() noexcept;
     bool running() const noexcept;
     const std::optional<ProcessResult>& result() const noexcept;
@@ -70,7 +70,7 @@ private:
 
 /// Transfers application lifetime to a detached process; returns after exec.
 std::expected<void, std::string> launch(std::span<const std::string> arguments, const std::string& directory = {});
-std::expected<std::string, std::string> read_file(const std::string& path, std::size_t limit = 1024 * 1024);
+std::expected<std::string, std::string> read_file(const std::string& path, std::size_t limit);
 std::expected<void, std::string> write_file(const std::string& path, const std::string& contents);
 
 struct FileUpdate {

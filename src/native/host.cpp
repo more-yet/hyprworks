@@ -226,7 +226,8 @@ std::expected<void, std::string> launch(std::span<const std::string> arguments, 
         if (!executable.contains('/')) {
             const auto base = directory.empty() ? std::filesystem::current_path() : std::filesystem::absolute(directory);
             const char* env_path = std::getenv("PATH");
-            const std::string search = env_path ? env_path : "/usr/bin:/bin";
+            if (!env_path) throw std::runtime_error("PATH is unset; supply an executable path");
+            const std::string_view search(env_path);
             bool found = false;
             for (std::size_t begin = 0; begin <= search.size();) {
                 const auto end = search.find(':', begin);

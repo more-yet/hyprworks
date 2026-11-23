@@ -73,8 +73,8 @@ public:
     std::expected<void, std::string> start(bool own_watcher = false, const std::string& address = {});
     std::optional<RequestResult> stop() noexcept;
     std::expected<void, std::string> refresh();
-    std::expected<std::uint64_t, std::string> action(const ItemKey& item, Action action, std::int32_t x = 0, std::int32_t y = 0);
-    std::expected<std::uint64_t, std::string> scroll(const ItemKey& item, std::int32_t delta, bool horizontal = false);
+    std::expected<std::uint64_t, std::string> action(const ItemKey& item, Action action, std::int32_t x, std::int32_t y);
+    std::expected<std::uint64_t, std::string> scroll(const ItemKey& item, std::int32_t delta, bool horizontal);
     WaitSet prepare_wait();
     Update dispatch(const WaitSet& ready);
     const Status& status() const noexcept;

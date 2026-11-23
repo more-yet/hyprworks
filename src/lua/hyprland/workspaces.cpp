@@ -38,7 +38,7 @@ void push_error(lua_State* lua, const native::Error& error) {
 int error_tostring(lua_State* lua) {
     lua_getfield(lua, 1, "operation");
     lua_getfield(lua, 1, "message");
-    lua_pushfstring(lua, "%s: %s", luaL_checkstring(lua, -2), luaL_checkstring(lua, -1));
+    lua_pushfstring(lua, "%s: %s", check_string(lua, -2), check_string(lua, -1));
     return 1;
 }
 
@@ -184,7 +184,7 @@ int workspace_open(lua_State* lua) {
     if (state.closing)
         return luaL_error(lua, "invocation is shutting down");
     std::size_t length = 0;
-    const char* path = lua_isnoneornil(lua, 1) ? nullptr : luaL_checklstring(lua, 1, &length);
+    const char* path = lua_isnoneornil(lua, 1) ? nullptr : check_string(lua, 1, &length);
     auto result = open_workspace(state, path, length);
     if (!result) return protected_call(lua, [&](lua_State* lua) {
         lua_pushnil(lua); push_error(lua, result.error()); return 2;
@@ -213,9 +213,9 @@ int workspace_status(lua_State* lua) {
 
 int workspace_switch(lua_State* lua) {
     static const char* types[] = {"normal", "special", nullptr};
-    const int type = luaL_checkoption(lua, 2, nullptr, types);
+    const int type = check_option(lua, 2, nullptr, types);
     std::size_t length;
-    const char* address = luaL_checklstring(lua, 3, &length);
+    const char* address = check_string(lua, 3, &length);
     auto& binding = workspace(lua);
     auto result = binding.result ?
         std::expected<std::uint64_t, native::Error>(std::unexpected(native::Error{

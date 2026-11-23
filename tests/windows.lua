@@ -3,7 +3,7 @@ local windows = assert(hw.hyprland.windows())
 local window = assert(hw.window {
     width = 640, height = 360, app_id = "org.hyprworks.WindowCheck", title = "Window subscription check",
 })
-assert(window:set_content {kind = "text", text = "Capture lifecycle", background = "#223344"})
+assert(window:set_content {kind = "text", font = "Sans 12", color = "#ffffff", text = "Capture lifecycle", background = "#223344"})
 
 local stage, frames, original_id, unavailable = 0, 0, nil, false
 windows:on_status(function()
@@ -33,10 +33,11 @@ windows:on_change(function()
         end))
     elseif stage == 2 then
         assert(target.id ~= original_id)
-        assert(not windows:capture(original_id, {}, function() error("stale identity captured") end))
-        local cancelled = assert(windows:capture(target.id, {}, function() error("cancelled capture callback") end))
+        local options = {max_width = 160, max_height = 90, max_fps = 2}
+        assert(not windows:capture(original_id, options, function() error("stale identity captured") end))
+        local cancelled = assert(windows:capture(target.id, options, function() error("cancelled capture callback") end))
         cancelled:close()
-        assert(windows:capture(target.id, {}, function(capture, event)
+        assert(windows:capture(target.id, options, function(capture, event)
             assert(stage == 3 and event.kind == "unavailable", event.error)
             unavailable = true
             capture:close()
@@ -54,6 +55,6 @@ hw.timer(25, function(timer)
     assert(frames == 1)
     windows:close()
     print("Windows: snapshot, capture lifetime, restart identities, cancellation and unavailability passed")
-    hw.quit()
+    hw.quit(0)
 end)
 hw.timer(8000, function() error("window subscription check timed out") end)

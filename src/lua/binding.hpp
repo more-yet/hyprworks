@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <expected>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -66,21 +67,62 @@ inline void field(lua_State* lua, int table, const char* name) {
     lua_rawget(lua, table);
 }
 
-inline lua_Integer integer_field(lua_State* lua, int table, const char* name, lua_Integer fallback,
+inline const char* check_string(lua_State* lua, int index, std::size_t* length = nullptr) {
+    luaL_checktype(lua, index, LUA_TSTRING);
+    return lua_tolstring(lua, index, length);
+}
+
+// Native exceptions unwind owning D-Bus parsing locals before guarded raises Lua errors.
+inline std::uint64_t check_uint64(lua_State* lua, int index, std::uint64_t minimum = 0) {
+    if (lua_type(lua, index) != LUA_TSTRING) throw std::runtime_error("expected a uint64 decimal string");
+    std::size_t size;
+    const char* text = lua_tolstring(lua, index, &size);
+    if (size > 20) throw std::runtime_error("uint64 decimal string exceeds 20 bytes");
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text, text + size, value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text + size || value < minimum)
+        throw std::runtime_error("invalid uint64 decimal string");
+    return value;
+}
+
+inline lua_Integer check_integer(lua_State* lua, int index) {
+    if (!lua_isinteger(lua, index)) luaL_argerror(lua, index, "integer expected");
+    return lua_tointeger(lua, index);
+}
+
+inline lua_Number check_number(lua_State* lua, int index) {
+    luaL_checktype(lua, index, LUA_TNUMBER);
+    return lua_tonumber(lua, index);
+}
+
+inline int check_option(lua_State* lua, int index, const char* absent, const char* const* choices) {
+    std::string_view value;
+    if (absent && lua_isnoneornil(lua, index)) value = absent;
+    else {
+        std::size_t length;
+        const char* text = check_string(lua, index, &length);
+        value = {text, length};
+    }
+    for (int i = 0; choices[i]; ++i)
+        if (value == choices[i]) return i;
+    return luaL_argerror(lua, index, "invalid option");
+}
+
+inline lua_Integer integer_field(lua_State* lua, int table, const char* name, std::optional<lua_Integer> absent,
                           lua_Integer minimum = 0, lua_Integer maximum = 16384) {
     field(lua, table, name);
-    const auto value = luaL_optinteger(lua, -1, fallback);
+    const auto value = absent && lua_isnil(lua, -1) ? *absent : check_integer(lua, -1);
     if (value < minimum || value > maximum)
         luaL_error(lua, "%s is out of range", name);
     lua_pop(lua, 1);
     return value;
 }
 
-inline bool boolean_field(lua_State* lua, int table, const char* name, bool fallback) {
+inline bool boolean_field(lua_State* lua, int table, const char* name, std::optional<bool> absent) {
     field(lua, table, name);
-    if (!lua_isnil(lua, -1))
+    if (!absent || !lua_isnil(lua, -1))
         luaL_checktype(lua, -1, LUA_TBOOLEAN);
-    const bool value = lua_isnil(lua, -1) ? fallback : lua_toboolean(lua, -1);
+    const bool value = absent && lua_isnil(lua, -1) ? *absent : lua_toboolean(lua, -1);
     lua_pop(lua, 1);
     return value;
 }
@@ -101,9 +143,9 @@ inline bool text_field(lua_State* lua, int table, const char* name, std::string&
     return changed;
 }
 
-inline int enum_field(lua_State* lua, int table, const char* name, const char* fallback, const char* const* choices) {
+inline int enum_field(lua_State* lua, int table, const char* name, const char* current, const char* const* choices) {
     field(lua, table, name);
-    const int value = luaL_checkoption(lua, -1, fallback, choices);
+    const int value = check_option(lua, -1, current, choices);
     lua_pop(lua, 1);
     return value;
 }

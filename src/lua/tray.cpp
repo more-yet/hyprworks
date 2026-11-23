@@ -27,9 +27,7 @@ int tray_open(lua_State* lua) {
     bool own = false;
     if (!lua_isnoneornil(lua, 1)) {
         luaL_checktype(lua, 1, LUA_TTABLE);
-        lua_getfield(lua, 1, "own_watcher");
-        if (!lua_isnil(lua, -1)) luaL_checktype(lua, -1, LUA_TBOOLEAN);
-        own = lua_toboolean(lua, -1); lua_pop(lua, 1);
+        own = boolean_field(lua, 1, "own_watcher", false);
     }
     if (!state.tray) {
         state.tray.emplace(); state.tray->own_watcher = own;
@@ -42,11 +40,11 @@ int menu_open(lua_State* lua) {
     auto& state = invocation(lua);
     if (state.closing) return luaL_error(lua, "invocation is shutting down");
     luaL_checktype(lua, 1, LUA_TTABLE);
-    lua_getfield(lua, 1, "owner");
+    field(lua, 1, "owner");
     std::size_t owner_length, path_length;
-    const char* owner = luaL_checklstring(lua, -1, &owner_length);
-    lua_getfield(lua, 1, "path");
-    const char* path = luaL_checklstring(lua, -1, &path_length);
+    const char* owner = check_string(lua, -1, &owner_length);
+    field(lua, 1, "path");
+    const char* path = check_string(lua, -1, &path_length);
     luaL_argcheck(lua, owner_length <= 255 && path_length <= 16384, 1, "invalid menu target");
     if (state.menus.size() >= 32) return luaL_error(lua, "menu handle limit reached");
     auto created = std::make_unique<MenuBinding>();
@@ -238,8 +236,8 @@ int menu_restart(lua_State* lua) {
         if (protected_call(lua, [&](lua_State* lua) {
             luaL_checktype(lua, 2, LUA_TTABLE);
             for (const auto& [name, value] : {std::pair{"owner", &target.owner}, {"path", &target.path}}) {
-                lua_getfield(lua, 2, name);
-                std::size_t size; const char* text = luaL_checklstring(lua, -1, &size);
+                field(lua, 2, name);
+                std::size_t size; const char* text = check_string(lua, -1, &size);
                 luaL_argcheck(lua, size <= 16384, 2, "menu target exceeds 16 KiB");
                 value->assign(text, size); lua_pop(lua, 1);
             }
@@ -275,13 +273,13 @@ int tray_action(lua_State* lua) {
     lua_settop(lua, 5);
     const char* parts[3]; std::size_t sizes[3];
     unsigned i = 0;
-    for (const auto* field : {"service", "owner", "path"}) {
-        lua_getfield(lua, 2, field); parts[i] = luaL_checklstring(lua, -1, &sizes[i]);
+    for (const auto* name : {"service", "owner", "path"}) {
+        field(lua, 2, name); parts[i] = check_string(lua, -1, &sizes[i]);
         luaL_argcheck(lua, sizes[i] <= (i == 2 ? 16384U : 255U), 2, "invalid tray key"); ++i;
     }
     static const char* actions[] = {"activate", "secondary_activate", "context_menu", nullptr};
-    const auto action = luaL_checkoption(lua, 3, nullptr, actions);
-    const auto x = luaL_optinteger(lua, 4, 0), y = luaL_optinteger(lua, 5, 0);
+    const auto action = check_option(lua, 3, nullptr, actions);
+    const auto x = check_integer(lua, 4), y = check_integer(lua, 5);
     luaL_argcheck(lua, x >= INT32_MIN && x <= INT32_MAX && y >= INT32_MIN && y <= INT32_MAX, 3, "coordinate or delta exceeds int32");
     auto& binding = tray_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
@@ -295,13 +293,13 @@ int tray_scroll(lua_State* lua) {
     lua_settop(lua, 4);
     const char* parts[3]; std::size_t sizes[3];
     unsigned i = 0;
-    for (const auto* field : {"service", "owner", "path"}) {
-        lua_getfield(lua, 2, field); parts[i] = luaL_checklstring(lua, -1, &sizes[i]);
+    for (const auto* name : {"service", "owner", "path"}) {
+        field(lua, 2, name); parts[i] = check_string(lua, -1, &sizes[i]);
         luaL_argcheck(lua, sizes[i] <= (i == 2 ? 16384U : 255U), 2, "invalid tray key"); ++i;
     }
-    const auto delta = luaL_checkinteger(lua, 3);
+    const auto delta = check_integer(lua, 3);
     static const char* directions[] = {"vertical", "horizontal", nullptr};
-    const bool horizontal = luaL_checkoption(lua, 4, "vertical", directions) == 1;
+    const bool horizontal = check_option(lua, 4, nullptr, directions) == 1;
     luaL_argcheck(lua, delta >= INT32_MIN && delta <= INT32_MAX, 3, "coordinate or delta exceeds int32");
     auto& binding = tray_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
@@ -311,7 +309,7 @@ int tray_scroll(lua_State* lua) {
 }
 
 int menu_about_to_show(lua_State* lua) {
-    const auto id = luaL_optinteger(lua, 2, 0);
+    const auto id = check_integer(lua, 2);
     luaL_argcheck(lua, id >= 0 && id <= INT32_MAX, 2, "invalid menu item ID");
     auto& binding = menu_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
@@ -320,11 +318,11 @@ int menu_about_to_show(lua_State* lua) {
 }
 
 int menu_event(lua_State* lua) {
-    const auto id = luaL_optinteger(lua, 2, 0);
+    const auto id = check_integer(lua, 2);
     luaL_argcheck(lua, id >= 0 && id <= INT32_MAX, 2, "invalid menu item ID");
     std::size_t length;
-    const char* event = luaL_checklstring(lua, 3, &length);
-    const auto timestamp = luaL_optinteger(lua, 4, 0);
+    const char* event = check_string(lua, 3, &length);
+    const auto timestamp = check_integer(lua, 4);
     luaL_argcheck(lua, length <= 128 && timestamp >= 0 && timestamp <= UINT32_MAX, 3, "invalid menu event or timestamp");
     auto& binding = menu_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }

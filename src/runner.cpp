@@ -45,26 +45,26 @@ void start_signals() {
 
 int main(int argc, char** argv) {
     bool gui = HYPRWORKS_DEFAULT_GUI;
-    const char* config_file = nullptr;
+    const char* entry_name = "main.lua";
     int entry = 1;
     while (entry < argc) {
         const std::string_view option(argv[entry]);
         if (option == "--headless") gui = false;
-        else if (option == "--config" || option == "-c") {
-            if (++entry == argc || !*argv[entry]) {
-                std::cerr << option << " requires a Lua configuration file\n";
+        else if (option == "--entry") {
+            if (++entry == argc || !*argv[entry] || std::string_view(argv[entry]).contains('/') ||
+                std::string_view(argv[entry]) == "." || std::string_view(argv[entry]) == "..") {
+                std::cerr << "--entry requires a filename in the configuration directory\n";
                 return 2;
             }
-            config_file = argv[entry];
+            entry_name = argv[entry];
         } else if (option == "--version" || option == "-v") {
             std::cout << "hyprworks " << HYPRWORKS_VERSION << '\n';
             return 0;
         } else if (option == "--help" || option == "-h") {
             std::cout << "usage: hyprworks [OPTIONS] [-- ARGUMENT ...]\n"
-                      << "Load $XDG_CONFIG_HOME/hyprworks/main.lua\n"
-                      << "(default: $HOME/.config/hyprworks/main.lua).\n"
+                      << "Load main.lua from $HYPRWORKS_CONFIG_DIR (required absolute directory).\n"
                       << "Reload automatically when the entry file or a required local Lua module changes.\n\n"
-                      << "  -c, --config FILE  Use another Lua configuration file\n"
+                      << "      --entry FILE   Select a filename in the configuration directory (main.lua)\n"
                       << "      --headless     Run the headless event loop\n"
                       << "  -v, --version      Print the version\n"
                       << "  -h, --help         Show this help\n";
@@ -79,21 +79,10 @@ int main(int argc, char** argv) {
         ++entry;
     }
     try {
-        std::filesystem::path entry_file;
-        if (config_file)
-            entry_file = config_file;
-        else {
-            const char* config = std::getenv("XDG_CONFIG_HOME");
-            if (config && std::filesystem::path(config).is_absolute())
-                entry_file = std::filesystem::path(config) / "hyprworks/main.lua";
-            else {
-                const char* home = std::getenv("HOME");
-                if (!home || !std::filesystem::path(home).is_absolute())
-                    throw std::runtime_error("set an absolute XDG_CONFIG_HOME or HOME, or use --config FILE");
-                entry_file = std::filesystem::path(home) / ".config/hyprworks/main.lua";
-            }
-        }
-        const auto filename = std::filesystem::absolute(entry_file).lexically_normal().string();
+        const char* directory = std::getenv("HYPRWORKS_CONFIG_DIR");
+        if (!directory || !std::filesystem::path(directory).is_absolute())
+            throw std::runtime_error("set HYPRWORKS_CONFIG_DIR to an absolute directory");
+        const auto filename = (std::filesystem::path(directory) / entry_name).lexically_normal().string();
         std::vector<std::string> arguments(argv + entry, argv + argc);
         start_signals();
         for (;;) {

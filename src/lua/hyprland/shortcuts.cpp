@@ -39,14 +39,14 @@ int shortcut_open(lua_State* lua) {
         lua_pushvalue(lua, 1);
         if (protected_call(lua, [&](lua_State* lua) {
             for (const auto& [key, target] : {std::pair{"app_id", &app_id}, {"display", &display}}) {
-                lua_getfield(lua, 2, key);
+                field(lua, 2, key);
                 if (!lua_isnil(lua, -1)) {
-                    std::size_t length; const char* value = luaL_checklstring(lua, -1, &length);
+                    std::size_t length; const char* value = check_string(lua, -1, &length);
                     luaL_argcheck(lua, length <= 4096, 2, "shortcut option exceeds 4096 bytes"); target->assign(value, length);
                 }
                 lua_pop(lua, 1);
             }
-            lua_getfield(lua, 2, "shortcuts"); luaL_checktype(lua, -1, LUA_TTABLE);
+            field(lua, 2, "shortcuts"); luaL_checktype(lua, -1, LUA_TTABLE);
             const auto count = lua_rawlen(lua, -1);
             luaL_argcheck(lua, count > 0 && count <= 128, 2, "expected 1..128 shortcuts");
             shortcuts.resize(count);
@@ -54,9 +54,9 @@ int shortcut_open(lua_State* lua) {
                 lua_rawgeti(lua, -1, static_cast<lua_Integer>(i + 1)); luaL_checktype(lua, -1, LUA_TTABLE);
                 auto& shortcut = shortcuts[i];
                 for (const auto& [key, target] : {std::pair{"id", &shortcut.id}, {"description", &shortcut.description}, {"trigger_description", &shortcut.trigger_description}}) {
-                    lua_getfield(lua, -1, key);
+                    field(lua, -1, key);
                     if (!lua_isnil(lua, -1)) {
-                        std::size_t length; const char* value = luaL_checklstring(lua, -1, &length);
+                        std::size_t length; const char* value = check_string(lua, -1, &length);
                         luaL_argcheck(lua, length <= 4096, 2, "shortcut text exceeds 4096 bytes"); target->assign(value, length);
                     }
                     lua_pop(lua, 1);

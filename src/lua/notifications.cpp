@@ -22,32 +22,29 @@ int notification_open(lua_State* lua) {
         notifications::Options options;
         if (lua_isnone(lua, 1)) lua_pushnil(lua); else lua_pushvalue(lua, 1);
         if (protected_call(lua, [&](lua_State* lua) {
-            if (lua_isnil(lua, 2)) return 0;
             luaL_checktype(lua, 2, LUA_TTABLE);
             for (const auto& [name, target] : {std::pair{"name", &options.name}, {"vendor", &options.vendor}, {"version", &options.version}}) {
-                lua_getfield(lua, 2, name);
-                if (!lua_isnil(lua, -1)) {
-                    std::size_t length; const char* text = luaL_checklstring(lua, -1, &length);
-                    luaL_argcheck(lua, length <= 128, 2, "server information exceeds 128 bytes");
-                    target->assign(text, length);
-                }
+                field(lua, 2, name);
+                std::size_t length; const char* text = check_string(lua, -1, &length);
+                luaL_argcheck(lua, length <= 128, 2, "server information exceeds 128 bytes");
+                target->assign(text, length);
                 lua_pop(lua, 1);
             }
-            lua_getfield(lua, 2, "capabilities");
+            field(lua, 2, "capabilities");
             if (!lua_isnil(lua, -1)) {
                 luaL_checktype(lua, -1, LUA_TTABLE);
                 const auto count = lua_rawlen(lua, -1);
                 luaL_argcheck(lua, count <= 64, 2, "at most 64 notification capabilities");
                 for (std::size_t i = 0; i < count; ++i) {
                     lua_rawgeti(lua, -1, static_cast<lua_Integer>(i + 1));
-                    std::size_t length; const char* text = luaL_checklstring(lua, -1, &length);
+                    std::size_t length; const char* text = check_string(lua, -1, &length);
                     luaL_argcheck(lua, length <= 128, 2, "capability exceeds 128 bytes");
                     options.capabilities.emplace_back(text, length); lua_pop(lua, 1);
                 }
             }
             lua_pop(lua, 1);
-            lua_getfield(lua, 2, "default_timeout");
-            if (!lua_isnil(lua, -1)) options.default_timeout = std::chrono::milliseconds(luaL_checkinteger(lua, -1));
+            field(lua, 2, "default_timeout");
+            if (!lua_isnil(lua, -1)) options.default_timeout = std::chrono::milliseconds(check_integer(lua, -1));
             lua_pop(lua, 1); return 0;
         }, 0, 0, 1) < 0) return -1;
         if (!state.notifications) {
@@ -105,7 +102,7 @@ void push_notification(lua_State* lua, const notifications::Notification& notifi
 
 int notification_get(lua_State* lua) {
     auto& binding = notification_handle(lua);
-    const auto id = luaL_checkinteger(lua, 2);
+    const auto id = check_integer(lua, 2);
     std::optional<notifications::Notification> notification;
     if (id > 0 && id <= UINT32_MAX) {
         const auto& records = binding.server.notifications();
@@ -151,11 +148,12 @@ int notification_on_event(lua_State* lua) {
 }
 
 int notification_invoke(lua_State* lua) {
-    const auto id = luaL_checkinteger(lua, 2);
+    const auto id = check_integer(lua, 2);
     luaL_argcheck(lua, id > 0 && id <= UINT32_MAX, 2, "invalid notification identifier");
     std::size_t action_length, token_length;
-    const char* action = luaL_checklstring(lua, 3, &action_length);
-    const char* token = luaL_optlstring(lua, 4, "", &token_length);
+    const char* action = check_string(lua, 3, &action_length);
+    token_length = 0;
+    const char* token = lua_isnoneornil(lua, 4) ? "" : check_string(lua, 4, &token_length);
     luaL_argcheck(lua, action_length <= 16384 && token_length <= 16384, 3, "notification action or token exceeds 16 KiB");
     auto& binding = notification_handle(lua);
     const auto result = binding.server.invoke(static_cast<std::uint32_t>(id), std::string(action, action_length), std::string(token, token_length));
@@ -163,9 +161,9 @@ int notification_invoke(lua_State* lua) {
 }
 
 int notification_dismiss(lua_State* lua) {
-    const auto id = luaL_checkinteger(lua, 2);
+    const auto id = check_integer(lua, 2);
     luaL_argcheck(lua, id > 0 && id <= UINT32_MAX, 2, "invalid notification identifier");
-    const auto reason = luaL_optinteger(lua, 3, 2);
+    const auto reason = check_integer(lua, 3);
     luaL_argcheck(lua, reason >= 1 && reason <= 4, 3, "close reason must be 1..4");
     auto& binding = notification_handle(lua);
     const auto result = binding.server.close(static_cast<std::uint32_t>(id), static_cast<notifications::CloseReason>(reason));

@@ -131,18 +131,18 @@ int media_restart(lua_State* lua) {
 /// before releasing those stack entries.
 std::pair<std::string_view, std::string_view> read_player_key(lua_State* lua) {
     luaL_checktype(lua, 2, LUA_TTABLE);
-    lua_getfield(lua, 2, "name");
+    field(lua, 2, "name");
     std::size_t name_length, owner_length;
-    const char* name = luaL_checklstring(lua, -1, &name_length);
-    lua_getfield(lua, 2, "owner");
-    const char* owner = luaL_checklstring(lua, -1, &owner_length);
+    const char* name = check_string(lua, -1, &name_length);
+    field(lua, 2, "owner");
+    const char* owner = check_string(lua, -1, &owner_length);
     luaL_argcheck(lua, name_length <= 255 && owner_length <= 255, 2, "invalid player key");
     return {{name, name_length}, {owner, owner_length}};
 }
 
 int media_action(lua_State* lua) {
     static const char* actions[] = {"play", "pause", "play_pause", "stop", "next", "previous", "raise", "quit", nullptr};
-    const auto action = luaL_checkoption(lua, 3, nullptr, actions);
+    const auto action = check_option(lua, 3, nullptr, actions);
     const auto [name, owner] = read_player_key(lua);
     auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
@@ -152,7 +152,7 @@ int media_action(lua_State* lua) {
 }
 
 int media_seek(lua_State* lua) {
-    const auto offset = luaL_checkinteger(lua, 3);
+    const auto offset = check_integer(lua, 3);
     const auto [name, owner] = read_player_key(lua);
     auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
@@ -163,9 +163,9 @@ int media_seek(lua_State* lua) {
 
 int media_set_position(lua_State* lua) {
     std::size_t track_length;
-    const char* track = luaL_checklstring(lua, 3, &track_length);
+    const char* track = check_string(lua, 3, &track_length);
     luaL_argcheck(lua, track_length <= 16384, 3, "text exceeds 16 KiB");
-    const auto position = luaL_checkinteger(lua, 4);
+    const auto position = check_integer(lua, 4);
     const auto [name, owner] = read_player_key(lua);
     auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
@@ -175,7 +175,7 @@ int media_set_position(lua_State* lua) {
 }
 
 int media_set_volume(lua_State* lua) {
-    const auto volume = luaL_checknumber(lua, 3);
+    const auto volume = check_number(lua, 3);
     const auto [name, owner] = read_player_key(lua);
     auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
@@ -185,7 +185,7 @@ int media_set_volume(lua_State* lua) {
 }
 
 int media_set_rate(lua_State* lua) {
-    const auto rate = luaL_checknumber(lua, 3);
+    const auto rate = check_number(lua, 3);
     const auto [name, owner] = read_player_key(lua);
     auto& binding = media_handle(lua);
     if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an MPRIS result awaits delivery"); return 2; }
@@ -207,7 +207,7 @@ int media_set_shuffle(lua_State* lua) {
 
 int media_set_loop_status(lua_State* lua) {
     std::size_t status_length;
-    const char* status = luaL_checklstring(lua, 3, &status_length);
+    const char* status = check_string(lua, 3, &status_length);
     luaL_argcheck(lua, status_length <= 16384, 3, "text exceeds 16 KiB");
     const auto [name, owner] = read_player_key(lua);
     auto& binding = media_handle(lua);
@@ -219,7 +219,7 @@ int media_set_loop_status(lua_State* lua) {
 
 int media_open_uri(lua_State* lua) {
     std::size_t uri_length;
-    const char* uri = luaL_checklstring(lua, 3, &uri_length);
+    const char* uri = check_string(lua, 3, &uri_length);
     luaL_argcheck(lua, uri_length <= 16384, 3, "text exceeds 16 KiB");
     const auto [name, owner] = read_player_key(lua);
     auto& binding = media_handle(lua);

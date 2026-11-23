@@ -41,8 +41,8 @@ struct Capture {
     std::size_t bytes = 0;
     std::uint32_t width = 0, height = 0, format = UINT32_MAX, transform = 0;
     std::uint32_t buffer_width = 0, buffer_height = 0, buffer_format = UINT32_MAX;
-    int max_width = 448, max_height = 252;
-    std::chrono::milliseconds interval{1000};
+    int max_width = 0, max_height = 0;
+    std::chrono::milliseconds interval{};
     std::optional<std::chrono::steady_clock::time_point> next_frame, deadline;
     std::shared_ptr<Image> image;
     const char* error = nullptr;

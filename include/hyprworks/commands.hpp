@@ -45,7 +45,7 @@ public:
     void stop() noexcept;
     WaitSet prepare_wait();
     Update dispatch(const WaitSet& ready);
-    std::expected<void, std::string> respond(std::uint64_t id, const std::string& text, bool success = true);
+    std::expected<void, std::string> respond(std::uint64_t id, const std::string& text, bool success);
     const Status& status() const noexcept;
 private:
     struct State;

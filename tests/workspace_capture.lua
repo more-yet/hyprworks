@@ -17,9 +17,11 @@ workspaces:on_change(function()
         end
     end
     assert(#targets > 0, "a normal workspace is required")
-    target = targets[1]
+    target = {name = targets[1].name, output = targets[1].output, mode = "windows_only",
+        max_width = 160, max_height = 90, max_fps = 2}
     started = true
-    assert(not hw.hyprland.capture_workspace({name = targets[1].name, output = "missing-output"}, function()
+    assert(not hw.hyprland.capture_workspace({name = targets[1].name, output = "missing-output",
+        mode = "windows_only", max_width = 160, max_height = 90, max_fps = 2}, function()
         error("missing output delivered a capture")
     end))
     remaining = #targets * 2
@@ -53,13 +55,13 @@ hw.timer(25, function(timer)
     end
     assert(not hw.hyprland.capture_workspace(target, function() error("over-limit capture delivered") end))
     for _, capture in ipairs(cancelled) do capture:close() end
-    local surface = assert(hw.layer {width = 160, height = 90, keyboard = "none"})
+    local surface = assert(hw.layer {width = 160, height = 90, keyboard = "none", edge = "top", layer = "top"})
     assert(surface:set_content {kind = "image", source = sources[1]})
     hw.timer(100, function()
         surface:close()
         workspaces:close()
         print("Workspace captures: compositor frames, modes, catalog independence, retained images, limits and cancellation passed")
-        hw.quit()
+        hw.quit(0)
     end)
 end)
 hw.timer(8000, function() error("workspace capture check timed out") end)

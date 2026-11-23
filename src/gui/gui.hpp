@@ -45,11 +45,12 @@ enum class Kind { row, column, scroll, box, text, image, button, toggle, slider,
 /// Array position is valid within one surface revision. Moving a preserved
 /// element transfers its editing, image and callback ownership at commit.
 struct Element {
-    std::string id, text, placeholder, font = "Sans 12";
+    std::string id, text, placeholder, font, mask, scroll_target;
     std::string accessible_role, accessible_name, accessible_description;
     double width = -1, height = -1, grow = 0, padding = 0, gap = 0, radius = 0;
     double x = 0, y = 0, border_width = 0;
-    double value = 0, scroll = 0, scroll_limit = 0;
+    double value = 0, scroll = 0, scroll_limit = 0, step = 0;
+    double caret_width = 0, focus_width = 0;
     std::optional<double> scroll_origin;
     Box box, clip;
     double intrinsic_w = 0, intrinsic_h = 0, measured_width = -1, measured_height = 0;
@@ -58,22 +59,23 @@ struct Element {
     std::uint64_t edit_revision = 0;
     std::string preedit;
     Kind kind = Kind::box;
-    int parent = -1, end = 0;
+    int parent = -1, end = 0, thumb_index = -1, target_index = -1;
     int halign = 0, valign = 0, align = 0;
-    std::uint32_t background = 0, color = 0xffffffff, accent = 0x8ab4f8ff, border_color = 0;
+    std::uint32_t background = 0, color = 0, border_color = 0;
+    std::uint32_t selection_color = 0, caret_color = 0, placeholder_color = 0, focus_color = 0;
     int callback = -2, text_width = -1;
     int natural_text_width = 0, natural_text_height = 0;
     int cursor = 0, anchor = 0;
     std::uint32_t preedit_seat = 0;
     int preedit_cursor = 0, preedit_end = 0;
     bool accessible_hidden = false;
-    bool enabled = true, wrap = false, password = false, horizontal = false;
+    bool enabled = true, wrap = false, ellipsize = false, password = false, horizontal = false, thumb = false, jump = false;
     bool measure_dirty = true, arrange_dirty = true, text_dirty = true;
     bool image_notified = false;
 };
 
 struct PopupPlacement {
-    int x = 0, y = 0, width = 640, height = 480;
+    int x = 0, y = 0, width = 0, height = 0;
 };
 
 struct SurfaceFocus {
@@ -100,8 +102,8 @@ struct Surface {
     std::uint32_t popup_grab_seat = 0, popup_grab_serial = 0;
     std::vector<std::uint32_t> outputs;
     std::vector<Element> elements;
-    std::vector<int> named_elements, image_elements, scroll_elements;
-    int width = 640, height = 480, pending_width = 640, pending_height = 480;
+    std::vector<int> named_elements, image_elements, scroll_elements, range_elements;
+    int width = 0, height = 0, pending_width = 0, pending_height = 0;
     PopupPlacement popup_placement;
     int popup_x = 0, popup_y = 0, pending_popup_x = 0, pending_popup_y = 0;
     std::uint32_t configure_serial = 0;
@@ -109,6 +111,7 @@ struct Surface {
     SurfaceFocus reported_focus;
     double scale = 1;
     int focused = -1, pressed = -1;
+    double drag_offset = 0;
     int key_pressed = -1;
     std::uint32_t key_seat = 0, key_code = 0, key_serial = 0;
     bool focus_visible = false;
@@ -184,7 +187,7 @@ struct Seat {
     int ime_element = -1;
     std::uint32_t ime_serial = 0, repeat_key = 0, serial = 0;
     double x = 0, y = 0, touch_x = 0, touch_y = 0;
-    int repeat_rate = 0, repeat_delay = 400;
+    int repeat_rate = 0, repeat_delay = 0;
     int touch_id = -1;
     std::optional<std::chrono::steady_clock::time_point> repeat_at;
     bool ime_enabled = false, ime_blocked = false, ime_surrounding = false, preedit_set = false, commit_set = false;

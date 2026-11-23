@@ -1,0 +1,5 @@
+#!/bin/sh
+[ "${HYPRWORKS_CONFIG_DIR+x}" = x ] && exit 0
+case "$XDG_CONFIG_HOME" in
+    /*) printf 'HYPRWORKS_CONFIG_DIR=%s/hyprworks\n' "$XDG_CONFIG_HOME" ;;
+esac

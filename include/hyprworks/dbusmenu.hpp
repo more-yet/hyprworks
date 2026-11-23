@@ -71,8 +71,8 @@ public:
     std::expected<void, std::string> start(const Target& target, const std::string& address = {});
     std::optional<RequestResult> stop() noexcept;
     std::expected<void, std::string> refresh();
-    std::expected<std::uint64_t, std::string> about_to_show(std::int32_t id = 0);
-    std::expected<std::uint64_t, std::string> event(std::int32_t id, const std::string& event, std::uint32_t timestamp = 0);
+    std::expected<std::uint64_t, std::string> about_to_show(std::int32_t id);
+    std::expected<std::uint64_t, std::string> event(std::int32_t id, const std::string& event, std::uint32_t timestamp);
     WaitSet prepare_wait();
     Update dispatch(const WaitSet& ready);
     const Target& target() const noexcept;

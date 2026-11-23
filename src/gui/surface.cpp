@@ -5,6 +5,7 @@
 #include <cassert>
 #include <charconv>
 #include <cmath>
+#include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 namespace hyprworks::lua {
@@ -114,7 +115,7 @@ void destroy_surface(Surface& surface) {
     if (surface.viewport) wp_viewport_destroy(std::exchange(surface.viewport, nullptr));
     if (surface.native) wl_surface_destroy(std::exchange(surface.native, nullptr));
     clear_elements(gui.owner.lua, surface.elements);
-    surface.named_elements.clear(); surface.image_elements.clear(); surface.scroll_elements.clear();
+    surface.named_elements.clear(); surface.image_elements.clear(); surface.scroll_elements.clear(); surface.range_elements.clear();
     unref(gui.owner.lua, surface.on_configure);
     unref(gui.owner.lua, surface.on_close);
     unref(gui.owner.lua, surface.on_grab_cleared);
@@ -318,18 +319,19 @@ const wp_fractional_scale_v1_listener scale_listener{
         surface.configure_pending = true; dirty(surface);
     }
 };
-double number(lua_State* lua, int table, const char* name, double fallback, double minimum, double maximum) {
+double number(lua_State* lua, int table, const char* name, double current, double minimum, double maximum) {
     field(lua, table, name);
-    const double value = luaL_optnumber(lua, -1, fallback);
+    if (lua_isnil(lua, -1)) { lua_pop(lua, 1); return current; }
+    const double value = check_number(lua, -1);
     if (!std::isfinite(value) || value < minimum || value > maximum) luaL_error(lua, "%s is out of range", name);
     lua_pop(lua, 1); return value;
 }
 
-std::uint32_t read_color(lua_State* lua, int table, const char* name, std::uint32_t fallback) {
+std::uint32_t read_color(lua_State* lua, int table, const char* name, std::uint32_t current) {
     field(lua, table, name);
-    if (lua_isnil(lua, -1)) { lua_pop(lua, 1); return fallback; }
+    if (lua_isnil(lua, -1)) { lua_pop(lua, 1); return current; }
     std::size_t length;
-    const char* text = luaL_checklstring(lua, -1, &length);
+    const char* text = check_string(lua, -1, &length);
     if ((length != 7 && length != 9) || text[0] != '#') luaL_error(lua, "%s must be #RRGGBB or #RRGGBBAA", name);
     std::uint32_t value = 0;
     const auto result = std::from_chars(text + 1, text + length, value, 16);
@@ -337,7 +339,22 @@ std::uint32_t read_color(lua_State* lua, int table, const char* name, std::uint3
     lua_pop(lua, 1); return length == 7 ? (value << 8) | 255 : value;
 }
 
-void properties(lua_State* lua, int table, Element& element, Gui& gui) {
+bool read_text(lua_State* lua, int table, const char* name, std::string& value) {
+    field(lua, table, name);
+    if (lua_isnil(lua, -1)) { lua_pop(lua, 1); return false; }
+    std::size_t size;
+    const char* text = check_string(lua, -1, &size);
+    const std::string_view next(text, size);
+    const bool changed = value != next;
+    if (changed) {
+        if (!valid_text(next)) luaL_error(lua, "%s must be UTF-8 without NUL, up to 16 KiB", name);
+        value.assign(next);
+    }
+    lua_pop(lua, 1);
+    return changed;
+}
+
+void properties(lua_State* lua, int table, Element& element, Gui& gui, bool creating) {
     table = lua_absindex(lua, table);
     text_field(lua, table, "id", element.id, 128);
     field(lua, table, "accessibility");
@@ -345,40 +362,26 @@ void properties(lua_State* lua, int table, Element& element, Gui& gui) {
         luaL_checktype(lua, -1, LUA_TTABLE);
         static const char* roles[] = {"auto", "group", "label", "image", "button", "checkbox", "slider",
             "textbox", "heading", "link", "list", "list_item", "menu", "menu_item", nullptr};
-        const int role = enum_field(lua, -1, "role",
-            element.accessible_role.empty() ? "auto" : element.accessible_role.c_str(), roles);
-        element.accessible_role = role ? roles[role] : "";
-        if (text_field(lua, -1, "name", element.accessible_name, max_text) && !valid_text(element.accessible_name))
-            luaL_error(lua, "accessibility text must be valid UTF-8 without NUL");
-        if (text_field(lua, -1, "description", element.accessible_description, max_text) && !valid_text(element.accessible_description))
-            luaL_error(lua, "accessibility text must be valid UTF-8 without NUL");
+        field(lua, -1, "role");
+        if (!lua_isnil(lua, -1)) element.accessible_role = roles[check_option(lua, -1, nullptr, roles)];
+        lua_pop(lua, 1);
+        read_text(lua, -1, "name", element.accessible_name);
+        read_text(lua, -1, "description", element.accessible_description);
         element.accessible_hidden = boolean_field(lua, -1, "hidden", element.accessible_hidden);
     }
     lua_pop(lua, 1);
-    field(lua, table, "text");
-    bool text_changed = false;
-    if (!lua_isnil(lua, -1)) {
-        std::size_t size; const char* text = luaL_checklstring(lua, -1, &size);
-        if (size > max_text) luaL_error(lua, "text exceeds 16 KiB");
-        text_changed = element.text != std::string_view(text, size);
-        if (text_changed) {
-            element.text.assign(text, size);
-            if (!valid_text(element.text)) luaL_error(lua, "text must be valid UTF-8 without NUL");
-        }
-    }
-    lua_pop(lua, 1);
-    if (element.kind == Kind::input) {
-        if (text_field(lua, table, "placeholder", element.placeholder, max_text) && !valid_text(element.placeholder))
-            luaL_error(lua, "placeholder must be valid UTF-8 without NUL");
-    }
+    const bool text_changed = read_text(lua, table, "text", element.text);
+    if (element.kind == Kind::input) read_text(lua, table, "placeholder", element.placeholder);
     if (text_field(lua, table, "font", element.font, 256)) {
         auto* font = pango_font_description_from_string(element.font.c_str());
         const int font_size = pango_font_description_get_size(font);
+        const bool family = pango_font_description_get_family(font) != nullptr;
         pango_font_description_free(font);
-        if (font_size < 0 || font_size > 256 * PANGO_SCALE) luaL_error(lua, "font size exceeds 256");
+        if (!family || font_size < PANGO_SCALE || font_size > 256 * PANGO_SCALE)
+            luaL_error(lua, "font requires a family and size in 1..256");
     }
-    element.width = number(lua, table, "width", element.width, -1, 16384);
-    element.height = number(lua, table, "height", element.height, -1, 16384);
+    element.width = number(lua, table, "width", element.width, 0, 16384);
+    element.height = number(lua, table, "height", element.height, 0, 16384);
     element.x = number(lua, table, "x", element.x, -16384, 16384);
     element.y = number(lua, table, "y", element.y, -16384, 16384);
     static const char* horizontal_alignments[] = {"stretch", "left", "center", "right", nullptr};
@@ -396,20 +399,37 @@ void properties(lua_State* lua, int table, Element& element, Gui& gui) {
     element.value = number(lua, table, "value", element.value, 0, 1);
     element.enabled = boolean_field(lua, table, "enabled", element.enabled);
     element.wrap = boolean_field(lua, table, "wrap", element.wrap);
+    element.ellipsize = boolean_field(lua, table, "ellipsize", element.ellipsize);
     if (element.kind == Kind::input) {
         element.password = boolean_field(lua, table, "password", element.password);
+        text_field(lua, table, "mask", element.mask, 4);
+        if (element.password && (!valid_text(element.mask) || g_utf8_strlen(element.mask.c_str(), -1) != 1))
+            luaL_error(lua, "password input requires one UTF-8 mask character");
+        element.caret_width = number(lua, table, "caret_width", element.caret_width, 0, 1024);
+        element.selection_color = read_color(lua, table, "selection_color", element.selection_color);
+        element.caret_color = read_color(lua, table, "caret_color", element.caret_color);
+        element.placeholder_color = read_color(lua, table, "placeholder_color", element.placeholder_color);
         if (element.password) element.preedit.clear();
     }
+    if ((element.kind == Kind::input || !element.text.empty() || !element.placeholder.empty()) && element.font.empty())
+        luaL_error(lua, "text requires an explicit font");
+    if (element.kind == Kind::slider) {
+        element.step = number(lua, table, "step", element.step, 0, 1);
+        element.jump = boolean_field(lua, table, "jump", element.jump);
+    }
+    if (element.kind == Kind::slider || element.kind == Kind::scroll)
+        element.horizontal = boolean_field(lua, table, "horizontal",
+            creating ? std::nullopt : std::optional(element.horizontal));
     if (element.kind == Kind::scroll) {
         field(lua, table, "scroll");
         if (!lua_isnil(lua, -1)) element.scroll_origin.reset();
         lua_pop(lua, 1);
         element.scroll = number(lua, table, "scroll", element.scroll, 0, 33554432);
-        element.horizontal = boolean_field(lua, table, "horizontal", element.horizontal);
     }
     element.background = read_color(lua, table, "background", element.background);
     element.color = read_color(lua, table, "color", element.color);
-    element.accent = read_color(lua, table, "accent", element.accent);
+    element.focus_color = read_color(lua, table, "focus_color", element.focus_color);
+    element.focus_width = number(lua, table, "focus_width", element.focus_width, 0, 1024);
     field(lua, table, element.kind == Kind::button ? "on_activate" : element.kind == Kind::image ? "on_loaded" : "on_change");
     if (!lua_isnil(lua, -1)) {
         luaL_checktype(lua, -1, LUA_TFUNCTION);
@@ -426,15 +446,17 @@ void properties(lua_State* lua, int table, Element& element, Gui& gui) {
             auto& image = *element.image;
             text_field(lua, -1, "path", image.path, 4096);
             text_field(lua, -1, "icon", image.icon, 256);
-            image.theme = "hicolor"; text_field(lua, -1, "theme", image.theme, 256);
-            image.pixels = static_cast<int>(integer_field(lua, -1, "pixels", 64, 1, 4096));
+            text_field(lua, -1, "theme", image.theme, 256);
+            image.pixels = static_cast<int>(integer_field(lua, -1, "pixels", 0, 0, 4096));
+            if (!image.icon.empty() && (image.theme.empty() || image.pixels == 0))
+                luaL_error(lua, "icon source requires a theme and pixel size");
             image.width = static_cast<int>(integer_field(lua, -1, "width", 0, 0, 4096));
             image.height = static_cast<int>(integer_field(lua, -1, "height", 0, 0, 4096));
             image.channels = static_cast<int>(integer_field(lua, -1, "channels", 0, 0, 4));
             if (image.channels && image.channels != 3 && image.channels != 4) luaL_error(lua, "raw image channels must be 3 or 4");
             field(lua, -1, "data");
             if (!lua_isnil(lua, -1)) {
-                std::size_t length; const char* bytes = luaL_checklstring(lua, -1, &length);
+                std::size_t length; const char* bytes = check_string(lua, -1, &length);
                 image.set_data({bytes, length});
             }
             lua_pop(lua, 1);
@@ -467,7 +489,7 @@ void parse_tree(lua_State* lua, int table, ParsedTree& tree, Gui& gui, int paren
     luaL_checktype(lua, table, LUA_TTABLE);
     table = lua_absindex(lua, table);
     static const char* kinds[] = {"row", "column", "scroll", "box", "text", "image", "button", "toggle", "slider", "input", nullptr};
-    const auto kind = static_cast<Kind>(enum_field(lua, table, "kind", "box", kinds));
+    const auto kind = static_cast<Kind>(enum_field(lua, table, "kind", nullptr, kinds));
     const int index = static_cast<int>(tree.elements.size());
     tree.elements.emplace_back();
     auto& element = tree.elements.back(); element.kind = kind; element.parent = parent;
@@ -478,14 +500,14 @@ void parse_tree(lua_State* lua, int table, ParsedTree& tree, Gui& gui, int paren
         lua_pop(lua, 1);
     }
     tree.specified.push_back(specified);
-    if (kind == Kind::button || kind == Kind::toggle || kind == Kind::input) {
-        element.padding = 6; element.radius = 4; element.background = 0x303238ff;
-    }
-    properties(lua, table, element, gui);
+    element.thumb = boolean_field(lua, table, "thumb", false);
+    if (kind == Kind::slider) text_field(lua, table, "scroll_target", element.scroll_target, 128);
+    properties(lua, table, element, gui, true);
     field(lua, table, "children");
     if (!lua_isnil(lua, -1)) {
         luaL_checktype(lua, -1, LUA_TTABLE);
-        if (kind != Kind::row && kind != Kind::column && kind != Kind::scroll && kind != Kind::box && kind != Kind::button)
+        if (kind != Kind::row && kind != Kind::column && kind != Kind::scroll && kind != Kind::box &&
+            kind != Kind::button && kind != Kind::toggle && kind != Kind::slider)
             luaL_error(lua, "only containers accept children");
         const auto count = lua_rawlen(lua, -1);
         if (count > 2048) luaL_error(lua, "too many children");
@@ -501,12 +523,14 @@ void parse_tree(lua_State* lua, int table, ParsedTree& tree, Gui& gui, int paren
 std::size_t element_text_bytes(const Element& element) {
     return element.id.size() + element.text.size() + element.placeholder.size() + element.font.size() +
         element.accessible_role.size() + element.accessible_name.size() + element.accessible_description.size() +
+        element.mask.size() + element.scroll_target.size() +
         (element.image ? element.image->icon.size() + element.image->path.size() + element.image->theme.size() : 0);
 }
 
 bool same_text_layout(const Element& a, const Element& b) {
     return a.font == b.font && a.text == b.text && a.placeholder == b.placeholder &&
-        a.password == b.password && a.preedit == b.preedit && a.wrap == b.wrap && a.align == b.align &&
+        a.password == b.password && a.mask == b.mask && a.preedit == b.preedit &&
+        a.wrap == b.wrap && a.ellipsize == b.ellipsize && a.align == b.align &&
         (a.preedit.empty() || a.cursor == b.cursor);
 }
 
@@ -530,6 +554,7 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
             if (previous.id != next.id || previous.kind != next.kind) continue;
             remap[static_cast<std::size_t>(*found)] = begin + static_cast<int>(i);
             if (!(parsed.specified[i] & text_specified)) next.text = previous.text;
+            if (!next.text.empty() && next.font.empty()) throw std::runtime_error("text requires an explicit font");
             if (!(parsed.specified[i] & value_specified)) next.value = previous.value;
             if (!(parsed.specified[i] & scroll_specified)) {
                 next.scroll = previous.scroll;
@@ -552,7 +577,13 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
         if (index < end + delta) return parsed.elements[static_cast<std::size_t>(index - begin)];
         return old[static_cast<std::size_t>(index - delta)];
     };
-    std::vector<int> named, images, scrolls;
+    const auto next_parent = [&](int index) {
+        int parent = next_element(index).parent;
+        if (index >= begin && index < end + delta) return parent < 0 ? begin - 1 : parent + begin;
+        return parent >= end ? parent + delta : parent;
+    };
+    std::vector<int> named, images, scrolls, ranges;
+    std::vector<std::array<int, 2>> links(static_cast<std::size_t>(count), {-1, -1});
     named.reserve(std::min(static_cast<std::size_t>(count), surface.named_elements.size()));
     images.reserve(std::min(static_cast<std::size_t>(count), surface.image_elements.size()));
     scrolls.reserve(std::min(static_cast<std::size_t>(count), surface.scroll_elements.size()));
@@ -563,12 +594,37 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
         if (!element.id.empty()) named.push_back(i);
         if (element.kind == Kind::image) images.push_back(i);
         if (element.kind == Kind::scroll) scrolls.push_back(i);
+        if (element.kind == Kind::slider) ranges.push_back(i);
+        if (element.kind == Kind::scroll || element.kind == Kind::button || element.kind == Kind::toggle ||
+            element.kind == Kind::slider || element.kind == Kind::input)
+            for (int parent = next_parent(i); parent >= 0; parent = next_parent(parent))
+                if (next_element(parent).kind == Kind::slider)
+                    throw std::runtime_error("slider children must be drawing or layout elements");
+        if (element.thumb) {
+            const int parent = next_parent(i);
+            if (parent < 0 || next_element(parent).kind != Kind::slider)
+                throw std::runtime_error("thumb belongs to a slider");
+            auto& thumb = links[static_cast<std::size_t>(parent)][0];
+            if (thumb >= 0) throw std::runtime_error("slider accepts one thumb");
+            thumb = i;
+        }
     }
     if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
     std::ranges::sort(named, {}, [&](int index) -> const std::string& { return next_element(index).id; });
     for (std::size_t i = 1; i < named.size(); ++i)
         if (next_element(named[i - 1]).id == next_element(named[i]).id)
             throw std::runtime_error("duplicate element id: " + next_element(named[i]).id);
+    for (const int index : ranges) {
+        const auto& target = next_element(index).scroll_target;
+        if (target.empty()) continue;
+        const auto found = std::ranges::lower_bound(named, target, {},
+            [&](int i) -> const std::string& { return next_element(i).id; });
+        if (found == named.end() || next_element(*found).id != target || next_element(*found).kind != Kind::scroll)
+            throw std::runtime_error("scroll_target must name a scroll element");
+        for (int parent = next_parent(index); parent >= 0; parent = next_parent(parent))
+            if (parent == *found) throw std::runtime_error("scroll_target must be in a separate tree branch");
+        links[static_cast<std::size_t>(index)][1] = *found;
+    }
     const bool whole_tree = begin == 0 && end == static_cast<int>(old.size());
     std::vector<Element> combined;
     if (!whole_tree) combined.reserve(static_cast<std::size_t>(count));
@@ -582,6 +638,24 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
     }
     const bool same_editor = next_focus >= 0 &&
         next_editor->edit_revision == old[static_cast<std::size_t>(previous_focus)].edit_revision;
+    const auto remap_drag = [&](int index) {
+        if (index < 0 || old[static_cast<std::size_t>(index)].kind != Kind::slider) return -1;
+        const int mapped = remap[static_cast<std::size_t>(index)];
+        if (mapped < 0) return -1;
+        const auto& next = next_element(mapped);
+        const auto& previous = old[static_cast<std::size_t>(index)];
+        if ((previous.thumb_index >= 0) != (links[static_cast<std::size_t>(mapped)][0] >= 0)) return -1;
+        if (previous.target_index >= 0) {
+            const int target = links[static_cast<std::size_t>(mapped)][1];
+            if (target < 0 || remap[static_cast<std::size_t>(previous.target_index)] != target ||
+                !next_element(target).enabled ||
+                next_element(target).horizontal != old[static_cast<std::size_t>(previous.target_index)].horizontal)
+                return -1;
+        }
+        return next.kind == Kind::slider && next.enabled &&
+            next.horizontal == previous.horizontal && next.scroll_target == previous.scroll_target ? mapped : -1;
+    };
+    const int next_drag = remap_drag(surface.pressed);
 
     // Validation and destination allocation precede this ownership transfer.
     if (next_focus < 0) focus(surface, -1);
@@ -635,7 +709,14 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
     surface.named_elements = std::move(named);
     surface.image_elements = std::move(images);
     surface.scroll_elements = std::move(scrolls);
-    ++surface.revision; surface.pressed = surface.key_pressed = -1; surface.content_bytes = bytes;
+    surface.range_elements = std::move(ranges);
+    for (const int index : surface.range_elements) {
+        auto& element = old[static_cast<std::size_t>(index)];
+        element.thumb_index = links[static_cast<std::size_t>(index)][0];
+        element.target_index = links[static_cast<std::size_t>(index)][1];
+    }
+    ++surface.revision; surface.pressed = next_drag;
+    surface.key_pressed = -1; surface.content_bytes = bytes;
     surface.focused = next_focus;
     const bool activation_target = next_focus >= 0 &&
         (surface.elements[static_cast<std::size_t>(next_focus)].kind == Kind::button ||
@@ -643,7 +724,9 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
     for (std::size_t i = 0; i < gui.event_count; ++i) {
         auto& event = gui.events[i];
         if (event.surface != surface.id) continue;
-        if (event.type == Input::Type::button || (event.type == Input::Type::key &&
+        const bool drag_release = next_drag >= 0 && !event.pressed && event.key == BTN_LEFT &&
+            event.seat == surface.press_seat && event.touch == surface.press_touch;
+        if ((event.type == Input::Type::button && !drag_release) || (event.type == Input::Type::key &&
             (next_focus < 0 || (activation_target && (event.key == XKB_KEY_space || event.key == XKB_KEY_Return)))))
             event.surface = 0;
         else if (same_editor && (event.type == Input::Type::ime || event.type == Input::Type::ime_leave) &&
@@ -683,7 +766,7 @@ int set_content(lua_State* lua) {
 int find_element(lua_State* lua) {
     auto& gui = gui_state(lua);
     const auto identity = handle(lua, 1, surface_type);
-    std::size_t length; const char* id = luaL_checklstring(lua, 2, &length);
+    std::size_t length; const char* id = check_string(lua, 2, &length);
     const auto& surface = live_surface(gui, identity);
     const std::string_view name(id, length);
     if (name.empty()) {
@@ -708,7 +791,7 @@ int replace_children(lua_State* lua) {
     const auto kind = initial.elements[static_cast<std::size_t>(identity.element)].kind;
     const auto previous_size = static_cast<std::size_t>(initial.elements[static_cast<std::size_t>(identity.element)].end - identity.element - 1);
     if (kind != Kind::row && kind != Kind::column &&
-        kind != Kind::scroll && kind != Kind::box && kind != Kind::button)
+        kind != Kind::scroll && kind != Kind::box && kind != Kind::button && kind != Kind::toggle && kind != Kind::slider)
         throw std::runtime_error("only containers accept children");
     unsigned depth = 2;
     for (int parent = initial.elements[static_cast<std::size_t>(identity.element)].parent; parent >= 0;
@@ -751,7 +834,7 @@ int set_element(lua_State* lua) {
             lua_rawgeti(lua, LUA_REGISTRYINDEX, current.callback);
             replacement.callback = luaL_ref(lua, LUA_REGISTRYINDEX);
         }
-        properties(lua, 2, replacement, gui); return 0;
+        properties(lua, 2, replacement, gui, false); return 0;
     }, 0, 0, 1) < 0) return -1;
     auto& live = live_surface(gui, identity);
     auto& element = live.elements[static_cast<std::size_t>(identity.element)];
@@ -765,11 +848,15 @@ int set_element(lua_State* lua) {
         replacement.x != element.x || replacement.y != element.y || replacement.grow != element.grow ||
         replacement.padding != element.padding || replacement.gap != element.gap ||
         replacement.halign != element.halign || replacement.valign != element.valign ||
-        replacement.horizontal != element.horizontal || replacement.scroll != element.scroll || replacement.image != element.image;
+        replacement.horizontal != element.horizontal || replacement.scroll != element.scroll || replacement.image != element.image ||
+        (element.kind == Kind::slider && replacement.value != element.value);
     const bool repaint = geometry || replacement.background != element.background || replacement.color != element.color ||
-        replacement.accent != element.accent || replacement.border_color != element.border_color ||
+        replacement.selection_color != element.selection_color || replacement.caret_color != element.caret_color ||
+        replacement.placeholder_color != element.placeholder_color || replacement.caret_width != element.caret_width ||
+        replacement.focus_color != element.focus_color || replacement.focus_width != element.focus_width ||
+        replacement.border_color != element.border_color ||
         replacement.border_width != element.border_width || replacement.radius != element.radius ||
-        replacement.value != element.value || replacement.enabled != element.enabled;
+        replacement.enabled != element.enabled;
     replacement.text_dirty |= text_changed;
     if (replacement.font == element.font) std::swap(replacement.layout, element.layout);
     std::swap(replacement, element); live.content_bytes = bytes;
@@ -777,6 +864,12 @@ int set_element(lua_State* lua) {
         if (live.focused == identity.element) focus(live, -1);
         if (live.pressed == identity.element) live.pressed = -1;
     }
+    if (element.kind == Kind::slider && replacement.horizontal != element.horizontal) {
+        if (live.pressed == identity.element) live.pressed = -1;
+    }
+    if (element.kind == Kind::scroll && (!element.enabled || replacement.horizontal != element.horizontal) &&
+        live.pressed >= 0 && live.elements[static_cast<std::size_t>(live.pressed)].target_index == identity.element)
+        live.pressed = -1;
     if (repaint) invalidate_element(live, identity.element, geometry);
     if (element.image && !element.image->submitted) wake(gui.owner);
     lua_pushboolean(lua, true); return 1;
@@ -786,15 +879,20 @@ int element_state(lua_State* lua) {
     auto& gui = gui_state(lua); const auto identity = handle(lua, 1, element_type);
     auto& surface = live_surface(gui, identity); layout(surface);
     const auto& element = surface.elements[static_cast<std::size_t>(identity.element)];
-    const auto text = element.text; const auto box = element.box; const auto value = element.value; const auto scroll = element.scroll;
+    const auto text = element.text; const auto box = element.box; const auto value = element.value;
+    const auto scroll = element.scroll, limit = element.scroll_limit;
+    const bool pressed = surface.pressed == identity.element, focused = surface.focused == identity.element;
     return protected_call(lua, [&](lua_State* lua) {
-        lua_createtable(lua, 0, 7); string_field(lua, "text", text);
+        lua_createtable(lua, 0, 10); string_field(lua, "text", text);
         lua_pushnumber(lua, value); lua_setfield(lua, -2, "value");
         lua_pushnumber(lua, box.x); lua_setfield(lua, -2, "x");
         lua_pushnumber(lua, box.y); lua_setfield(lua, -2, "y");
         lua_pushnumber(lua, box.w); lua_setfield(lua, -2, "width");
         lua_pushnumber(lua, box.h); lua_setfield(lua, -2, "height");
         lua_pushnumber(lua, scroll); lua_setfield(lua, -2, "scroll");
+        lua_pushnumber(lua, limit); lua_setfield(lua, -2, "scroll_limit");
+        lua_pushboolean(lua, pressed); lua_setfield(lua, -2, "pressed");
+        lua_pushboolean(lua, focused); lua_setfield(lua, -2, "focused");
         return 1;
     }, 1);
 }
@@ -804,10 +902,8 @@ int element_accessibility(lua_State* lua) {
     const auto& surface = live_surface(gui, identity);
     const auto& element = surface.elements[static_cast<std::size_t>(identity.element)];
     static const char* roles[] = {"group", "group", "group", "group", "label", "image", "button", "checkbox", "slider", "textbox"};
-    const std::string role = element.accessible_role.empty() ? roles[static_cast<unsigned>(element.kind)] : element.accessible_role;
-    const std::string name = !element.accessible_name.empty() ? element.accessible_name :
-        element.kind == Kind::input ? element.placeholder :
-        element.kind == Kind::text || element.kind == Kind::button || element.kind == Kind::toggle ? element.text : "";
+    const std::string role = element.accessible_role == "auto" ? roles[static_cast<unsigned>(element.kind)] : element.accessible_role;
+    const auto name = element.accessible_name;
     const auto description = element.accessible_description;
     bool hidden = element.accessible_hidden;
     for (int parent = element.parent; parent >= 0; parent = surface.elements[static_cast<std::size_t>(parent)].parent)
@@ -817,7 +913,9 @@ int element_accessibility(lua_State* lua) {
     const auto value = element.value;
     return protected_call(lua, [&](lua_State* lua) {
         lua_createtable(lua, 0, 9);
-        string_field(lua, "role", role); string_field(lua, "name", name); string_field(lua, "description", description);
+        if (!role.empty()) string_field(lua, "role", role);
+        if (!name.empty()) string_field(lua, "name", name);
+        if (!description.empty()) string_field(lua, "description", description);
         lua_pushboolean(lua, hidden); lua_setfield(lua, -2, "hidden");
         lua_pushboolean(lua, enabled); lua_setfield(lua, -2, "enabled");
         lua_pushboolean(lua, can_focus); lua_setfield(lua, -2, "focusable");
@@ -855,15 +953,15 @@ int create_surface(lua_State* lua) {
         Surface* surface;
         ~Cleanup() { if (surface) destroy_surface(*surface); }
     } cleanup{surface.get()};
-    std::string title = "Hyprworks", app_id = "hyprworks", output;
-    int width = Role == 1 ? 0 : 640, height = Role == 1 ? 32 : 480, x = 0, y = 0;
-    int edge = 0, layer = 2, keyboard = 0, exclusive_zone = 0, margin = 0;
+    std::string title, app_id, output;
+    int width = 0, height = 0, x = 0, y = 0;
+    int edge = 0, layer = 0, keyboard = 0, exclusive_zone = 0, margin = 0;
     bool exclusive = false, grab = false;
     lua_pushvalue(lua, 1);
     if (protected_call(lua, [&](lua_State* lua) {
         if constexpr (Role != 1) {
-            width = static_cast<int>(integer_field(lua, 2, "width", width, 1));
-            height = static_cast<int>(integer_field(lua, 2, "height", height, 1));
+            width = static_cast<int>(integer_field(lua, 2, "width", std::nullopt, 1));
+            height = static_cast<int>(integer_field(lua, 2, "height", std::nullopt, 1));
         }
         text_field(lua, 2, "title", title, 256); text_field(lua, 2, "app_id", app_id, 256);
         text_field(lua, 2, "output", output, 256);
@@ -879,15 +977,15 @@ int create_surface(lua_State* lua) {
             static const char* edges[] = {"top", "bottom", "left", "right", "all", nullptr};
             static const char* layers[] = {"background", "bottom", "top", "overlay", nullptr};
             static const char* keyboards[] = {"none", "exclusive", "on_demand", nullptr};
-            edge = enum_field(lua, 2, "edge", "top", edges);
-            layer = enum_field(lua, 2, "layer", "top", layers);
-            keyboard = enum_field(lua, 2, "keyboard", "none", keyboards);
+            edge = enum_field(lua, 2, "edge", nullptr, edges);
+            layer = enum_field(lua, 2, "layer", nullptr, layers);
+            keyboard = enum_field(lua, 2, "keyboard", nullptr, keyboards);
             exclusive = boolean_field(lua, 2, "exclusive", false);
             exclusive_zone = static_cast<int>(integer_field(lua, 2, "exclusive_zone", 0, -1));
             margin = static_cast<int>(integer_field(lua, 2, "margin", 0, 0, 4096));
             const bool vertical = edge == 2 || edge == 3;
-            width = static_cast<int>(integer_field(lua, 2, "width", vertical ? 32 : 0, vertical ? 1 : 0));
-            height = static_cast<int>(integer_field(lua, 2, "height", edge < 2 ? 32 : 0, edge < 2 ? 1 : 0));
+            width = static_cast<int>(integer_field(lua, 2, "width", std::nullopt, vertical ? 1 : 0));
+            height = static_cast<int>(integer_field(lua, 2, "height", std::nullopt, edge < 2 ? 1 : 0));
             if (edge == 4 && (exclusive || exclusive_zone > 0)) luaL_error(lua, "an all-edge layer cannot reserve space");
         }
         if constexpr (Role == 2) {
@@ -928,8 +1026,8 @@ int create_surface(lua_State* lua) {
         }
         if (!native_output) throw std::runtime_error("output not found: " + output);
     }
-    surface->pending_width = surface->width = width ? width : 640;
-    surface->pending_height = surface->height = height ? height : 480;
+    surface->pending_width = surface->width = width;
+    surface->pending_height = surface->height = height;
     surface->native = wl_compositor_create_surface(gui.compositor);
     if (!surface->native) throw std::runtime_error("cannot create Wayland surface");
     wl_surface_add_listener(surface->native, &surface_listener, surface.get());

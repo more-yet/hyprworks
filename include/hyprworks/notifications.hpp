@@ -31,9 +31,9 @@ struct Notification {
 };
 
 struct Options {
-    std::string name = "Hyprworks", vendor = "Hyprworks", version = "0.1.0";
+    std::string name, vendor, version;
     std::vector<std::string> capabilities;
-    std::chrono::milliseconds default_timeout{5000};
+    std::optional<std::chrono::milliseconds> default_timeout;
 };
 
 enum class Phase { stopped, connecting, ready, failed };
@@ -69,9 +69,9 @@ public:
     ~NotificationServer();
     NotificationServer(const NotificationServer&) = delete;
     NotificationServer& operator=(const NotificationServer&) = delete;
-    std::expected<void, std::string> start(const Options& options = {}, const std::string& address = {});
+    std::expected<void, std::string> start(const Options& options, const std::string& address = {});
     void stop() noexcept;
-    std::expected<void, std::string> close(std::uint32_t id, CloseReason reason = CloseReason::dismissed);
+    std::expected<void, std::string> close(std::uint32_t id, CloseReason reason);
     std::expected<void, std::string> invoke(std::uint32_t id, const std::string& action, const std::string& activation_token = {});
     WaitSet prepare_wait();
     Update dispatch(const WaitSet& ready);

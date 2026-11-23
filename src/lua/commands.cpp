@@ -23,12 +23,12 @@ int command_open(lua_State* lua) {
         std::vector<std::string> commands;
         lua_pushvalue(lua, 1);
         if (protected_call(lua, [&](lua_State* lua) {
-            lua_getfield(lua, 2, "name"); std::size_t length; const char* value = luaL_checklstring(lua, -1, &length);
+            field(lua, 2, "name"); std::size_t length; const char* value = check_string(lua, -1, &length);
             luaL_argcheck(lua, length <= 255, 2, "command bus name exceeds 255 bytes"); name.assign(value, length); lua_pop(lua, 1);
-            lua_getfield(lua, 2, "commands"); luaL_checktype(lua, -1, LUA_TTABLE);
+            field(lua, 2, "commands"); luaL_checktype(lua, -1, LUA_TTABLE);
             const auto count = lua_rawlen(lua, -1); luaL_argcheck(lua, count > 0 && count <= 128, 2, "expected 1..128 command names");
             for (std::size_t i = 0; i < count; ++i) {
-                lua_rawgeti(lua, -1, static_cast<lua_Integer>(i + 1)); value = luaL_checklstring(lua, -1, &length);
+                lua_rawgeti(lua, -1, static_cast<lua_Integer>(i + 1)); value = check_string(lua, -1, &length);
                 luaL_argcheck(lua, length <= 128, 2, "command name exceeds 128 bytes"); commands.emplace_back(value, length); lua_pop(lua, 1);
             }
             return 0;

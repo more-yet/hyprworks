@@ -104,10 +104,18 @@ void decode(Image& image) {
             throw std::runtime_error(message);
         }
         double width = 0, height = 0;
-        if (!rsvg_handle_get_intrinsic_size_in_pixels(svg.get(), &width, &height)) width = height = 64;
+        if (!rsvg_handle_get_intrinsic_size_in_pixels(svg.get(), &width, &height)) {
+            if (!image.pixels) throw std::runtime_error("SVG without intrinsic dimensions requires pixels");
+            gboolean has_viewbox = false;
+            RsvgRectangle viewbox{};
+            rsvg_handle_get_intrinsic_dimensions(svg.get(), nullptr, nullptr, nullptr, nullptr, &has_viewbox, &viewbox);
+            width = has_viewbox ? viewbox.width : image.pixels;
+            height = has_viewbox ? viewbox.height : image.pixels;
+        }
+        if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0)
+            throw std::runtime_error("SVG dimensions must be positive and finite");
         if (image.pixels > 0) {
-            const double ratio = width > 0 && height > 0 ? width / height : 1;
-            width = image.pixels; height = width / ratio;
+            height = image.pixels * (height / width); width = image.pixels;
         }
         if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0 || width > 4096 || height > 4096)
             throw std::runtime_error("SVG dimensions must be in 1..4096");

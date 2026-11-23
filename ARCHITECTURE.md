@@ -28,7 +28,11 @@ holds its owning invocation for callbacks, shutdown requests and wakeups.
 library and CLI. Wayland scanner generates protocol bindings from the installed
 and repository XML definitions. Installed CMake targets expose the native and
 Lua libraries; user services start the CLI and send SIGHUP for reload.
-The manually enabled Polkit service loads the installed standalone Lua prompt.
+The CLI requires an absolute `HYPRWORKS_CONFIG_DIR`, then loads `main.lua` or
+the filename selected by `--entry`. The manually enabled Polkit service selects
+the author's `polkit-agent.lua` from that directory.
+The installed user-environment generator initializes the user-service variable
+from an absolute `XDG_CONFIG_HOME`, preserving an existing author value.
 
 ## Entry, scheduling and shutdown
 
@@ -77,6 +81,9 @@ result remains with its binding through earlier callbacks, allowing `close()`
 to return it. It transfers to a local value immediately before result delivery.
 Event batches transfer to local storage before callbacks can mutate the owner.
 
+Serial service queries use asynchronous replies. Their chain determines snapshot
+latency while the invocation continues processing other ready sources.
+
 Polkit uses the existing sd-bus path for registration and incoming calls and
 libpolkit-agent for authentication. Its private GLib context contributes poll
 descriptors and deadlines to the invocation loop; callbacks only retain native
@@ -104,17 +111,21 @@ PAM/NSS and helper teardown can therefore delay the invocation thread.
 | `surface.cpp`: create/close | Parse role/options/callbacks → resolve output/parent → allocate protocol role → retain surface → configure | Popup roles wait for the parent's first buffer commit. Dismissal cancels queued interaction/editor work before callbacks. Child roles retire before parents. |
 | Tree replacement | Parse candidate → preserve explicit-ID/kind state → validate combined IDs/budgets → allocate destination → transfer resources/remap targets → commit revision | Failed preparation destroys the candidate and retains the live tree. Whole-tree commit moves its vector; subtree commit splices. Explicit values override preserved state. Structural changes invalidate element handles. |
 | Element update | Copy candidate → apply supplied properties → resolve live handle → validate identity/budget → swap → invalidate affected geometry/paint | Retained strings keep their validated state; changed strings are checked at parsing. Unchanged shaping survives paint-only updates. |
-| `input.cpp`: input | Queue native packet → validate seat/target generation → Lua input callback → resolve target again → pass live surface to input processing → interaction callback | Dispatch owns surface lookup and closing checks. Input processing checks the generation after the callback. Consumed events, focus changes and tree commits retire presses. |
+| `input.cpp`: input | Queue native packet → validate seat/target generation → Lua input callback → resolve target again → pass live surface to input processing → interaction callback | Dispatch owns surface lookup and closing checks. Input processing checks the generation after the callback. Consumed events and focus loss retire capture; tree commits cancel activation presses but can retain range drags. |
 | IME/paste | Retain tree/editor identity → receive text → resolve current editor → validate insertion and UTF-8 boundaries → replace → callback | Stale transactions are ignored. Preedit validates independently. Clipboard callbacks validate received text at delivery; editor insertion owns validation on the editing branch. |
 | Clipboard transport | Validate Lua text or borrow a validated editor selection → copy into seat-owned storage → offer/pipe → bounded nonblocking local I/O → completion/timeout → delivery | Selection views last through the ownership copy. The source application receives a blocking writer. Transfers own endpoints and deadlines; SIGPIPE handling preserves the caller's signal state. |
-| Scrolling/focus | Hit-test → walk matching-axis ancestors → consume available range → layout clamp → coalesced change | Focus reveal uses the same geometry. Callback-driven tree replacement requires resolving the next pending target again. |
+| Scrolling/ranges/focus | Hit-test → wheel ancestry or captured slider drag → native range update → layout clamp → coalesced scroll change | Sliders position authored thumb children; optional resolved targets connect them to scroll state. Tree commits validate relationships before transfer. Compatible controls retain seat-owned capture; target replacement, disabling, axis changes and thumb removal cancel it. |
 | `render.cpp`: layout | Dirty ancestry → intrinsic measurement → width-dependent measurement → arrangement | Retained Pango configuration/natural sizes avoid shaping unchanged text. Hit testing, caret, IME rectangles and painting share arrangement. |
 | Presentation | Damage → configured/frame-ready surface → reusable buffer or bounded allocation → repair region → attach/commit | Busy buffers accumulate repair metadata and remain immutable. Release permits reuse; capacity exhaustion waits. GUI retirement collects orphaned buffers once per turn; render retires resized buffers for its own surface. |
-| `images.cpp`, `icons.cpp` | Validate/account source → bounded queue → cached icon lookup → decode/premultiply → release/acquire completion → invalidate layout and notify | Lua admission establishes raw image dimensions, channels and byte count. File decoders validate encoded inputs. Superseded jobs are discarded; queue exhaustion retries after completion. Shutdown joins the worker before releasing its owner. |
+| `images.cpp`, `icons.cpp` | Validate/account source → bounded queue → cached icon lookup → decode/premultiply → release/acquire completion → invalidate layout and notify | Lua admission establishes raw image dimensions, channels and byte count. File decoders validate encoded inputs; SVG raster dimensions come from intrinsic sizes or authored pixels. Superseded jobs are discarded; queue exhaustion retries after completion. Shutdown joins the worker before releasing its owner. |
 | `windows.cpp`: catalog | Foreign-toplevel events → coalesced Hyprland query → Wayland synchronization → generation comparison → immutable records | A changed invalidation generation schedules another query. Session/generation identity prevents old targets from addressing restarted subscriptions. |
 | Window/workspace capture | Resolve published window identity or completed workspace name/output → create session → collect constraints → allocate buffer → request frame → scale into independent image → callback | GUI owns the shared eight-slot/128 MiB budget. Workspace targets belong to its Wayland connection; catalog closure cancels only its window captures. Workspace removal and protocol loss deliver terminal unavailability. Changed constraints discard incompatible completions; bounded retries handle constraint failures. Close releases protocol/storage ownership while delivered images retain their pixels. |
 
 Layout calls at input, callback and presentation boundaries share a dirty gate.
+Arrangement establishes scroll extents before a range pass synchronizes linked
+sliders and arranges their thumbs. Linked controls occupy separate tree branches,
+and sliders contain only drawing/layout elements, keeping scroll geometry
+independent of thumb positioning.
 Intermediate callbacks can change geometry, so those calls observe distinct
 states. Presentation has separate frame and buffer-release gates: one permits a
 new submission, the other permits writing storage.
@@ -139,6 +150,13 @@ inputs; Lua parsing also bounds the allocations needed to construct those inputs
 
 `binding.hpp` owns protected calls and registry references;
 `dispatch_callback` owns argument conversion and callback revalidation.
+Shared readers enforce exact Lua scalar types, including optional fields.
+Option tables use raw field lookup. Decimal identifiers parse borrowed Lua
+strings; GUI text fields validate changed UTF-8 once before candidate assignment.
+Required fields reject absence. Optional paint has no effect until authored;
+surface dimensions, fonts, range axes and capture bounds are supplied explicitly.
+Notification expiry is an optional duration; its absence creates no deadline for
+sender-delegated expiry.
 
 - Keep C++ owning locals outside the function passed to `protected_call`.
   Lua errors return through `lua_pcall` before native locals unwind.
@@ -157,7 +175,9 @@ the connection that owns its recovery state.
 
 | Choice | Benefit and practical effect | Cost or constraint |
 |---|---|---|
-| One invocation thread and a bounded image worker | Native readiness precedes direct, ordered Lua delivery; mutable UI state has one owner | Desktop scans/launch, serial service queries and PAM/helper operations can delay that thread |
+| Native controls with authored appearance | Editing, activation, clamping and capture ownership share native invariants; Lua supplies paint, sizes and application policy | Authors supply explicit fonts, control children and visual feedback |
+| Resolved range links at tree commit | One slider input path serves standalone ranges and scrollbars; input and layout use indices | Target and slider must occupy separate branches; structural edits validate the combined tree |
+| One invocation thread and a bounded image worker | Native readiness precedes direct, ordered Lua delivery; mutable UI state has one owner | Desktop scans/launch and PAM/helper operations can delay that thread; asynchronous service-query chains add snapshot latency |
 | Concrete connections and stable binding storage | Transport errors and teardown stay with their resource owner; Lua finalizers retain valid storage | Similar scheduling and marshalling code remains explicit for each integration |
 | Validation at ingress and mutation | Input processing uses an already-resolved surface; workers consume admitted image payloads | Every producer must preserve those invariants; callbacks and asynchronous completion require fresh ownership checks |
 | D-Bus body validation during encoding | Calls and replies share bounds and avoid a separate signature string/pass | Reply signature mismatches are detected after bounded message construction; the request remains available |

@@ -7,7 +7,7 @@ ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=exec
-ExecStart="@CMAKE_INSTALL_FULL_BINDIR@/hyprworks" --config "@CMAKE_INSTALL_FULL_DATADIR@/hyprworks/polkit-agent.lua"
+ExecStart="@CMAKE_INSTALL_FULL_BINDIR@/hyprworks" --entry polkit-agent.lua
 ExecReload=/usr/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2

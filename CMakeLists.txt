@@ -187,6 +187,8 @@ if(HYPRWORKS_BUILD_LUA)
         LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
         ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
     install(TARGETS hyprworks-cli RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    install(PROGRAMS cmake/60-hyprworks-environment
+        DESTINATION "lib/systemd/user-environment-generators")
     install(EXPORT hyprworks-lua-targets NAMESPACE hyprworks:: DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/hyprworks")
     if(HYPRWORKS_BUILD_GUI)
         configure_file(cmake/hyprworks.service.in hyprworks.service @ONLY)
@@ -196,7 +198,6 @@ if(HYPRWORKS_BUILD_LUA)
             configure_file(cmake/hyprworks-polkit.service.in hyprworks-polkit.service @ONLY)
             install(FILES "${CMAKE_CURRENT_BINARY_DIR}/hyprworks-polkit.service"
                 DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/user")
-            install(FILES share/polkit-agent.lua DESTINATION "${CMAKE_INSTALL_DATADIR}/hyprworks")
         endif()
     endif()
 endif()

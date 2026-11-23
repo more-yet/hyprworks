@@ -10,7 +10,7 @@ local window = assert(hw.window {
     end,
 })
 
-assert(window:set_content {kind = "text", text = "Lifecycle check", background = "#20242aff"})
+assert(window:set_content {kind = "text", font = "Sans 12", color = "#ffffff", text = "Lifecycle check", background = "#20242aff"})
 
 local obsolete = assert(hw.window {width = 32, height = 32})
 assert(obsolete:set_content {
@@ -37,10 +37,10 @@ hw.timer(50, function(timer)
     cycles = cycles + 1
     if cycles == 1 then
         popup = assert(hw.popup {parent = window, x = 10, y = 10, width = 80, height = 40})
-        assert(popup:set_content {kind = "text", text = "Popup"})
+        assert(popup:set_content {kind = "text", font = "Sans 12", color = "#ffffff", text = "Popup"})
         if hw.capabilities().layer_shell then
-            layer = assert(hw.layer {height = 24})
-            assert(layer:set_content {kind = "text", text = "Lifecycle check"})
+            layer = assert(hw.layer {width = 0, height = 24, edge = "top", layer = "top", keyboard = "none"})
+            assert(layer:set_content {kind = "text", font = "Sans 12", color = "#ffffff", text = "Lifecycle check"})
         end
     elseif cycles == 2 then
         assert(window:close())
@@ -53,7 +53,7 @@ hw.timer(50, function(timer)
     else
         timer:close()
         print("GUI lifecycle: configure, image cancellation, popup ownership and slot reuse passed")
-        hw.quit()
+        hw.quit(0)
     end
 end, true)
 

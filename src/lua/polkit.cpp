@@ -13,15 +13,6 @@ PolkitBinding& handle(lua_State* lua, bool allow_closed = false) {
     return binding;
 }
 
-std::uint64_t id(lua_State* lua, int index) {
-    std::size_t size;
-    const char* text = luaL_checklstring(lua, index, &size);
-    std::uint64_t value = 0;
-    const auto result = std::from_chars(text, text + size, value);
-    luaL_argcheck(lua, result.ec == std::errc{} && result.ptr == text + size && value, index, "expected an authentication identifier");
-    return value;
-}
-
 int open(lua_State* lua) {
     auto& state = invocation(lua);
     if (state.closing) return luaL_error(lua, "invocation is shutting down");
@@ -87,19 +78,19 @@ int close(lua_State* lua) {
     return 0;
 }
 int authenticate(lua_State* lua) {
-    const auto request = id(lua, 2);
-    const auto uid = luaL_checkinteger(lua, 3);
+    const auto request = check_uint64(lua, 2, 1);
+    const auto uid = check_integer(lua, 3);
     luaL_argcheck(lua, uid >= 0 && uid <= INT_MAX, 3, "Unix uid is out of range");
     return operation_result(lua, handle(lua).agent.authenticate(request, static_cast<std::uint32_t>(uid)));
 }
 int respond(lua_State* lua) {
-    const auto request = id(lua, 2), prompt = id(lua, 3);
+    const auto request = check_uint64(lua, 2, 1), prompt = check_uint64(lua, 3, 1);
     std::size_t size;
-    const char* response = luaL_checklstring(lua, 4, &size);
+    const char* response = check_string(lua, 4, &size);
     return operation_result(lua, handle(lua).agent.respond(request, prompt, {response, size}));
 }
 int cancel(lua_State* lua) {
-    const auto request = id(lua, 2);
+    const auto request = check_uint64(lua, 2, 1);
     return operation_result(lua, handle(lua).agent.cancel(request));
 }
 

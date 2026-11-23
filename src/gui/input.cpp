@@ -544,7 +544,7 @@ static int clipboard_read(lua_State* lua) {
 
 static int clipboard_write(lua_State* lua) {
     auto& gui = gui_state(lua);
-    std::size_t length; const char* text = luaL_checklstring(lua, 1, &length);
+    std::size_t length; const char* text = check_string(lua, 1, &length);
     if (length > 1024 * 1024) luaL_error(lua, "clipboard text exceeds 1 MiB");
     if (!g_utf8_validate(text, static_cast<gssize>(length), nullptr))
         throw std::runtime_error("clipboard text must be valid UTF-8 without NUL");
@@ -613,11 +613,28 @@ static void position_input_cursor(Surface& surface, Element& element, double x, 
         units(x - element.box.x - element.padding + element.scroll),
         units(y - element.box.y - element.padding), &index, &trailing);
     index = std::clamp(index, 0, layout_index(element, static_cast<int>(element.text.size())));
-    const auto* point = element.password ? g_utf8_offset_to_pointer(element.text.c_str(), index) : element.text.c_str() + index;
+    const auto* point = element.password ?
+        g_utf8_offset_to_pointer(element.text.c_str(), index / static_cast<int>(element.mask.size())) : element.text.c_str() + index;
     while (trailing-- > 0 && *point) point = g_utf8_next_char(point);
     element.cursor = static_cast<int>(point - element.text.c_str());
     if (!select) element.anchor = element.cursor;
     ++element.edit_revision; invalidate_element(surface, target);
+}
+
+static bool change_range(Surface& surface, int index, double value) {
+    auto& element = surface.elements[static_cast<std::size_t>(index)];
+    value = std::clamp(value, 0.0, 1.0);
+    if (value == element.value) return false;
+    if (element.target_index >= 0) {
+        auto& target = surface.elements[static_cast<std::size_t>(element.target_index)];
+        if (!target.enabled || target.scroll_limit == 0) return false;
+        if (!target.scroll_origin) target.scroll_origin = target.scroll;
+        target.scroll = value * target.scroll_limit;
+        invalidate_element(surface, element.target_index, true);
+    }
+    element.value = value;
+    invalidate_element(surface, index, true);
+    return true;
 }
 
 int process_input(Surface& s, Input& event) {
@@ -660,6 +677,10 @@ int process_input(Surface& s, Input& event) {
                 target = i; break;
             }
         }
+        for (int i = target; i >= 0; i = s.elements[static_cast<std::size_t>(i)].parent) {
+            const auto& element = s.elements[static_cast<std::size_t>(i)];
+            if (element.kind == Kind::slider && element.target_index >= 0) { target = element.target_index; break; }
+        }
         double remaining = event.delta;
         for (int i = target; i >= 0 && remaining != 0; i = s.elements[static_cast<std::size_t>(i)].parent) {
             auto& element = s.elements[static_cast<std::size_t>(i)];
@@ -680,6 +701,20 @@ int process_input(Surface& s, Input& event) {
             if (focusable(s.elements[static_cast<std::size_t>(i)]) && s.elements[static_cast<std::size_t>(i)].clip.contains(event.x, event.y)) { target = i; break; }
         if (event.pressed) {
             if (s.pressed >= 0 && !owns_press) return -1;
+            if (target >= 0) {
+                const auto& element = s.elements[static_cast<std::size_t>(target)];
+                if (element.kind == Kind::slider) {
+                    if (element.target_index >= 0 && !s.elements[static_cast<std::size_t>(element.target_index)].enabled)
+                        return -1;
+                    const auto thumb = element.thumb_index >= 0 ?
+                        s.elements[static_cast<std::size_t>(element.thumb_index)].box : Box{};
+                    const bool grabbed = thumb.contains(event.x, event.y);
+                    if (!grabbed && !element.jump) return -1;
+                    const double length = element.horizontal ? thumb.w : thumb.h;
+                    s.drag_offset = grabbed && length > 0 ?
+                        (element.horizontal ? event.x - thumb.x : event.y - thumb.y) / length : 0.5;
+                }
+            }
             s.pressed = target; s.press_seat = event.seat; s.press_touch = event.touch;
             focus(s, target); s.press_serial = event.serial;
             if (target >= 0) {
@@ -693,15 +728,20 @@ int process_input(Surface& s, Input& event) {
             auto& element = s.elements[static_cast<std::size_t>(target)];
             gui.event_serial = s.press_serial;
             if (element.kind == Kind::button) return target;
-            if (element.kind == Kind::toggle) { element.value = element.value == 0 ? 1 : 0; invalidate_element(s, target); return target; }
+            if (element.kind == Kind::toggle) { element.value = element.value == 0 ? 1 : 0; return target; }
         }
     }
     if (((event.type == Input::Type::motion && owns_press) ||
         (event.type == Input::Type::button && event.key == BTN_LEFT && event.pressed)) && s.pressed >= 0) {
         auto& element = s.elements[static_cast<std::size_t>(s.pressed)];
         if (element.kind == Kind::slider) {
-            const double value = std::clamp((event.x - element.box.x - 4) / std::max(1.0, element.box.w - 8), 0.0, 1.0);
-            if (value != element.value) { element.value = value; invalidate_element(s, s.pressed); return s.pressed; }
+            const auto thumb = element.thumb_index >= 0 ?
+                s.elements[static_cast<std::size_t>(element.thumb_index)].box : Box{};
+            const double length = element.horizontal ? thumb.w : thumb.h;
+            const double travel = (element.horizontal ? element.box.w : element.box.h) - 2 * element.padding - length;
+            if (travel <= 0) return -1;
+            const double position = (element.horizontal ? event.x - element.box.x : event.y - element.box.y) - element.padding;
+            if (change_range(s, s.pressed, (position - s.drag_offset * length) / travel)) return s.pressed;
         } else if (element.kind == Kind::input && event.type == Input::Type::motion) {
             position_input_cursor(s, element, event.x, event.y, true);
         }
@@ -773,7 +813,6 @@ int process_input(Surface& s, Input& event) {
         if (element.kind == Kind::button) return pressed;
         if (element.kind == Kind::toggle) {
             element.value = element.value == 0 ? 1 : 0;
-            invalidate_element(s, pressed);
             return pressed;
         }
         return -1;
@@ -786,9 +825,11 @@ int process_input(Surface& s, Input& event) {
         }
         return -1;
     }
-    if (element.kind == Kind::slider && (event.key == XKB_KEY_Left || event.key == XKB_KEY_Right)) {
-        element.value = std::clamp(element.value + (event.key == XKB_KEY_Left ? -0.01 : 0.01), 0.0, 1.0);
-        invalidate_element(s, s.focused); return s.focused;
+    if (element.kind == Kind::slider && element.step > 0) {
+        const xkb_keysym_t backward = element.horizontal ? XKB_KEY_Left : XKB_KEY_Up;
+        const xkb_keysym_t forward = element.horizontal ? XKB_KEY_Right : XKB_KEY_Down;
+        if (event.key == backward || event.key == forward)
+            return change_range(s, s.focused, element.value + (event.key == backward ? -element.step : element.step)) ? s.focused : -1;
     }
     if (element.kind != Kind::input) return -1;
     const int begin = std::min(element.cursor, element.anchor), end = std::max(element.cursor, element.anchor);
@@ -900,6 +941,7 @@ int dispatch_input(Gui& gui) {
                 if (!live || live->close_pending || (!lifecycle && event.generation != live->input_generation) ||
                     state.requests.load(std::memory_order_relaxed)) return 0;
                 lua_call(lua, 2, 1);
+                if (!lua_isnil(lua, -1)) luaL_checktype(lua, -1, LUA_TBOOLEAN);
                 consumed = lua_toboolean(lua, -1);
                 return 0;
             }, 0, 1);

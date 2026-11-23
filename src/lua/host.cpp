@@ -69,8 +69,9 @@ WatchBinding& watch_handle(lua_State* lua) {
 int timer_open(lua_State* lua) {
     auto& state = invocation(lua);
     if (state.closing) return luaL_error(lua, "invocation is shutting down");
-    const auto milliseconds = luaL_checkinteger(lua, 1);
+    const auto milliseconds = check_integer(lua, 1);
     luaL_checktype(lua, 2, LUA_TFUNCTION);
+    if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TBOOLEAN);
     const bool repeat = lua_toboolean(lua, 3);
     if (state.timers.size() == 128) return luaL_error(lua, "timer handle limit reached; reuse existing timers");
     auto timer = std::make_unique<TimerBinding>();
@@ -91,7 +92,8 @@ int timer_open(lua_State* lua) {
 
 int timer_start(lua_State* lua) {
     auto& binding = timer_handle(lua);
-    const auto milliseconds = luaL_checkinteger(lua, 2);
+    const auto milliseconds = check_integer(lua, 2);
+    if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TBOOLEAN);
     auto result = binding.timer.start(std::chrono::milliseconds(milliseconds), lua_toboolean(lua, 3));
     if (!result) throw std::runtime_error(result.error());
     binding.closed = false; binding.pending = 0; ++binding.generation;
@@ -134,25 +136,22 @@ void parse_arguments(lua_State* lua, int argument, std::vector<std::string>& arg
 }
 
 void parse_process_options(lua_State* lua, int argument, host::ProcessOptions& options) {
-    if (lua_isnoneornil(lua, argument)) return;
     luaL_checktype(lua, argument, LUA_TTABLE);
-    lua_getfield(lua, argument, "directory");
+    field(lua, argument, "directory");
     if (!lua_isnil(lua, -1)) {
         std::size_t length;
-        const char* value = luaL_checklstring(lua, -1, &length);
+        const char* value = check_string(lua, -1, &length);
         luaL_argcheck(lua, length <= 16384, argument, "directory exceeds 16 KiB");
         options.directory.assign(value, length);
     }
     lua_pop(lua, 1);
-    lua_getfield(lua, argument, "timeout");
-    if (!lua_isnil(lua, -1)) options.timeout = std::chrono::milliseconds(luaL_checkinteger(lua, -1));
+    field(lua, argument, "timeout");
+    options.timeout = std::chrono::milliseconds(check_integer(lua, -1));
     lua_pop(lua, 1);
-    lua_getfield(lua, argument, "output_limit");
-    if (!lua_isnil(lua, -1)) {
-        const auto limit = luaL_checkinteger(lua, -1);
-        luaL_argcheck(lua, limit >= 0 && limit <= 16 * 1024 * 1024, argument, "output limit must be 0..16 MiB per stream");
-        options.output_limit = static_cast<std::size_t>(limit);
-    }
+    field(lua, argument, "output_limit");
+    const auto limit = check_integer(lua, -1);
+    luaL_argcheck(lua, limit >= 0 && limit <= 16 * 1024 * 1024, argument, "output limit must be 0..16 MiB per stream");
+    options.output_limit = static_cast<std::size_t>(limit);
     lua_pop(lua, 1);
 }
 
@@ -190,12 +189,14 @@ int process_open(lua_State* lua) {
 
 int process_start(lua_State* lua) {
     auto& binding = process_handle(lua);
+    const auto generation = binding.generation;
     std::vector<std::string> arguments;
     host::ProcessOptions options;
     lua_settop(lua, 3);
     lua_pushvalue(lua, 2);
     lua_pushvalue(lua, 3);
     if (protected_call(lua, [&](lua_State* lua) { parse_arguments(lua, 2, arguments); parse_process_options(lua, 3, options); return 0; }, 0, 0, 2) < 0) return -1;
+    if (binding.generation != generation) throw std::runtime_error("process changed while parsing options");
     const auto result = binding.process.start(arguments, options);
     if (result) { binding.closed = false; binding.pending = false; ++binding.generation; }
     return operation_result(lua, result);
@@ -236,7 +237,7 @@ int launch_application(lua_State* lua) {
         parse_arguments(lua, 2, arguments);
         if (!lua_isnil(lua, 3)) {
             std::size_t length;
-            const char* value = luaL_checklstring(lua, 3, &length);
+            const char* value = check_string(lua, 3, &length);
             luaL_argcheck(lua, length <= 16384, 3, "directory exceeds 16 KiB");
             directory.assign(value, length);
         }
@@ -249,9 +250,9 @@ int launch_application(lua_State* lua) {
 int read_file(lua_State* lua) {
     if (invocation(lua).closing) return luaL_error(lua, "invocation is shutting down");
     std::size_t path_length;
-    const char* path = luaL_checklstring(lua, 1, &path_length);
+    const char* path = check_string(lua, 1, &path_length);
     luaL_argcheck(lua, path_length <= 16384, 1, "path exceeds 16 KiB");
-    const auto limit = luaL_optinteger(lua, 2, 1024 * 1024);
+    const auto limit = check_integer(lua, 2);
     luaL_argcheck(lua, limit >= 0 && limit <= 16 * 1024 * 1024, 2, "read limit must be 0..16 MiB");
     const auto result = host::read_file(std::string(path, path_length), static_cast<std::size_t>(limit));
     return protected_call(lua, [&](lua_State* lua) {
@@ -263,9 +264,9 @@ int read_file(lua_State* lua) {
 int write_file(lua_State* lua) {
     if (invocation(lua).closing) return luaL_error(lua, "invocation is shutting down");
     std::size_t path_length, length;
-    const char* path = luaL_checklstring(lua, 1, &path_length);
+    const char* path = check_string(lua, 1, &path_length);
     luaL_argcheck(lua, path_length <= 16384, 1, "path exceeds 16 KiB");
-    const char* contents = luaL_checklstring(lua, 2, &length);
+    const char* contents = check_string(lua, 2, &length);
     luaL_argcheck(lua, length <= 16 * 1024 * 1024, 2, "write exceeds 16 MiB");
     const auto result = host::write_file(std::string(path, path_length), std::string(contents, length));
     return operation_result(lua, result);
@@ -275,9 +276,10 @@ int watch_open(lua_State* lua) {
     auto& state = invocation(lua);
     if (state.closing) return luaL_error(lua, "invocation is shutting down");
     std::size_t length;
-    const char* path = luaL_checklstring(lua, 1, &length);
+    const char* path = check_string(lua, 1, &length);
     luaL_argcheck(lua, length <= 16384, 1, "path exceeds 16 KiB");
     luaL_checktype(lua, 2, LUA_TFUNCTION);
+    if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TBOOLEAN);
     const bool directory = lua_toboolean(lua, 3);
     if (state.watches.size() == 64) return luaL_error(lua, "file watch handle limit reached");
     auto watch = std::make_unique<WatchBinding>();
@@ -305,8 +307,9 @@ int watch_close(lua_State* lua) {
 int watch_start(lua_State* lua) {
     auto& binding = watch_handle(lua);
     std::size_t length;
-    const char* path = luaL_checklstring(lua, 2, &length);
+    const char* path = check_string(lua, 2, &length);
     luaL_argcheck(lua, length <= 16384, 2, "path exceeds 16 KiB");
+    if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TBOOLEAN);
     const auto result = binding.watch.start(std::string(path, length), lua_toboolean(lua, 3));
     binding.closed = false; binding.pending = {}; ++binding.generation;
     return operation_result(lua, result);

@@ -1,7 +1,7 @@
 local hw = require("hyprworks")
 local agent = assert(hw.polkit())
 local requested, prompted, completed = false, false, false
-local pid = assert(hw.read_file("/proc/self/stat")):match("^(%d+)")
+local pid = assert(hw.read_file("/proc/self/stat", 4096)):match("^(%d+)")
 
 agent:on_status(function(handle)
     local status = handle:status()
@@ -10,13 +10,13 @@ agent:on_status(function(handle)
     local check = assert(hw.process({
         "pkcheck", "--action-id", "org.freedesktop.policykit.exec",
         "--process", pid, "--allow-user-interaction",
-    }, {timeout = 10000}))
+    }, {timeout = 10000, output_limit = 65536}))
     check:on_exit(function(_, result)
         assert(result.outcome == "exited" and result.exit_code ~= 0, result.stderr)
         assert(requested and prompted and completed)
         agent:close()
         print("Polkit live registration, PAM prompt and cancellation passed")
-        hw.quit()
+        hw.quit(0)
     end)
 end)
 agent:on_event(function(handle, event)

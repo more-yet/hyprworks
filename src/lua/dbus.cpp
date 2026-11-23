@@ -21,15 +21,6 @@ std::string text(lua_State* lua, int index, std::size_t limit = 16384) {
     return {data, size};
 }
 
-std::uint64_t request_id(lua_State* lua, int index) {
-    const auto value = text(lua, index, 20);
-    std::uint64_t result;
-    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
-    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || !result)
-        throw std::runtime_error("invalid D-Bus request identifier");
-    return result;
-}
-
 struct Budget {
     std::size_t nodes = 0, bytes = 0;
 };
@@ -51,12 +42,7 @@ void read_value(lua_State* lua, int index, dbus::Value& value, Budget& budget, u
         value.data = static_cast<double>(lua_tonumber(lua, index));
     } else if (std::string_view("ynqiuxt").contains(type)) {
         if (type == 't' && lua_type(lua, index) == LUA_TSTRING) {
-            const auto number = text(lua, index, 20);
-            std::uint64_t result;
-            const auto parsed = std::from_chars(number.data(), number.data() + number.size(), result);
-            if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size())
-                throw std::runtime_error("invalid uint64 decimal string");
-            value.data = result;
+            value.data = check_uint64(lua, index);
         } else {
             if (!lua_isinteger(lua, index)) throw std::runtime_error("expected D-Bus integer");
             const auto number = lua_tointeger(lua, index);
@@ -151,18 +137,18 @@ int bus_open(lua_State* lua) {
     auto& state = invocation(lua);
     if (state.closing) return luaL_error(lua, "invocation is shutting down");
     luaL_checktype(lua, 1, LUA_TTABLE);
-    if (state.buses.size() >= 8) return luaL_error(lua, "D-Bus handle limit reached");
     auto bus = std::make_unique<Bus>();
     std::string address;
     bool system = false;
     lua_pushvalue(lua, 1);
     const int parsed = protected_call(lua, [&](lua_State* lua) {
         static const char* choices[] = {"session", "system", nullptr};
-        system = enum_field(lua, 2, "bus", "session", choices) == 1;
+        system = enum_field(lua, 2, "bus", nullptr, choices) == 1;
         text_field(lua, 2, "address", address);
         return 0;
     }, 0, 0, 1);
     if (parsed < 0) return -1;
+    if (state.buses.size() >= 8) throw std::runtime_error("D-Bus handle limit reached");
     const auto result = bus->connection.start(system, address);
     if (!result) return operation_result(lua, result);
     auto& binding = *bus;
@@ -183,7 +169,7 @@ int bus_call(lua_State* lua) {
         text_field(lua, 2, "path", call.path);
         text_field(lua, 2, "interface", call.interface);
         text_field(lua, 2, "member", call.member);
-        call.timeout = std::chrono::milliseconds(integer_field(lua, 2, "timeout", 5000, 1, 300000));
+        call.timeout = std::chrono::milliseconds(integer_field(lua, 2, "timeout", std::nullopt, 1, 300000));
         call.interactive = boolean_field(lua, 2, "interactive", false);
         text_field(lua, 2, "signature", signature, 255);
         field(lua, 2, "arguments");
@@ -201,12 +187,12 @@ int bus_subscribe(lua_State* lua) {
 
 int bus_cancel(lua_State* lua) {
     auto& bus = bus_handle(lua);
-    return operation_result(lua, bus.connection.cancel(request_id(lua, 2)));
+    return operation_result(lua, bus.connection.cancel(check_uint64(lua, 2, 1)));
 }
 
 int bus_unsubscribe(lua_State* lua) {
     auto& bus = bus_handle(lua);
-    return operation_result(lua, bus.connection.unsubscribe(request_id(lua, 2)));
+    return operation_result(lua, bus.connection.unsubscribe(check_uint64(lua, 2, 1)));
 }
 
 int bus_export(lua_State* lua) {
@@ -218,7 +204,7 @@ int bus_export(lua_State* lua) {
     lua_pushvalue(lua, 2);
     const auto parsed = protected_call(lua, [&](lua_State* lua) {
         text_field(lua, 2, "path", path); text_field(lua, 2, "interface", interface);
-        timeout = std::chrono::milliseconds(integer_field(lua, 2, "timeout", 120000, 1, 300000));
+        timeout = std::chrono::milliseconds(integer_field(lua, 2, "timeout", std::nullopt, 1, 300000));
         field(lua, 2, "methods"); luaL_checktype(lua, -1, LUA_TTABLE);
         const auto count = lua_rawlen(lua, -1);
         if (count == 0 || count > 32) throw std::runtime_error("D-Bus export needs 1..32 methods");
@@ -238,7 +224,7 @@ int bus_export(lua_State* lua) {
 
 int bus_reply(lua_State* lua) {
     auto& bus = bus_handle(lua);
-    const auto id = request_id(lua, 2);
+    const auto id = check_uint64(lua, 2, 1);
     const auto signature = text(lua, 3, 255);
     dbus::Body body;
     lua_pushvalue(lua, 4);
@@ -251,7 +237,7 @@ int bus_reply(lua_State* lua) {
 
 int bus_error(lua_State* lua) {
     auto& bus = bus_handle(lua);
-    return operation_result(lua, bus.connection.error(request_id(lua, 2), text(lua, 3), text(lua, 4)));
+    return operation_result(lua, bus.connection.error(check_uint64(lua, 2, 1), text(lua, 3), text(lua, 4)));
 }
 
 int bus_status(lua_State* lua) {

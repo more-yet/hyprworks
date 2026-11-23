@@ -176,7 +176,7 @@ struct NotificationServer::State {
             require(sd_bus_message_read(message, "i", &timeout));
             if (timeout < -1) throw std::runtime_error("invalid notification timeout");
             const auto duration = timeout < 0 ? state.options.default_timeout : std::chrono::milliseconds(timeout);
-            if (duration.count() > 0) notification.expires_at = Clock::now() + duration;
+            if (duration && duration->count() > 0) notification.expires_at = Clock::now() + *duration;
             auto found = std::ranges::find(state.notifications, replaces, &Notification::id);
             const bool replacement = replaces && found != state.notifications.end();
             if (!replacement && state.notifications.size() == 128) throw std::length_error("notification limit of 128 reached");
@@ -219,7 +219,8 @@ std::expected<void, std::string> NotificationServer::start(const Options& option
     try {
         for (const auto* text : {&options.name, &options.vendor, &options.version})
             if (text->size() > 128 || text->contains('\0')) throw std::runtime_error("invalid notification server information");
-        if (options.default_timeout.count() < 0 || options.default_timeout.count() > INT32_MAX || options.capabilities.size() > 64)
+        if ((options.default_timeout && (options.default_timeout->count() < 0 || options.default_timeout->count() > INT32_MAX)) ||
+            options.capabilities.size() > 64)
             throw std::runtime_error("invalid notification defaults or capabilities");
         for (const auto& capability : options.capabilities)
             if (capability.empty() || capability.size() > 128 || capability.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") != std::string::npos)

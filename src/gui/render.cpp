@@ -27,7 +27,7 @@ void text_layout(Gui& gui, Element& element, double width) {
         pango_layout_set_font_description(element.layout, font); pango_font_description_free(font);
         element.text_dirty = true;
     }
-    const int text_width = width < 0 || element.kind == Kind::input ? -1 :
+    const int text_width = width < 0 || (!element.wrap && !element.ellipsize) || element.kind == Kind::input ? -1 :
         static_cast<int>(std::clamp(width, 0.0, 16384.0) * PANGO_SCALE);
     if (!element.text_dirty) {
         if (element.text_width != text_width) pango_layout_set_width(element.layout, text_width);
@@ -38,7 +38,8 @@ void text_layout(Gui& gui, Element& element, double width) {
     if (element.kind == Kind::input && element.text.empty() && element.preedit.empty()) {
         pango_layout_set_text(element.layout, element.placeholder.data(), static_cast<int>(element.placeholder.size()));
     } else if (element.password) {
-        display.assign(static_cast<std::size_t>(g_utf8_strlen(element.text.c_str(), -1)), '*');
+        const auto count = g_utf8_strlen(element.text.c_str(), -1);
+        for (glong i = 0; i < count; ++i) display += element.mask;
         pango_layout_set_text(element.layout, display.data(), static_cast<int>(display.size()));
     } else if (element.kind == Kind::input && !element.preedit.empty()) {
         display = element.text;
@@ -48,7 +49,8 @@ void text_layout(Gui& gui, Element& element, double width) {
     pango_layout_set_single_paragraph_mode(element.layout, element.kind == Kind::input);
     pango_layout_set_wrap(element.layout, PANGO_WRAP_WORD_CHAR);
     pango_layout_set_alignment(element.layout, static_cast<PangoAlignment>(element.align));
-    pango_layout_set_ellipsize(element.layout, element.wrap || element.kind == Kind::input ? PANGO_ELLIPSIZE_NONE : PANGO_ELLIPSIZE_END);
+    pango_layout_set_ellipsize(element.layout,
+        element.ellipsize && !element.wrap && element.kind != Kind::input ? PANGO_ELLIPSIZE_END : PANGO_ELLIPSIZE_NONE);
     pango_layout_set_width(element.layout, text_width);
     element.text_width = text_width; element.text_dirty = false;
 }
@@ -65,7 +67,6 @@ void measure(Surface& surface, int index, double width) {
         int w, h; pango_layout_get_pixel_size(element.layout, &w, &h);
         height = h;
     } else if (element.kind == Kind::image) height = element.intrinsic_h - element.padding * 2;
-    else if (element.kind == Kind::slider) height = 24;
     double used = 0, growth = 0; int count = 0;
     const bool horizontal = element.kind == Kind::row || (element.kind == Kind::scroll && element.horizontal);
     const bool vertical = element.kind == Kind::column || (element.kind == Kind::scroll && !element.horizontal);
@@ -90,7 +91,6 @@ void measure(Surface& surface, int index, double width) {
     }
     if (vertical) height += gaps;
     element.measured_height = element.height >= 0 ? element.height : height + 2 * element.padding;
-    if (element.kind == Kind::scroll && element.height < 0) element.measured_height = std::min(element.measured_height, 240.0);
 }
 
 void arrange(Surface& surface, int index, Box box, Box clip) {
@@ -133,6 +133,23 @@ void arrange(Surface& surface, int index, Box box, Box clip) {
         if (!horizontal && item.halign >= 2) child_box.x += (inner.w - child_box.w) * (item.halign == 2 ? 0.5 : 1);
         if (!vertical && item.valign >= 2) child_box.y += (inner.h - child_box.h) * (item.valign == 2 ? 0.5 : 1);
         child_box.x += item.x; child_box.y += item.y;
+        if (element.kind == Kind::slider && child == element.thumb_index) {
+            const double track = element.horizontal ? inner.w : inner.h;
+            double length = element.horizontal ? child_box.w : child_box.h;
+            if (element.target_index >= 0 && (element.horizontal ? item.width : item.height) < 0) {
+                const auto& target = elements[static_cast<std::size_t>(element.target_index)];
+                const double viewport = std::max(0.0, (target.horizontal ? target.box.w : target.box.h) - 2 * target.padding);
+                length = target.scroll_limit > 0 ? track * viewport / (viewport + target.scroll_limit) : track;
+            }
+            length = std::clamp(length, 0.0, track);
+            if (element.horizontal) {
+                child_box.x = inner.x + (track - length) * element.value;
+                child_box.w = length;
+            } else {
+                child_box.y = inner.y + (track - length) * element.value;
+                child_box.h = length;
+            }
+        }
         arrange(surface, child, child_box, intersect(inner, clip));
     }
 }
@@ -163,11 +180,11 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
         const auto box = element.box;
         const auto visible = intersect(element.clip, damaged);
         if (visible.w <= 0 || visible.h <= 0) continue;
-        const auto background = element.kind == Kind::toggle && element.value != 0 ? element.accent : element.background;
+        const auto background = element.background;
         const bool border = element.border_width > 0 && (element.border_color & 255);
-        const bool outline = static_cast<int>(index) == outlined;
+        const bool outline = static_cast<int>(index) == outlined && element.focus_width > 0 && (element.focus_color & 255);
         if (!(background & 255) && !border && !outline && !element.layout &&
-            element.kind != Kind::slider && element.kind != Kind::image) continue;
+            element.kind != Kind::image) continue;
         cairo_save(cr);
         cairo_rectangle(cr, element.clip.x, element.clip.y, element.clip.w, element.clip.h); cairo_clip(cr);
         if (background & 255) {
@@ -181,11 +198,6 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
                 std::max(0.0, box.h - 2 * inset)}, element.radius);
             cairo_stroke(cr);
         }
-        if (element.kind == Kind::slider) {
-            color(cr, element.accent);
-            rounded(cr, {box.x + 4, box.y + box.h / 2 - 2, std::max(0.0, box.w - 8) * element.value, 4}, 2); cairo_fill(cr);
-            cairo_arc(cr, box.x + 4 + std::max(0.0, box.w - 8) * element.value, box.y + box.h / 2, 5, 0, 6.283185307); cairo_fill(cr);
-        }
         if (element.kind == Kind::image && element.image && element.image->ready.load(std::memory_order_acquire) && element.image->error.empty()) {
             const auto& image = *element.image;
             const double factor = std::min(box.w / image.width, box.h / image.height);
@@ -198,7 +210,10 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
             cairo_restore(cr);
         }
         if (element.layout) {
-            const double x = box.x + element.padding, y = box.y + element.padding;
+            double x = box.x + element.padding;
+            const double y = box.y + element.padding;
+            if (element.kind != Kind::input && !element.wrap && !element.ellipsize && element.align)
+                x += (box.w - element.padding * 2 - element.natural_text_width) * (element.align == 1 ? 0.5 : 1);
             cairo_rectangle(cr, x, y, std::max(0.0, box.w - element.padding * 2), std::max(0.0, box.h - element.padding * 2));
             cairo_clip(cr);
             double offset = 0;
@@ -213,7 +228,7 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
                     int* ranges = nullptr, count = 0;
                     auto* line = pango_layout_get_line_readonly(element.layout, 0);
                     pango_layout_line_get_x_ranges(line, layout_index(element, begin), layout_index(element, end), &ranges, &count);
-                    color(cr, (element.accent & 0xffffff00) | 100);
+                    color(cr, element.selection_color);
                     for (int i = 0; i < count; ++i)
                         cairo_rectangle(cr, x + ranges[i * 2] / double(PANGO_SCALE) - offset, y,
                             (ranges[i * 2 + 1] - ranges[i * 2]) / double(PANGO_SCALE), cursor.height / double(PANGO_SCALE));
@@ -221,19 +236,22 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
                 }
             }
             color(cr, element.kind == Kind::input && element.text.empty() && element.preedit.empty() ?
-                (element.color & 0xffffff00) | ((element.color & 255) / 2) : element.color);
+                element.placeholder_color : element.color);
             cairo_move_to(cr, x - offset, y); pango_cairo_show_layout(cr, element.layout);
             if (element.kind == Kind::input && static_cast<int>(index) == surface.focused) {
                 if (element.preedit.empty() || element.preedit_cursor >= 0) {
+                    color(cr, element.caret_color);
                     cairo_rectangle(cr, x + cursor.x / double(PANGO_SCALE) - offset, y + cursor.y / double(PANGO_SCALE),
-                        1, cursor.height / double(PANGO_SCALE)); cairo_fill(cr);
+                        element.caret_width, cursor.height / double(PANGO_SCALE)); cairo_fill(cr);
                 }
                 if (!element.preedit.empty()) {
                     PangoRectangle start{}, end{};
                     pango_layout_get_cursor_pos(element.layout, element.cursor, &start, nullptr);
                     pango_layout_get_cursor_pos(element.layout, element.cursor + static_cast<int>(element.preedit.size()), &end, nullptr);
+                    color(cr, element.caret_color);
                     cairo_rectangle(cr, x + std::min(start.x, end.x) / double(PANGO_SCALE) - offset,
-                        y + cursor.height / double(PANGO_SCALE) - 1, std::abs(end.x - start.x) / double(PANGO_SCALE), 1); cairo_fill(cr);
+                        y + cursor.height / double(PANGO_SCALE) - element.caret_width,
+                        std::abs(end.x - start.x) / double(PANGO_SCALE), element.caret_width); cairo_fill(cr);
                 }
             }
         }
@@ -241,8 +259,10 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
         if (outline) {
             cairo_save(cr);
             cairo_rectangle(cr, element.clip.x, element.clip.y, element.clip.w, element.clip.h); cairo_clip(cr);
-            color(cr, element.accent); cairo_set_line_width(cr, 1);
-            rounded(cr, {box.x + 0.5, box.y + 0.5, std::max(0.0, box.w - 1), std::max(0.0, box.h - 1)}, element.radius);
+            const double inset = element.focus_width / 2;
+            color(cr, element.focus_color); cairo_set_line_width(cr, element.focus_width);
+            rounded(cr, {box.x + inset, box.y + inset, std::max(0.0, box.w - element.focus_width),
+                std::max(0.0, box.h - element.focus_width)}, element.radius);
             cairo_stroke(cr); cairo_restore(cr);
         }
     }
@@ -306,19 +326,18 @@ void layout(Surface& surface) {
         double width = 0, height = 0; int count = 0;
         const bool horizontal = element.kind == Kind::row || (element.kind == Kind::scroll && element.horizontal);
         const bool vertical = element.kind == Kind::column || (element.kind == Kind::scroll && !element.horizontal);
-        if (element.kind == Kind::text || element.kind == Kind::button || element.kind == Kind::toggle || element.kind == Kind::input) {
+        if (!element.font.empty() && (element.kind == Kind::text || element.kind == Kind::button ||
+            element.kind == Kind::toggle || element.kind == Kind::input)) {
             if (!element.layout || element.text_dirty) {
                 text_layout(*surface.gui, element, -1);
                 pango_layout_get_pixel_size(element.layout, &element.natural_text_width, &element.natural_text_height);
             }
             width = element.natural_text_width; height = element.natural_text_height;
-            if (element.kind == Kind::input) width = std::max(width, 160.0);
         } else if (element.kind == Kind::image) {
-            width = height = 32;
             if (element.image && element.image->ready.load(std::memory_order_acquire) && element.image->error.empty()) {
                 width = element.image->width / surface.scale; height = element.image->height / surface.scale;
             }
-        } else if (element.kind == Kind::slider) { width = 120; height = 24; }
+        }
         for (int child = index + 1; child < element.end; child = elements[static_cast<std::size_t>(child)].end) {
             const auto& item = elements[static_cast<std::size_t>(child)];
             if (horizontal) width += item.intrinsic_w; else width = std::max(width, item.intrinsic_w);
@@ -333,6 +352,14 @@ void layout(Surface& surface) {
     measure(surface, 0, surface.width);
     arrange(surface, 0, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)},
         {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)});
+    for (const int index : surface.range_elements) {
+        auto& range = elements[static_cast<std::size_t>(index)];
+        if (range.target_index < 0) continue;
+        const auto& target = elements[static_cast<std::size_t>(range.target_index)];
+        range.value = target.scroll_limit > 0 ? target.scroll / target.scroll_limit : 0;
+        range.arrange_dirty = true;
+        arrange(surface, index, range.box, range.clip);
+    }
     surface.layout_dirty = false;
 }
 
@@ -378,7 +405,8 @@ void reveal_focus(Surface& surface, bool native) {
 }
 
 int layout_index(const Element& element, int index) {
-    return element.password ? static_cast<int>(g_utf8_pointer_to_offset(element.text.c_str(), element.text.c_str() + index)) : index;
+    return element.password ? static_cast<int>(g_utf8_pointer_to_offset(element.text.c_str(), element.text.c_str() + index)) *
+        static_cast<int>(element.mask.size()) : index;
 }
 
 PangoRectangle input_cursor(Element& element, bool focused) {
@@ -387,7 +415,7 @@ PangoRectangle input_cursor(Element& element, bool focused) {
     pango_layout_get_cursor_pos(element.layout, layout_index(element, position), &cursor, nullptr);
     if (focused) {
         const double x = std::max(0.0, cursor.x / double(PANGO_SCALE));
-        const double visible = std::max(0.0, element.box.w - element.padding * 2 - 2);
+        const double visible = std::max(0.0, element.box.w - element.padding * 2 - element.caret_width);
         element.scroll = std::clamp(element.scroll, std::max(0.0, x - visible), x);
     }
     return cursor;

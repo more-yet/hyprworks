@@ -533,11 +533,11 @@ template<bool workspace>
 int capture_open(lua_State* lua) {
     const int options = workspace ? 1 : 3, callback = workspace ? 2 : 4;
     std::size_t length = 0;
-    const char* id = workspace ? nullptr : luaL_checklstring(lua, 2, &length);
+    const char* id = workspace ? nullptr : check_string(lua, 2, &length);
     luaL_checktype(lua, options, LUA_TTABLE); luaL_checktype(lua, callback, LUA_TFUNCTION);
-    const auto max_width = static_cast<int>(integer_field(lua, options, "max_width", 448, 1, 1024));
-    const auto max_height = static_cast<int>(integer_field(lua, options, "max_height", 252, 1, 1024));
-    const auto max_fps = integer_field(lua, options, "max_fps", 1, 1, 30);
+    const auto max_width = static_cast<int>(integer_field(lua, options, "max_width", std::nullopt, 1, 1024));
+    const auto max_height = static_cast<int>(integer_field(lua, options, "max_height", std::nullopt, 1, 1024));
+    const auto max_fps = integer_field(lua, options, "max_fps", std::nullopt, 1, 30);
     auto& gui = gui_state(lua);
     auto* window_catalog = workspace ? nullptr : &catalog(lua);
     std::string name, output;
@@ -548,7 +548,7 @@ int capture_open(lua_State* lua) {
             text_field(lua, 2, "name", name, 4096);
             text_field(lua, 2, "output", output, 256);
             static const char* modes[] = {"windows_only", "everything", nullptr};
-            mode = enum_field(lua, 2, "mode", "windows_only", modes);
+            mode = enum_field(lua, 2, "mode", nullptr, modes);
             if (name.empty() || output.empty()) return luaL_error(lua, "workspace capture requires name and output");
             return 0;
         }, 0, 0, 1);

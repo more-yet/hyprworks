@@ -23,6 +23,7 @@ bool file_exists(const std::string& path) {
 }
 
 IconTheme read_theme(const std::string& name) {
+    if (!component(name)) throw std::runtime_error("invalid icon theme name");
     IconTheme result;
     result.name = name;
     std::vector<std::string> roots{std::string(g_get_home_dir()) + "/.icons"};
@@ -38,7 +39,7 @@ IconTheme read_theme(const std::string& name) {
     }
     result.fallback_paths.insert(result.fallback_paths.begin(), roots.front());
 
-    std::vector<std::string> pending{"hicolor", component(name) ? name : "default"}, visited;
+    std::vector<std::string> pending{"hicolor", name}, visited;
     std::size_t bytes = 0;
     while (!pending.empty()) {
         auto theme = std::move(pending.back());

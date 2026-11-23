@@ -23,7 +23,7 @@ struct Method { std::string name, input, output; };
 struct Call {
     std::string destination, path, interface, member;
     Body arguments;
-    std::chrono::milliseconds timeout{5000};
+    std::chrono::milliseconds timeout{};
     bool interactive = false;
 };
 enum class EventKind { reply, signal, method, expired };
@@ -54,14 +54,14 @@ public:
     ~Connection();
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
-    std::expected<void, std::string> start(bool system = false, const std::string& address = {});
+    std::expected<void, std::string> start(bool system, const std::string& address = {});
     void stop() noexcept;
     std::expected<std::uint64_t, std::string> call(const Call& call);
     std::expected<void, std::string> cancel(std::uint64_t id);
     std::expected<std::uint64_t, std::string> subscribe(const std::string& match);
     std::expected<void, std::string> unsubscribe(std::uint64_t id);
     std::expected<void, std::string> export_methods(const std::string& path, const std::string& interface,
-        const std::vector<Method>& methods, std::chrono::milliseconds timeout = std::chrono::seconds(120));
+        const std::vector<Method>& methods, std::chrono::milliseconds timeout);
     std::expected<void, std::string> reply(std::uint64_t id, const Body& arguments);
     std::expected<void, std::string> error(std::uint64_t id, const std::string& name, const std::string& message);
     WaitSet prepare_wait();
