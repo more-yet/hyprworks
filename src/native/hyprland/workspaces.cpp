@@ -64,7 +64,7 @@ void WorkspaceConnection::Socket::reset() noexcept {
         ::close(std::exchange(fd, -1));
 }
 
-std::expected<bool, Error> WorkspaceConnection::Socket::connect(const std::string& path) {
+std::expected<bool, Error> protocol::connect_socket(int& fd, const std::string& path) {
     fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0)
         return std::unexpected(io_error("socket", errno));
@@ -77,7 +77,7 @@ std::expected<bool, Error> WorkspaceConnection::Socket::connect(const std::strin
     const int code = errno;
     if (code == EINPROGRESS)
         return false;
-    reset();
+    ::close(std::exchange(fd, -1));
     return std::unexpected(io_error("connect", code));
 }
 
@@ -100,7 +100,7 @@ std::expected<void, Error> WorkspaceConnection::start(SessionTarget target, Time
     snapshot_.reset();
     subscription_marker_ = "hyprworks-ready:" + std::to_string(getpid()) + ":" +
                            std::to_string(now.time_since_epoch().count()) + ":" + std::to_string(wait_generation_);
-    auto connected = events_.connect(target_.directory + "/.socket2.sock");
+    auto connected = protocol::connect_socket(events_.fd, target_.directory + "/.socket2.sock");
     if (!connected) {
         status_ = {ConnectionPhase::failed, false, connected.error()};
         return std::unexpected(connected.error());
@@ -277,7 +277,7 @@ void WorkspaceConnection::start_command(CommandKind kind, std::string request, T
         command_deadline_ = std::min(command_deadline_, event_deadline_);
         marker_retry_at_ = now + std::chrono::milliseconds(20);
     }
-    auto connected = command_.connect(target_.directory + "/.socket.sock");
+    auto connected = protocol::connect_socket(command_.fd, target_.directory + "/.socket.sock");
     if (!connected) {
         fail_command(connected.error(), now, result);
         return;
@@ -290,60 +290,62 @@ void WorkspaceConnection::start_command(CommandKind kind, std::string request, T
     }
 }
 
-void WorkspaceConnection::advance_command(short events, TimePoint now, DispatchResult& result) {
-    if (command_phase_ == CommandPhase::connecting) {
-        if (auto connected = finish_connect(command_.fd); !connected) {
-            fail_command(connected.error(), now, result);
-            return;
-        }
-        command_phase_ = CommandPhase::sending;
+std::expected<SocketPhase, Error> protocol::advance_request(int fd, short events, SocketPhase phase,
+    std::string_view request, std::string& reply, std::size_t limit, bool& wrote) {
+    if (phase == SocketPhase::connecting) {
+        if (auto connected = finish_connect(fd); !connected) return std::unexpected(connected.error());
+        phase = SocketPhase::sending;
     }
-    if (command_phase_ == CommandPhase::sending) {
-        const auto count = ::send(command_.fd, request_.data(), request_.size(), MSG_NOSIGNAL);
+    if (phase == SocketPhase::sending) {
+        const auto count = ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
         if (count < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-                return;
-            fail_command(io_error("send", errno), now, result);
-            return;
+                return phase;
+            return std::unexpected(io_error("send", errno));
         }
-        if (command_kind_ == CommandKind::switch_workspace && count > 0)
-            pending_switch_->may_have_executed = true;
+        wrote = count > 0;
         // Socket1 treats its first read as a request; a short write ends this command.
-        if (static_cast<std::size_t>(count) != request_.size()) {
-            fail_command(Error{ErrorCode::io, "send", "incomplete command write"}, now, result);
-            return;
-        }
-        command_phase_ = CommandPhase::reading;
-        return;
+        if (static_cast<std::size_t>(count) != request.size())
+            return std::unexpected(Error{ErrorCode::io, "send", "incomplete command write"});
+        return SocketPhase::reading;
     }
 
-    const auto limit = command_kind_ == CommandKind::snapshot ? protocol::max_snapshot_bytes : protocol::max_switch_reply_bytes;
     std::array<char, 4096> buffer;
     std::size_t consumed = 0;
     unsigned attempts = 0;
     while (consumed < protocol::io_budget && attempts++ < 64) {
-        const auto count = ::recv(command_.fd, buffer.data(), std::min(buffer.size(), protocol::io_budget - consumed), 0);
+        const auto count = ::recv(fd, buffer.data(), std::min(buffer.size(), protocol::io_budget - consumed), 0);
         if (count < 0) {
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (events & (POLLERR | POLLHUP))
-                    fail_command(Error{ErrorCode::io, "receive", "command stream failed before EOF"}, now, result);
-                return;
+                    return std::unexpected(Error{ErrorCode::io, "receive", "command stream failed before EOF"});
+                return phase;
             }
-            fail_command(io_error("receive", errno), now, result);
-            return;
+            return std::unexpected(io_error("receive", errno));
         }
         if (count > 0) {
             const auto bytes = static_cast<std::size_t>(count);
-            if (bytes > limit - reply_.size()) {
-                fail_command(Error{ErrorCode::limit_exceeded, "receive", "reply exceeds byte limit"}, now, result);
-                return;
-            }
-            reply_.append(buffer.data(), bytes);
+            if (bytes > limit - reply.size())
+                return std::unexpected(Error{ErrorCode::limit_exceeded, "receive", "reply exceeds byte limit"});
+            reply.append(buffer.data(), bytes);
             consumed += bytes;
             continue;
         }
+        return SocketPhase::complete;
+    }
+    return phase;
+}
+
+void WorkspaceConnection::advance_command(short events, TimePoint now, DispatchResult& result) {
+    const auto limit = command_kind_ == CommandKind::snapshot ? protocol::max_snapshot_bytes : protocol::max_switch_reply_bytes;
+    bool wrote = false;
+    const auto next = protocol::advance_request(command_.fd, events, command_phase_, request_, reply_, limit, wrote);
+    if (command_kind_ == CommandKind::switch_workspace && wrote) pending_switch_->may_have_executed = true;
+    if (!next) { fail_command(next.error(), now, result); return; }
+    command_phase_ = *next;
+    if (command_phase_ == CommandPhase::complete) {
         if (command_kind_ == CommandKind::subscription_marker) {
             if (reply_ != "ok") {
                 fail_command(Error{ErrorCode::protocol, "subscribe", "marker command failed: " + reply_}, now, result);

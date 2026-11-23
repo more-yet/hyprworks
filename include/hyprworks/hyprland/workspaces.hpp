@@ -105,6 +105,8 @@ struct DispatchResult {
     std::optional<SwitchResult> switch_result;
 };
 
+enum class SocketPhase { idle, connecting, sending, reading, complete };
+
 class WorkspaceConnection {
 public:
     explicit WorkspaceConnection(ConnectionOptions options = {});
@@ -129,10 +131,9 @@ private:
         Socket(const Socket&) = delete;
         Socket& operator=(const Socket&) = delete;
         void reset() noexcept;
-        std::expected<bool, Error> connect(const std::string& path);
     };
     enum class CommandKind { subscription_marker, snapshot, switch_workspace };
-    enum class CommandPhase { idle, connecting, sending, reading };
+    using CommandPhase = SocketPhase;
     struct PendingSwitch {
         std::uint64_t id;
         WorkspaceKey key;

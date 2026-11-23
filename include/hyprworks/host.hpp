@@ -95,7 +95,8 @@ private:
     int fd_ = -1;
     struct Target {
         int descriptor = -1;
-        std::string filename;
+        std::string path;
+        std::size_t name_offset;
     };
     std::vector<Target> targets_;
 };

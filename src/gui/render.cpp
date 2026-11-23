@@ -334,7 +334,9 @@ void layout(Surface& surface) {
             }
             width = element.natural_text_width; height = element.natural_text_height;
         } else if (element.kind == Kind::image) {
-            if (element.image && element.image->ready.load(std::memory_order_acquire) && element.image->error.empty()) {
+            if (element.image && element.image->icon_size) {
+                width = height = element.image->icon_size;
+            } else if (element.image && element.image->ready.load(std::memory_order_acquire) && element.image->error.empty()) {
                 width = element.image->width / surface.scale; height = element.image->height / surface.scale;
             }
         }

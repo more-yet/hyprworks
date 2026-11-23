@@ -19,6 +19,7 @@ struct Image {
     ImageWork& work;
     std::string path, encoded, icon, theme, error;
     int width = 0, height = 0, channels = 0, pixels = 0;
+    int icon_size = 0;
     cairo_surface_t* surface = nullptr;
     std::size_t bytes = 0;
     bool submitted = false;

@@ -15,7 +15,7 @@ TrayBinding& tray_handle(lua_State* lua, bool allow_closed = false) {
 }
 
 MenuBinding& menu_handle(lua_State* lua, bool allow_closed = false) {
-    auto& binding = **static_cast<MenuBinding**>(luaL_checkudata(lua, 1, menu_metatable));
+    auto& binding = **static_cast<std::shared_ptr<MenuBinding>*>(luaL_checkudata(lua, 1, menu_metatable));
     if (invocation(lua).closing) luaL_error(lua, "invocation is shutting down");
     if (binding.closed && !allow_closed) luaL_error(lua, "connection is closed");
     return binding;
@@ -46,15 +46,12 @@ int menu_open(lua_State* lua) {
     field(lua, 1, "path");
     const char* path = check_string(lua, -1, &path_length);
     luaL_argcheck(lua, owner_length <= 255 && path_length <= 16384, 1, "invalid menu target");
-    if (state.menus.size() >= 32) return luaL_error(lua, "menu handle limit reached");
-    auto created = std::make_unique<MenuBinding>();
+    auto& slot = vacant_slot(state.menus);
+    auto created = std::make_shared<MenuBinding>();
     created->target = {std::string(owner, owner_length), std::string(path, path_length)};
     auto& binding = *created;
     const auto started = binding.connection.start(binding.target); binding.status_pending = !started;
-    state.menus.push_back(std::move(created));
-    const int result = retain_handle(lua, binding, menu_metatable);
-    if (result < 0) { binding.closed = true; binding.connection.stop(); }
-    return result;
+    return open_active(lua, slot, created, menu_metatable);
 }
 
 void push_tray_result(lua_State* lua, const tray::RequestResult& result) {
@@ -220,17 +217,13 @@ int menu_refresh(lua_State* lua) {
 
 int tray_restart(lua_State* lua) {
     auto& binding = tray_handle(lua, true);
-    if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
-    const auto result = binding.connection.start(binding.own_watcher);
-    binding.closed = false; binding.status_pending = true;
-    if (result) { ++binding.generation; binding.change_pending = true; }
-    return operation_result(lua, result);
+    return operation_result(lua, restart_observer(binding, binding.own_watcher));
 }
 
 int menu_restart(lua_State* lua) {
     auto& binding = menu_handle(lua, true);
-    if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "a result awaits delivery"); return 2; }
     dbusmenu::Target target = binding.target;
+    const auto generation = binding.generation;
     if (!lua_isnoneornil(lua, 2)) {
         lua_pushvalue(lua, 2);
         if (protected_call(lua, [&](lua_State* lua) {
@@ -244,10 +237,10 @@ int menu_restart(lua_State* lua) {
             return 0;
         }, 0, 0, 1) < 0) return -1;
     }
-    const auto result = binding.connection.start(target);
+    if (generation != binding.generation) throw std::runtime_error("menu changed while parsing target");
+    if (resume_handle(lua, invocation(lua).menus, binding) < 0) return -1;
+    const auto result = restart_observer(binding, target);
     if (result) binding.target = std::move(target);
-    binding.closed = false; binding.status_pending = true;
-    if (result) { ++binding.generation; binding.change_pending = true; }
     return operation_result(lua, result);
 }
 
@@ -262,7 +255,7 @@ int tray_close(lua_State* lua) {
 int menu_close(lua_State* lua) {
     auto& binding = menu_handle(lua, true);
     auto result = binding.connection.stop(); if (binding.result) result = std::exchange(binding.result, {});
-    binding.closed = true; ++binding.generation; binding.status_pending = binding.change_pending = false;
+    untrack(lua, invocation(lua).menus, binding); ++binding.generation; binding.status_pending = binding.change_pending = false;
     binding.activations.clear();
     for (auto* reference : {&binding.on_status, &binding.on_change, &binding.on_result, &binding.on_activation}) unref(lua, *reference);
     return protected_call(lua, [&](lua_State* lua) { if (result) push_menu_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
@@ -333,33 +326,13 @@ int menu_event(lua_State* lua) {
 }
 
 int dispatch_tray(lua_State* lua, TrayBinding& binding) {
-    const bool status = std::exchange(binding.status_pending, false), change = std::exchange(binding.change_pending, false);
-    const auto generation = binding.generation;
-    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    if (binding.result && !binding.closed && generation == binding.generation && !invocation(lua).requests.load(std::memory_order_relaxed)) {
-        const auto result = std::exchange(binding.result, {});
-        if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
-            push_tray_result(lua, *result);
-            return 1;
-        }) < 0) return -1;
-    }
-    return 0;
+    return deliver_observer(lua, binding, push_tray_result);
 }
 
 int dispatch_menu(lua_State* lua, MenuBinding& binding) {
-    const bool status = std::exchange(binding.status_pending, false), change = std::exchange(binding.change_pending, false);
     const auto generation = binding.generation;
     const auto activations = std::exchange(binding.activations, {});
-    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    if (binding.result && !binding.closed && generation == binding.generation && !invocation(lua).requests.load(std::memory_order_relaxed)) {
-        const auto result = std::exchange(binding.result, {});
-        if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
-            push_menu_result(lua, *result);
-            return 1;
-        }) < 0) return -1;
-    }
+    if (deliver_observer(lua, binding, push_menu_result) < 0) return -1;
     for (const auto& activation : activations) {
         if (dispatch_callback(lua, binding, binding.on_activation, generation, [&](lua_State* lua) {
             lua_createtable(lua, 0, 2); lua_pushinteger(lua, activation.id); lua_setfield(lua, -2, "id");
@@ -388,8 +361,8 @@ void register_tray(lua_State* lua) {
     lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
     lua_pushcfunction(lua, guarded<tray_close>); lua_setfield(lua, -2, "__close");
     lua_pushliteral(lua, "hyprworks protocol connection"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);
-    luaL_newmetatable(lua, menu_metatable); luaL_setfuncs(lua, menu_methods, 0);
-    lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
+    luaL_newmetatable(lua, menu_metatable); userdata_methods(lua, menu_methods);
+    lua_pushcfunction(lua, release_userdata<MenuBinding>); lua_setfield(lua, -2, "__gc");
     lua_pushcfunction(lua, guarded<menu_close>); lua_setfield(lua, -2, "__close");
     lua_pushliteral(lua, "hyprworks protocol connection"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);
     lua_pushcfunction(lua, guarded<tray_open>); lua_setfield(lua, -2, "tray");

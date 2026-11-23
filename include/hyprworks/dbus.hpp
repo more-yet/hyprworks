@@ -18,7 +18,6 @@ struct Value {
     std::variant<bool, std::int64_t, std::uint64_t, double, std::string, std::vector<Value>> data;
 };
 using Body = std::vector<Value>;
-std::vector<std::string> split_signature(const std::string& signature, bool dictionary = false);
 struct Method { std::string name, input, output; };
 struct Call {
     std::string destination, path, interface, member;

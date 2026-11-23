@@ -319,169 +319,244 @@ const wp_fractional_scale_v1_listener scale_listener{
         surface.configure_pending = true; dirty(surface);
     }
 };
-double number(lua_State* lua, int table, const char* name, double current, double minimum, double maximum) {
-    field(lua, table, name);
-    if (lua_isnil(lua, -1)) { lua_pop(lua, 1); return current; }
-    const double value = check_number(lua, -1);
-    if (!std::isfinite(value) || value < minimum || value > maximum) luaL_error(lua, "%s is out of range", name);
-    lua_pop(lua, 1); return value;
+enum Damage { unchanged, paint_changed, geometry_changed, shaping_changed };
+bool container(Kind kind) {
+    return kind == Kind::row || kind == Kind::column || kind == Kind::scroll || kind == Kind::box ||
+        kind == Kind::button || kind == Kind::toggle || kind == Kind::slider;
 }
+template<class T>
+struct Property { T Element::*member; T value; Damage damage; };
 
-std::uint32_t read_color(lua_State* lua, int table, const char* name, std::uint32_t current) {
-    field(lua, table, name);
-    if (lua_isnil(lua, -1)) { lua_pop(lua, 1); return current; }
-    std::size_t length;
-    const char* text = check_string(lua, -1, &length);
-    if ((length != 7 && length != 9) || text[0] != '#') luaL_error(lua, "%s must be #RRGGBB or #RRGGBBAA", name);
-    std::uint32_t value = 0;
-    const auto result = std::from_chars(text + 1, text + length, value, 16);
-    if (result.ec != std::errc{} || result.ptr != text + length) luaL_error(lua, "invalid color");
-    lua_pop(lua, 1); return length == 7 ? (value << 8) | 255 : value;
-}
+struct ElementPatch {
+    lua_State* lua;
+    std::vector<Property<double>> numbers;
+    std::vector<Property<bool>> flags;
+    std::vector<Property<int>> enums;
+    std::vector<Property<std::uint32_t>> colors;
+    std::vector<Property<std::string>> strings;
+    std::shared_ptr<Image> image;
+    int callback = LUA_NOREF;
+    unsigned specified = 0;
+    explicit ElementPatch(lua_State* state) : lua(state) {}
+    ~ElementPatch() { unref(lua, callback); }
+};
+constexpr unsigned text_specified = 1, value_specified = 2, scroll_specified = 4;
 
-bool read_text(lua_State* lua, int table, const char* name, std::string& value) {
-    field(lua, table, name);
-    if (lua_isnil(lua, -1)) { lua_pop(lua, 1); return false; }
-    std::size_t size;
-    const char* text = check_string(lua, -1, &size);
-    const std::string_view next(text, size);
-    const bool changed = value != next;
-    if (changed) {
-        if (!valid_text(next)) luaL_error(lua, "%s must be UTF-8 without NUL, up to 16 KiB", name);
-        value.assign(next);
-    }
-    lua_pop(lua, 1);
-    return changed;
-}
-
-void properties(lua_State* lua, int table, Element& element, Gui& gui, bool creating) {
+void read_properties(lua_State* lua, int table, ElementPatch& patch, Gui& gui, Kind kind,
+                     bool creating, std::size_t remaining) {
     table = lua_absindex(lua, table);
-    text_field(lua, table, "id", element.id, 128);
+    const auto present = [&](int index, const char* name) {
+        field(lua, index, name);
+        if (!lua_isnil(lua, -1)) return true;
+        lua_pop(lua, 1); return false;
+    };
+    const auto string = [&](int index, const char* name, std::string Element::*member,
+                            std::size_t limit, Damage damage) {
+        if (!present(index, name)) return false;
+        std::size_t size;
+        const char* data = check_string(lua, -1, &size);
+        if (size > remaining || size > limit || !valid_text({data, size}))
+            luaL_error(lua, "%s exceeds its text budget or is invalid UTF-8", name);
+        remaining -= size;
+        patch.strings.push_back({member, std::string(data, size), damage});
+        lua_pop(lua, 1); return true;
+    };
+    const auto number = [&](const char* name, double Element::*member, double min, double max, Damage damage) {
+        if (!present(table, name)) return false;
+        const auto value = check_number(lua, -1);
+        if (!(value >= min && value <= max)) luaL_error(lua, "%s is out of range", name);
+        patch.numbers.push_back({member, value, damage});
+        lua_pop(lua, 1); return true;
+    };
+    const auto flag = [&](int index, const char* name, bool Element::*member, Damage damage) {
+        if (!present(index, name)) return false;
+        luaL_checktype(lua, -1, LUA_TBOOLEAN);
+        patch.flags.push_back({member, lua_toboolean(lua, -1) != 0, damage});
+        lua_pop(lua, 1); return true;
+    };
+    const auto color = [&](const char* name, std::uint32_t Element::*member) {
+        if (!present(table, name)) return;
+        std::size_t length;
+        const char* data = check_string(lua, -1, &length);
+        if ((length != 7 && length != 9) || data[0] != '#') luaL_error(lua, "%s must be #RRGGBB or #RRGGBBAA", name);
+        std::uint32_t value;
+        const auto parsed = std::from_chars(data + 1, data + length, value, 16);
+        if (parsed.ec != std::errc{} || parsed.ptr != data + length) luaL_error(lua, "invalid color");
+        patch.colors.push_back({member, length == 7 ? (value << 8) | 255 : value, paint_changed});
+        lua_pop(lua, 1);
+    };
+    const auto alignment = [&](const char* name, int Element::*member, const char* const* choices, Damage damage) {
+        if (!present(table, name)) return;
+        patch.enums.push_back({member, check_option(lua, -1, nullptr, choices), damage});
+        lua_pop(lua, 1);
+    };
+    if (creating) {
+        string(table, "id", &Element::id, 128, unchanged);
+        flag(table, "thumb", &Element::thumb, unchanged);
+        if (kind == Kind::slider) string(table, "scroll_target", &Element::scroll_target, 128, unchanged);
+    }
     field(lua, table, "accessibility");
     if (!lua_isnil(lua, -1)) {
         luaL_checktype(lua, -1, LUA_TTABLE);
         static const char* roles[] = {"auto", "group", "label", "image", "button", "checkbox", "slider",
             "textbox", "heading", "link", "list", "list_item", "menu", "menu_item", nullptr};
         field(lua, -1, "role");
-        if (!lua_isnil(lua, -1)) element.accessible_role = roles[check_option(lua, -1, nullptr, roles)];
+        if (!lua_isnil(lua, -1)) patch.strings.push_back({&Element::accessible_role, roles[check_option(lua, -1, nullptr, roles)], unchanged});
         lua_pop(lua, 1);
-        read_text(lua, -1, "name", element.accessible_name);
-        read_text(lua, -1, "description", element.accessible_description);
-        element.accessible_hidden = boolean_field(lua, -1, "hidden", element.accessible_hidden);
+        string(-1, "name", &Element::accessible_name, max_text, unchanged);
+        string(-1, "description", &Element::accessible_description, max_text, unchanged);
+        flag(-1, "hidden", &Element::accessible_hidden, unchanged);
     }
     lua_pop(lua, 1);
-    const bool text_changed = read_text(lua, table, "text", element.text);
-    if (element.kind == Kind::input) read_text(lua, table, "placeholder", element.placeholder);
-    if (text_field(lua, table, "font", element.font, 256)) {
-        auto* font = pango_font_description_from_string(element.font.c_str());
-        const int font_size = pango_font_description_get_size(font);
-        const bool family = pango_font_description_get_family(font) != nullptr;
-        pango_font_description_free(font);
-        if (!family || font_size < PANGO_SCALE || font_size > 256 * PANGO_SCALE)
-            luaL_error(lua, "font requires a family and size in 1..256");
-    }
-    element.width = number(lua, table, "width", element.width, 0, 16384);
-    element.height = number(lua, table, "height", element.height, 0, 16384);
-    element.x = number(lua, table, "x", element.x, -16384, 16384);
-    element.y = number(lua, table, "y", element.y, -16384, 16384);
+    number("width", &Element::width, 0, 16384, geometry_changed);
+    number("height", &Element::height, 0, 16384, geometry_changed);
+    number("x", &Element::x, -16384, 16384, geometry_changed);
+    number("y", &Element::y, -16384, 16384, geometry_changed);
     static const char* horizontal_alignments[] = {"stretch", "left", "center", "right", nullptr};
     static const char* vertical_alignments[] = {"stretch", "top", "center", "bottom", nullptr};
     static const char* text_alignments[] = {"left", "center", "right", nullptr};
-    element.halign = enum_field(lua, table, "halign", horizontal_alignments[element.halign], horizontal_alignments);
-    element.valign = enum_field(lua, table, "valign", vertical_alignments[element.valign], vertical_alignments);
-    element.align = enum_field(lua, table, "align", text_alignments[element.align], text_alignments);
-    element.grow = number(lua, table, "grow", element.grow, 0, 1024);
-    element.padding = number(lua, table, "padding", element.padding, 0, 1024);
-    element.gap = number(lua, table, "gap", element.gap, 0, 1024);
-    element.radius = number(lua, table, "radius", element.radius, 0, 1024);
-    element.border_width = number(lua, table, "border_width", element.border_width, 0, 1024);
-    element.border_color = read_color(lua, table, "border_color", element.border_color);
-    element.value = number(lua, table, "value", element.value, 0, 1);
-    element.enabled = boolean_field(lua, table, "enabled", element.enabled);
-    element.wrap = boolean_field(lua, table, "wrap", element.wrap);
-    element.ellipsize = boolean_field(lua, table, "ellipsize", element.ellipsize);
-    if (element.kind == Kind::input) {
-        element.password = boolean_field(lua, table, "password", element.password);
-        text_field(lua, table, "mask", element.mask, 4);
-        if (element.password && (!valid_text(element.mask) || g_utf8_strlen(element.mask.c_str(), -1) != 1))
-            luaL_error(lua, "password input requires one UTF-8 mask character");
-        element.caret_width = number(lua, table, "caret_width", element.caret_width, 0, 1024);
-        element.selection_color = read_color(lua, table, "selection_color", element.selection_color);
-        element.caret_color = read_color(lua, table, "caret_color", element.caret_color);
-        element.placeholder_color = read_color(lua, table, "placeholder_color", element.placeholder_color);
-        if (element.password) element.preedit.clear();
+    alignment("halign", &Element::halign, horizontal_alignments, geometry_changed);
+    alignment("valign", &Element::valign, vertical_alignments, geometry_changed);
+    number("grow", &Element::grow, 0, 1024, geometry_changed);
+    number("padding", &Element::padding, 0, 1024, geometry_changed);
+    if (kind == Kind::row || kind == Kind::column || kind == Kind::scroll)
+        number("gap", &Element::gap, 0, 1024, geometry_changed);
+    number("radius", &Element::radius, 0, 1024, paint_changed);
+    number("border_width", &Element::border_width, 0, 1024, paint_changed);
+    color("border_color", &Element::border_color);
+    color("background", &Element::background);
+    flag(table, "enabled", &Element::enabled, paint_changed);
+    const bool control = kind == Kind::button || kind == Kind::input || kind == Kind::toggle || kind == Kind::slider;
+    if (control) {
+        color("focus_color", &Element::focus_color);
+        number("focus_width", &Element::focus_width, 0, 1024, paint_changed);
     }
-    if ((element.kind == Kind::input || !element.text.empty() || !element.placeholder.empty()) && element.font.empty())
-        luaL_error(lua, "text requires an explicit font");
-    if (element.kind == Kind::slider) {
-        element.step = number(lua, table, "step", element.step, 0, 1);
-        element.jump = boolean_field(lua, table, "jump", element.jump);
+    if (kind == Kind::text || (control && kind != Kind::slider)) {
+        if (string(table, "text", &Element::text, max_text, shaping_changed)) patch.specified |= text_specified;
+        if (string(table, "font", &Element::font, 256, shaping_changed)) {
+            auto* font = pango_font_description_from_string(patch.strings.back().value.c_str());
+            const int size = pango_font_description_get_size(font);
+            const bool family = pango_font_description_get_family(font) != nullptr;
+            pango_font_description_free(font);
+            if (!family || size < PANGO_SCALE || size > 256 * PANGO_SCALE) luaL_error(lua, "font requires a family and size in 1..256");
+        }
+        alignment("align", &Element::align, text_alignments, shaping_changed);
+        color("color", &Element::color);
+        if (kind != Kind::input) {
+            flag(table, "wrap", &Element::wrap, shaping_changed);
+            flag(table, "ellipsize", &Element::ellipsize, shaping_changed);
+        }
     }
-    if (element.kind == Kind::slider || element.kind == Kind::scroll)
-        element.horizontal = boolean_field(lua, table, "horizontal",
-            creating ? std::nullopt : std::optional(element.horizontal));
-    if (element.kind == Kind::scroll) {
-        field(lua, table, "scroll");
-        if (!lua_isnil(lua, -1)) element.scroll_origin.reset();
-        lua_pop(lua, 1);
-        element.scroll = number(lua, table, "scroll", element.scroll, 0, 33554432);
+    if (kind == Kind::input) {
+        flag(table, "password", &Element::password, shaping_changed);
+        string(table, "placeholder", &Element::placeholder, max_text, shaping_changed);
+        if (string(table, "mask", &Element::mask, 4, shaping_changed) && g_utf8_strlen(patch.strings.back().value.c_str(), -1) != 1)
+            luaL_error(lua, "mask requires one UTF-8 character");
+        number("caret_width", &Element::caret_width, 0, 1024, paint_changed);
+        color("selection_color", &Element::selection_color);
+        color("caret_color", &Element::caret_color);
+        color("placeholder_color", &Element::placeholder_color);
     }
-    element.background = read_color(lua, table, "background", element.background);
-    element.color = read_color(lua, table, "color", element.color);
-    element.focus_color = read_color(lua, table, "focus_color", element.focus_color);
-    element.focus_width = number(lua, table, "focus_width", element.focus_width, 0, 1024);
-    field(lua, table, element.kind == Kind::button ? "on_activate" : element.kind == Kind::image ? "on_loaded" : "on_change");
-    if (!lua_isnil(lua, -1)) {
-        luaL_checktype(lua, -1, LUA_TFUNCTION);
-        const int reference = luaL_ref(lua, LUA_REGISTRYINDEX);
-        unref(lua, element.callback); element.callback = reference;
-    } else lua_pop(lua, 1);
-    if (element.kind == Kind::image) {
+    if ((kind == Kind::slider || kind == Kind::toggle) &&
+        number("value", &Element::value, 0, 1, kind == Kind::slider ? geometry_changed : paint_changed))
+        patch.specified |= value_specified;
+    if (kind == Kind::slider) {
+        number("step", &Element::step, 0, 1, unchanged);
+        flag(table, "jump", &Element::jump, unchanged);
+    }
+    if (kind == Kind::slider || kind == Kind::scroll) {
+        const bool supplied = flag(table, "horizontal", &Element::horizontal, geometry_changed);
+        if (creating && !supplied) luaL_error(lua, "horizontal is required");
+    }
+    if (kind == Kind::scroll && number("scroll", &Element::scroll, 0, 33554432, geometry_changed)) patch.specified |= scroll_specified;
+    if (control || kind == Kind::image || kind == Kind::scroll)
+        callback_field(lua, table, kind == Kind::button ? "on_activate" : kind == Kind::image ? "on_loaded" : "on_change", patch.callback);
+    if (kind == Kind::image) {
         field(lua, table, "source");
         if (auto* image = static_cast<std::shared_ptr<Image>*>(luaL_testudata(lua, -1, captured_image_type))) {
-            element.image = *image; element.image_notified = false;
+            patch.image = *image;
         } else if (!lua_isnil(lua, -1)) {
             luaL_checktype(lua, -1, LUA_TTABLE);
-            element.image = std::make_shared<Image>(gui.images); element.image_notified = false;
-            auto& image = *element.image;
+            patch.image = std::make_shared<Image>(gui.images);
+            auto& image = *patch.image;
             text_field(lua, -1, "path", image.path, 4096);
             text_field(lua, -1, "icon", image.icon, 256);
-            text_field(lua, -1, "theme", image.theme, 256);
-            image.pixels = static_cast<int>(integer_field(lua, -1, "pixels", 0, 0, 4096));
-            if (!image.icon.empty() && (image.theme.empty() || image.pixels == 0))
-                luaL_error(lua, "icon source requires a theme and pixel size");
-            image.width = static_cast<int>(integer_field(lua, -1, "width", 0, 0, 4096));
-            image.height = static_cast<int>(integer_field(lua, -1, "height", 0, 0, 4096));
-            image.channels = static_cast<int>(integer_field(lua, -1, "channels", 0, 0, 4));
-            if (image.channels && image.channels != 3 && image.channels != 4) luaL_error(lua, "raw image channels must be 3 or 4");
             field(lua, -1, "data");
-            if (!lua_isnil(lua, -1)) {
+            const bool data = !lua_isnil(lua, -1);
+            if (int(!image.path.empty()) + int(!image.icon.empty()) + int(data) != 1)
+                luaL_error(lua, "image source requires exactly one of path, icon or data");
+            if (data) {
                 std::size_t length; const char* bytes = check_string(lua, -1, &length);
+                image.channels = static_cast<int>(integer_field(lua, -2, "channels", 0, 0, 4));
+                if (image.channels) {
+                    if (image.channels != 3 && image.channels != 4) luaL_error(lua, "raw image channels must be 3 or 4");
+                    image.width = static_cast<int>(integer_field(lua, -2, "width", std::nullopt, 1, 4096));
+                    image.height = static_cast<int>(integer_field(lua, -2, "height", std::nullopt, 1, 4096));
+                    if (length != static_cast<std::size_t>(image.width * image.height * image.channels))
+                        luaL_error(lua, "raw image dimensions do not match its data");
+                }
                 image.set_data({bytes, length});
             }
             lua_pop(lua, 1);
-            if (int(!image.path.empty()) + int(!image.icon.empty()) + int(!image.encoded.empty()) != 1)
-                luaL_error(lua, "image source requires exactly one of path, icon or data");
-            if (image.channels && (image.width < 1 || image.height < 1 ||
-                image.encoded.size() != static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * static_cast<std::size_t>(image.channels)))
-                luaL_error(lua, "raw image dimensions do not match its data");
+            if (!image.icon.empty()) {
+                text_field(lua, -1, "theme", image.theme, 256);
+                if (image.theme.empty()) luaL_error(lua, "icon source requires a theme");
+                image.icon_size = static_cast<int>(integer_field(lua, -1, "pixels", std::nullopt, 1, 4096));
+                image.pixels = image.icon_size;
+            } else if (!image.channels) image.pixels = static_cast<int>(integer_field(lua, -1, "pixels", 0, 0, 4096));
         }
         lua_pop(lua, 1);
     }
-    if (text_changed) {
-        element.cursor = element.anchor = static_cast<int>(element.text.size());
-        element.preedit.clear();
+}
+
+Damage apply_properties(Element& element, ElementPatch& patch, std::size_t& bytes) {
+    auto total = bytes;
+    bool has_font = !element.font.empty(), has_text = !element.text.empty(), has_mask = !element.mask.empty();
+    bool password = element.password, edit = false;
+    for (const auto& [member, value, damage] : patch.strings) {
+        total = total - (element.*member).size() + value.size();
+        if (member == &Element::font) has_font = true;
+        if (member == &Element::mask) has_mask = true;
+        if (member == &Element::text) { has_text = !value.empty(); edit = value != element.text; }
     }
+    for (const auto& prop : patch.flags) if (prop.member == &Element::password) password = prop.value;
+    if (password && !has_mask) throw std::runtime_error("password input requires a mask");
+    if ((has_text || element.kind == Kind::input) && !has_font) throw std::runtime_error("text requires an explicit font");
+    if (patch.image) {
+        const auto metadata = [](const Image& i) { return i.icon.size() + i.path.size() + i.theme.size(); };
+        total = total - (element.image ? metadata(*element.image) : 0) + metadata(*patch.image);
+    }
+    if (total > max_content) throw std::runtime_error("content strings exceed 1 MiB");
+    bytes = total;
+    Damage damage = unchanged;
+    if (edit || password != element.password) { ++element.edit_revision; element.preedit.clear(); }
+    for (auto& prop : patch.strings)
+        if (prop.member == &Element::font && prop.value != element.font && element.layout)
+            g_object_unref(std::exchange(element.layout, nullptr));
+    const auto apply = [&](auto& changes) {
+        for (auto& prop : changes) {
+            auto& current = element.*prop.member;
+            if (current != prop.value) { current = std::move(prop.value); damage = std::max(damage, prop.damage); }
+        }
+        changes.clear();
+    };
+    apply(patch.strings); apply(patch.numbers); apply(patch.flags); apply(patch.enums); apply(patch.colors);
+    if (edit) element.cursor = element.anchor = static_cast<int>(element.text.size());
+    if (patch.specified & scroll_specified) element.scroll_origin.reset();
+    if (patch.callback >= 0) { unref(patch.lua, element.callback); element.callback = std::exchange(patch.callback, LUA_NOREF); }
+    if (patch.image) { element.image = std::move(patch.image); element.image_notified = false; damage = std::max(damage, geometry_changed); }
+    element.text_dirty |= damage == shaping_changed;
+    return damage;
 }
 
 struct ParsedTree {
     lua_State* lua;
     std::vector<Element> elements;
     std::vector<unsigned> specified;
+    ElementPatch patch{lua};
+    std::size_t bytes = 0;
     ~ParsedTree() { clear_elements(lua, elements); }
 };
-
-constexpr unsigned text_specified = 1, value_specified = 2, scroll_specified = 4;
 
 void parse_tree(lua_State* lua, int table, ParsedTree& tree, Gui& gui, int parent, unsigned depth) {
     if (!lua_checkstack(lua, 12)) luaL_error(lua, "cannot grow Lua parsing stack");
@@ -493,30 +568,23 @@ void parse_tree(lua_State* lua, int table, ParsedTree& tree, Gui& gui, int paren
     const int index = static_cast<int>(tree.elements.size());
     tree.elements.emplace_back();
     auto& element = tree.elements.back(); element.kind = kind; element.parent = parent;
-    unsigned specified = 0;
-    for (const auto& [name, bit] : {std::pair{"text", text_specified}, {"value", value_specified}, {"scroll", scroll_specified}}) {
-        field(lua, table, name);
-        if (!lua_isnil(lua, -1)) specified |= bit;
+    tree.patch.specified = 0;
+    read_properties(lua, table, tree.patch, gui, kind, true, max_content - tree.bytes);
+    tree.specified.push_back(tree.patch.specified);
+    apply_properties(element, tree.patch, tree.bytes);
+    if (container(kind)) {
+        field(lua, table, "children");
+        if (!lua_isnil(lua, -1)) {
+            luaL_checktype(lua, -1, LUA_TTABLE);
+            const auto count = lua_rawlen(lua, -1);
+            if (count > 2048 - tree.elements.size()) luaL_error(lua, "too many children");
+            for (std::size_t child = 1; child <= count; ++child) {
+                lua_rawgeti(lua, -1, static_cast<lua_Integer>(child));
+                parse_tree(lua, -1, tree, gui, index, depth + 1); lua_pop(lua, 1);
+            }
+        }
         lua_pop(lua, 1);
     }
-    tree.specified.push_back(specified);
-    element.thumb = boolean_field(lua, table, "thumb", false);
-    if (kind == Kind::slider) text_field(lua, table, "scroll_target", element.scroll_target, 128);
-    properties(lua, table, element, gui, true);
-    field(lua, table, "children");
-    if (!lua_isnil(lua, -1)) {
-        luaL_checktype(lua, -1, LUA_TTABLE);
-        if (kind != Kind::row && kind != Kind::column && kind != Kind::scroll && kind != Kind::box &&
-            kind != Kind::button && kind != Kind::toggle && kind != Kind::slider)
-            luaL_error(lua, "only containers accept children");
-        const auto count = lua_rawlen(lua, -1);
-        if (count > 2048) luaL_error(lua, "too many children");
-        for (std::size_t child = 1; child <= count; ++child) {
-            lua_rawgeti(lua, -1, static_cast<lua_Integer>(child));
-            parse_tree(lua, -1, tree, gui, index, depth + 1); lua_pop(lua, 1);
-        }
-    }
-    lua_pop(lua, 1);
     tree.elements[static_cast<std::size_t>(index)].end = static_cast<int>(tree.elements.size());
 }
 
@@ -537,12 +605,15 @@ bool same_text_layout(const Element& a, const Element& b) {
 void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, bool preserve) {
     auto& gui = *surface.gui;
     auto& old = surface.elements;
-    if (parsed.elements.size() < parsed.elements.capacity() / 2) parsed.elements.shrink_to_fit();
     const int delta = static_cast<int>(parsed.elements.size()) - (end - begin);
     if (static_cast<int>(old.size()) + delta > 2048) throw std::runtime_error("tree exceeds 2048 elements");
     std::vector<int> remap(old.size(), -1);
     for (int i = 0; i < static_cast<int>(old.size()); ++i)
         if (i < begin || i >= end) remap[static_cast<std::size_t>(i)] = i < begin ? i : i + delta;
+    std::size_t bytes = parsed.bytes;
+    for (int i = 0; i < static_cast<int>(old.size()); ++i)
+        if (i < begin || i >= end) bytes += element_text_bytes(old[static_cast<std::size_t>(i)]);
+    if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
     if (preserve) {
         for (std::size_t i = 0; i < parsed.elements.size(); ++i) {
             auto& next = parsed.elements[i];
@@ -553,8 +624,12 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
             const auto& previous = old[static_cast<std::size_t>(*found)];
             if (previous.id != next.id || previous.kind != next.kind) continue;
             remap[static_cast<std::size_t>(*found)] = begin + static_cast<int>(i);
-            if (!(parsed.specified[i] & text_specified)) next.text = previous.text;
-            if (!next.text.empty() && next.font.empty()) throw std::runtime_error("text requires an explicit font");
+            if (!(parsed.specified[i] & text_specified) && !previous.text.empty()) {
+                if (next.font.empty()) throw std::runtime_error("text requires an explicit font");
+                bytes += previous.text.size();
+                if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
+                next.text = previous.text;
+            }
             if (!(parsed.specified[i] & value_specified)) next.value = previous.value;
             if (!(parsed.specified[i] & scroll_specified)) {
                 next.scroll = previous.scroll;
@@ -587,10 +662,8 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
     named.reserve(std::min(static_cast<std::size_t>(count), surface.named_elements.size()));
     images.reserve(std::min(static_cast<std::size_t>(count), surface.image_elements.size()));
     scrolls.reserve(std::min(static_cast<std::size_t>(count), surface.scroll_elements.size()));
-    std::size_t bytes = 0;
     for (int i = 0; i < count; ++i) {
         const auto& element = next_element(i);
-        bytes += element_text_bytes(element);
         if (!element.id.empty()) named.push_back(i);
         if (element.kind == Kind::image) images.push_back(i);
         if (element.kind == Kind::scroll) scrolls.push_back(i);
@@ -609,7 +682,6 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
             thumb = i;
         }
     }
-    if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
     std::ranges::sort(named, {}, [&](int index) -> const std::string& { return next_element(index).id; });
     for (std::size_t i = 1; i < named.size(); ++i)
         if (next_element(named[i - 1]).id == next_element(named[i]).id)
@@ -769,13 +841,6 @@ int find_element(lua_State* lua) {
     std::size_t length; const char* id = check_string(lua, 2, &length);
     const auto& surface = live_surface(gui, identity);
     const std::string_view name(id, length);
-    if (name.empty()) {
-        const auto found = std::ranges::find(surface.elements, name, &Element::id);
-        if (found != surface.elements.end()) {
-            push_handle(lua, {surface.id, surface.revision, static_cast<int>(found - surface.elements.begin())}, element_type);
-            return 1;
-        }
-    }
     const auto found = std::ranges::lower_bound(surface.named_elements, name, {},
         [&](int index) -> const std::string& { return surface.elements[static_cast<std::size_t>(index)].id; });
     if (found != surface.named_elements.end() && surface.elements[static_cast<std::size_t>(*found)].id == name) {
@@ -790,9 +855,7 @@ int replace_children(lua_State* lua) {
     const auto& initial = live_surface(gui, identity);
     const auto kind = initial.elements[static_cast<std::size_t>(identity.element)].kind;
     const auto previous_size = static_cast<std::size_t>(initial.elements[static_cast<std::size_t>(identity.element)].end - identity.element - 1);
-    if (kind != Kind::row && kind != Kind::column &&
-        kind != Kind::scroll && kind != Kind::box && kind != Kind::button && kind != Kind::toggle && kind != Kind::slider)
-        throw std::runtime_error("only containers accept children");
+    if (!container(kind)) throw std::runtime_error("only containers accept children");
     unsigned depth = 2;
     for (int parent = initial.elements[static_cast<std::size_t>(identity.element)].parent; parent >= 0;
         parent = initial.elements[static_cast<std::size_t>(parent)].parent) ++depth;
@@ -821,56 +884,28 @@ int replace_children(lua_State* lua) {
 int set_element(lua_State* lua) {
     auto& gui = gui_state(lua);
     const auto identity = handle(lua, 1, element_type);
-    auto& surface = live_surface(gui, identity);
+    const auto kind = live_surface(gui, identity).elements[static_cast<std::size_t>(identity.element)].kind;
     luaL_checktype(lua, 2, LUA_TTABLE);
-    ParsedTree parsed{lua, {}, {}};
-    parsed.elements.push_back(surface.elements[static_cast<std::size_t>(identity.element)]);
-    auto& replacement = parsed.elements.front();
-    replacement.layout = nullptr; replacement.callback = LUA_NOREF;
+    ElementPatch patch(lua);
     lua_pushvalue(lua, 2);
     if (protected_call(lua, [&](lua_State* lua) {
-        const auto& current = live_surface(gui, identity).elements[static_cast<std::size_t>(identity.element)];
-        if (current.callback >= 0) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, current.callback);
-            replacement.callback = luaL_ref(lua, LUA_REGISTRYINDEX);
-        }
-        properties(lua, 2, replacement, gui, false); return 0;
+        read_properties(lua, 2, patch, gui, kind, false, max_content); return 0;
     }, 0, 0, 1) < 0) return -1;
     auto& live = live_surface(gui, identity);
     auto& element = live.elements[static_cast<std::size_t>(identity.element)];
-    if (replacement.id != element.id) throw std::runtime_error("element id is immutable");
-    const auto bytes = live.content_bytes - element_text_bytes(element) + element_text_bytes(replacement);
-    if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
-    replacement.edit_revision = element.edit_revision +
-        (replacement.text != element.text || replacement.password != element.password ? 1 : 0);
-    const bool text_changed = !same_text_layout(replacement, element);
-    const bool geometry = text_changed || replacement.width != element.width || replacement.height != element.height ||
-        replacement.x != element.x || replacement.y != element.y || replacement.grow != element.grow ||
-        replacement.padding != element.padding || replacement.gap != element.gap ||
-        replacement.halign != element.halign || replacement.valign != element.valign ||
-        replacement.horizontal != element.horizontal || replacement.scroll != element.scroll || replacement.image != element.image ||
-        (element.kind == Kind::slider && replacement.value != element.value);
-    const bool repaint = geometry || replacement.background != element.background || replacement.color != element.color ||
-        replacement.selection_color != element.selection_color || replacement.caret_color != element.caret_color ||
-        replacement.placeholder_color != element.placeholder_color || replacement.caret_width != element.caret_width ||
-        replacement.focus_color != element.focus_color || replacement.focus_width != element.focus_width ||
-        replacement.border_color != element.border_color ||
-        replacement.border_width != element.border_width || replacement.radius != element.radius ||
-        replacement.enabled != element.enabled;
-    replacement.text_dirty |= text_changed;
-    if (replacement.font == element.font) std::swap(replacement.layout, element.layout);
-    std::swap(replacement, element); live.content_bytes = bytes;
+    const bool horizontal = element.horizontal;
+    const auto damage = apply_properties(element, patch, live.content_bytes);
     if (!element.enabled) {
         if (live.focused == identity.element) focus(live, -1);
         if (live.pressed == identity.element) live.pressed = -1;
     }
-    if (element.kind == Kind::slider && replacement.horizontal != element.horizontal) {
+    if (element.kind == Kind::slider && horizontal != element.horizontal) {
         if (live.pressed == identity.element) live.pressed = -1;
     }
-    if (element.kind == Kind::scroll && (!element.enabled || replacement.horizontal != element.horizontal) &&
+    if (element.kind == Kind::scroll && (!element.enabled || horizontal != element.horizontal) &&
         live.pressed >= 0 && live.elements[static_cast<std::size_t>(live.pressed)].target_index == identity.element)
         live.pressed = -1;
-    if (repaint) invalidate_element(live, identity.element, geometry);
+    if (damage != unchanged) invalidate_element(live, identity.element, damage >= geometry_changed);
     if (element.image && !element.image->submitted) wake(gui.owner);
     lua_pushboolean(lua, true); return 1;
 }
@@ -963,8 +998,9 @@ int create_surface(lua_State* lua) {
             width = static_cast<int>(integer_field(lua, 2, "width", std::nullopt, 1));
             height = static_cast<int>(integer_field(lua, 2, "height", std::nullopt, 1));
         }
-        text_field(lua, 2, "title", title, 256); text_field(lua, 2, "app_id", app_id, 256);
-        text_field(lua, 2, "output", output, 256);
+        if constexpr (Role == 0) text_field(lua, 2, "title", title, 256);
+        if constexpr (Role != 2) text_field(lua, 2, "app_id", app_id, 256);
+        if constexpr (Role == 1) text_field(lua, 2, "output", output, 256);
         callback_field(lua, 2, "on_configure", surface->on_configure);
         callback_field(lua, 2, "on_close", surface->on_close);
         callback_field(lua, 2, "on_grab_cleared", surface->on_grab_cleared);

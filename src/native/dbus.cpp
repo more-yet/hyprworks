@@ -1,5 +1,6 @@
 #include <hyprworks/dbus.hpp>
 #include "dbus.hpp"
+#include "dbus_body.hpp"
 #include <algorithm>
 #include <cmath>
 #include <exception>
@@ -31,22 +32,14 @@ std::size_t type_end(std::string_view signature, std::size_t at, unsigned depth,
     throw std::runtime_error("unsupported D-Bus type");
 }
 
-struct Budget {
-    std::size_t nodes = 0, bytes = 0;
-    void add(unsigned depth, std::size_t size = 0) {
-        if (depth > 32 || ++nodes > 65536 || size > 8 * 1024 * 1024 || (bytes += size) > 8 * 1024 * 1024)
-            throw std::length_error("D-Bus message exceeds depth, value or 8 MiB payload limit");
-    }
-};
-
 void validate_value_signature(std::string_view signature) {
     if (signature.size() > 255) throw std::runtime_error("D-Bus signature exceeds 255 bytes");
     if (type_end(signature, 0, 0, false) != signature.size())
         throw std::runtime_error("D-Bus value requires one complete type");
 }
 
-Value read_value(sd_bus_message* message, Budget& budget, unsigned depth) {
-    budget.add(depth);
+Value read_value(sd_bus_message* message, BodyBudget& budget, unsigned depth) {
+    budget.node(depth);
     char type;
     const char* contents = nullptr;
     require(sd_bus_message_peek_type(message, &type, &contents));
@@ -68,7 +61,7 @@ Value read_value(sd_bus_message* message, Budget& budget, unsigned depth) {
         }
         case 's': case 'o': case 'g': {
             const char* data; require(sd_bus_message_read_basic(message, type, &data));
-            const auto size = std::strlen(data); budget.add(depth, size);
+            const auto size = std::strlen(data); budget.payload(size);
             value.data = std::string(data, size); break;
         }
         case 'a': case 'r': case 'e': case 'v': {
@@ -78,7 +71,7 @@ Value read_value(sd_bus_message* message, Budget& budget, unsigned depth) {
             if (value.signature == "ay") {
                 const void* data; std::size_t size;
                 require(sd_bus_message_read_array(message, 'y', &data, &size));
-                budget.add(depth, size);
+                budget.payload(size);
                 value.data = size ? std::string(static_cast<const char*>(data), size) : std::string{};
                 break;
             }
@@ -94,8 +87,8 @@ Value read_value(sd_bus_message* message, Budget& budget, unsigned depth) {
     return value;
 }
 
-void write_value(sd_bus_message* message, const Value& value, Budget& budget, unsigned depth) {
-    budget.add(depth);
+void write_value(sd_bus_message* message, const Value& value, BodyBudget& budget, unsigned depth) {
+    budget.node(depth);
     // Root and variant signatures are validated; other children match their parent's type.
     const char type = value.signature[0];
     switch (type) {
@@ -126,14 +119,14 @@ void write_value(sd_bus_message* message, const Value& value, Budget& budget, un
         }
         case 's': case 'o': case 'g': {
             const auto& data = std::get<std::string>(value.data);
-            budget.add(depth, data.size());
+            budget.payload(data.size());
             if (data.contains('\0')) throw std::runtime_error("D-Bus text contains NUL");
             check(sd_bus_message_append_basic(message, type, data.c_str())); break;
         }
         default: {
             if (value.signature == "ay") {
                 const auto& data = std::get<std::string>(value.data);
-                budget.add(depth, data.size());
+                budget.payload(data.size());
                 check(sd_bus_message_append_array(message, 'y', data.data(), data.size())); break;
             }
             const auto& body = std::get<Body>(value.data);
@@ -162,7 +155,7 @@ void write_value(sd_bus_message* message, const Value& value, Budget& budget, un
 }
 
 void write_body(sd_bus_message* message, const Body& body) {
-    Budget budget;
+    BodyBudget budget;
     std::size_t signature_bytes = 0;
     for (const auto& value : body) {
         validate_value_signature(value.signature);
@@ -174,14 +167,11 @@ void write_body(sd_bus_message* message, const Body& body) {
 
 }
 
-std::vector<std::string> split_signature(const std::string& signature, bool dictionary) {
+std::string_view take_type(std::string_view& signature) {
     if (signature.size() > 255) throw std::runtime_error("D-Bus signature exceeds 255 bytes");
-    std::vector<std::string> result;
-    for (std::size_t at = 0; at < signature.size();) {
-        const auto end = type_end(signature, at, 0, dictionary);
-        result.push_back(signature.substr(at, end - at)); at = end;
-    }
-    return result;
+    const auto type = signature.substr(0, type_end(signature, 0, 0, false));
+    signature.remove_prefix(type.size());
+    return type;
 }
 
 struct Connection::State {
@@ -226,6 +216,13 @@ struct Connection::State {
     std::optional<Clock::time_point> connect_deadline;
     bool more = false;
 
+    auto reply_target(std::uint64_t id) {
+        const auto found = std::ranges::find(incoming, id, &Incoming::id);
+        if (found == incoming.end() || Clock::now() >= found->deadline)
+            throw std::runtime_error("unknown or expired D-Bus incoming request");
+        return found;
+    }
+
     std::uint64_t next_id() {
         if (last_id == INT64_MAX) throw std::runtime_error("D-Bus identifiers exhausted");
         return ++last_id;
@@ -241,7 +238,7 @@ struct Connection::State {
                 event.error.assign(detail, ::strnlen(detail, 16384));
                 event_bytes += event.error.size() + event.error_name.size();
             } else {
-                Budget budget;
+                BodyBudget budget;
                 while (!check(sd_bus_message_at_end(message, false))) event.arguments.push_back(read_value(message, budget, 0));
                 event_bytes += budget.bytes + budget.nodes * sizeof(Value);
             }
@@ -393,7 +390,8 @@ std::expected<void, std::string> Connection::export_methods(const std::string& p
         object->table.push_back(SD_BUS_VTABLE_START(0));
         for (const auto& method : object->methods) {
             if (!sd_bus_member_name_is_valid(method.name.c_str()) || method.name.contains('\0')) throw std::runtime_error("invalid D-Bus method name");
-            split_signature(method.input); split_signature(method.output);
+            for (std::string_view signature : {std::string_view(method.input), std::string_view(method.output)})
+                while (!signature.empty()) take_type(signature);
             object->table.push_back(SD_BUS_METHOD(method.name.c_str(), method.input.c_str(), method.output.c_str(), State::method, SD_BUS_VTABLE_UNPRIVILEGED));
         }
         object->table.push_back(SD_BUS_VTABLE_END);
@@ -406,8 +404,7 @@ std::expected<void, std::string> Connection::export_methods(const std::string& p
 std::expected<void, std::string> Connection::reply(std::uint64_t id, const Body& arguments) {
     auto& state = *state_;
     try {
-        const auto found = std::ranges::find(state.incoming, id, &State::Incoming::id);
-        if (found == state.incoming.end()) throw std::runtime_error("unknown or expired D-Bus incoming request");
+        const auto found = state.reply_target(id);
         sd_bus_message* raw = nullptr; check(sd_bus_message_new_method_return(found->message.get(), &raw));
         Message message(raw, sd_bus_message_unref);
         write_body(message.get(), arguments);
@@ -424,8 +421,7 @@ std::expected<void, std::string> Connection::error(std::uint64_t id, const std::
     try {
         if (!sd_bus_interface_name_is_valid(name.c_str()) || name.contains('\0') || message.size() > 16384 || message.contains('\0'))
             throw std::runtime_error("invalid D-Bus error");
-        const auto found = std::ranges::find(state.incoming, id, &State::Incoming::id);
-        if (found == state.incoming.end()) throw std::runtime_error("unknown or expired D-Bus incoming request");
+        const auto found = state.reply_target(id);
         check(sd_bus_reply_method_errorf(found->message.get(), name.c_str(), "%s", message.c_str()));
         state.incoming.erase(found); ++state.generation;
         return {};

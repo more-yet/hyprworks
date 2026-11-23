@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.5)
-project(hyprworks VERSION 0.1.9 LANGUAGES CXX)
+project(hyprworks VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
@@ -43,7 +43,7 @@ endif()
 add_library(hyprworks src/native/hyprland/workspaces.cpp src/native/hyprland/workspace_protocol.cpp src/native/host.cpp)
 add_library(hyprworks::hyprworks ALIAS hyprworks)
 target_compile_features(hyprworks PUBLIC cxx_std_23)
-set_target_properties(hyprworks PROPERTIES CXX_EXTENSIONS OFF VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
+set_target_properties(hyprworks PROPERTIES CXX_EXTENSIONS OFF VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
 target_include_directories(hyprworks PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
@@ -105,8 +105,14 @@ if(HYPRWORKS_BUILD_LUA)
         target_compile_options(hyprworks-invocation-core PRIVATE -UNDEBUG -Wall -Wextra -Wpedantic)
         add_test(NAME invocation-core COMMAND hyprworks-invocation-core)
         set_tests_properties(invocation-core PROPERTIES TIMEOUT 15)
-        if(HYPRWORKS_BUILD_POLKIT)
+        if(HYPRWORKS_BUILD_POLKIT OR HYPRWORKS_BUILD_DBUS)
             find_program(DBUS_RUN_SESSION_EXECUTABLE dbus-run-session REQUIRED)
+        endif()
+        if(HYPRWORKS_BUILD_DBUS)
+            add_test(NAME dbus-requests COMMAND "${DBUS_RUN_SESSION_EXECUTABLE}" -- $<TARGET_FILE:hyprworks-cli> --headless --entry dbus.lua)
+            set_tests_properties(dbus-requests PROPERTIES TIMEOUT 15 ENVIRONMENT "HYPRWORKS_CONFIG_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests")
+        endif()
+        if(HYPRWORKS_BUILD_POLKIT)
             add_executable(hyprworks-polkit-core tests/polkit_core.cpp src/native/polkit.cpp)
             target_link_libraries(hyprworks-polkit-core PRIVATE hyprworks-lua
                 PkgConfig::HYPRWORKS_lua PkgConfig::HYPRWORKS_polkit-agent-1 PkgConfig::HYPRWORKS_libsystemd Threads::Threads)

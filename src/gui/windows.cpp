@@ -1,6 +1,7 @@
 #include "../runtime/invocation.hpp"
 #include "gui.hpp"
 #include "windows.hpp"
+#include "../native/hyprland/workspace_protocol.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -329,7 +330,7 @@ const wl_callback_listener sync_listener{
     .done = [](void* data, wl_callback* callback, std::uint32_t) {
         auto& catalog = *static_cast<WindowCatalog*>(data);
         wl_callback_destroy(callback); catalog.sync = nullptr;
-        if (catalog.subscribed) { catalog.query = WindowCatalog::Query::complete; return; }
+        if (catalog.subscribed) return;
         if (!catalog.manager || !catalog.capture_list) { catalog.protocol_error = "compositor lacks foreign-toplevel notifications"; return; }
         if (!catalog.registered) {
             catalog.registered = true;
@@ -529,59 +530,15 @@ int image_gc(lua_State* lua) {
     return 0;
 }
 
-template<bool workspace>
-int capture_open(lua_State* lua) {
-    const int options = workspace ? 1 : 3, callback = workspace ? 2 : 4;
-    std::size_t length = 0;
-    const char* id = workspace ? nullptr : check_string(lua, 2, &length);
+template<class ResolveSource>
+int open_capture(lua_State* lua, Gui& gui, int options, int callback, ResolveSource resolve_source) {
     luaL_checktype(lua, options, LUA_TTABLE); luaL_checktype(lua, callback, LUA_TFUNCTION);
     const auto max_width = static_cast<int>(integer_field(lua, options, "max_width", std::nullopt, 1, 1024));
     const auto max_height = static_cast<int>(integer_field(lua, options, "max_height", std::nullopt, 1, 1024));
     const auto max_fps = integer_field(lua, options, "max_fps", std::nullopt, 1, 30);
-    auto& gui = gui_state(lua);
-    auto* window_catalog = workspace ? nullptr : &catalog(lua);
-    std::string name, output;
-    int mode = 0;
-    if (workspace) {
-        lua_pushvalue(lua, options);
-        const int parsed = protected_call(lua, [&](lua_State* lua) {
-            text_field(lua, 2, "name", name, 4096);
-            text_field(lua, 2, "output", output, 256);
-            static const char* modes[] = {"windows_only", "everything", nullptr};
-            mode = enum_field(lua, 2, "mode", nullptr, modes);
-            if (name.empty() || output.empty()) return luaL_error(lua, "workspace capture requires name and output");
-            return 0;
-        }, 0, 0, 1);
-        if (parsed < 0) return parsed;
-    }
     if (!gui.capture_manager) throw std::runtime_error("native image capture is unavailable");
     auto capture = std::make_shared<Capture>();
     capture->gui = &gui;
-    std::uint64_t generation = 0;
-    if (workspace) {
-        if (!gui.workspace_capture_manager || !gui.capture_workspaces)
-            throw std::runtime_error("native workspace capture is unavailable");
-        if (!gui.capture_workspaces_ready) throw std::runtime_error("workspace capture targets are not synchronized");
-        const auto monitor = std::ranges::find_if(gui.outputs, [&](const auto& item) { return item->state.name == output; });
-        if (monitor == gui.outputs.end()) throw std::runtime_error("workspace output is unavailable");
-        for (const auto& target : gui.capture_targets) {
-            if (target->hidden || target->name != name) continue;
-            if (!target->group || std::ranges::find(target->group->outputs, (*monitor)->native) == target->group->outputs.end()) continue;
-            if (capture->workspace) throw std::runtime_error("workspace capture name is ambiguous on this output");
-            capture->workspace = target->native;
-        }
-        if (!capture->workspace) throw std::runtime_error("workspace capture target is unavailable");
-    } else {
-        auto& value = *window_catalog;
-        if (!value.capture_sources || !value.capture_list) throw std::runtime_error("native window capture is unavailable");
-        if (!value.records) throw std::runtime_error("window catalog is not synchronized");
-        const auto record = std::ranges::find(*value.records, std::string_view(id, length), &WindowRecord::id);
-        if (record == value.records->end() || !record->mapped) throw std::runtime_error("window identity is no longer mapped");
-        capture->catalog = &value; capture->capture_id = record->capture_id;
-        generation = value.generation;
-    }
-    auto slot = std::ranges::find_if(gui.captures, [](const auto& item) { return !item || item->closed; });
-    if (slot == gui.captures.end()) throw std::runtime_error("at most eight captures may be active");
     capture->max_width = max_width; capture->max_height = max_height;
     capture->interval = std::chrono::milliseconds((1000 + max_fps - 1) / max_fps);
     lua_pushvalue(lua, callback);
@@ -594,32 +551,66 @@ int capture_open(lua_State* lua) {
         return 1;
     }, 1, 0, 1);
     if (result < 0) { close_capture(*capture); return result; }
-    if (capture->closed || gui.owner.closing || (capture->catalog && capture->catalog->generation != generation) ||
-        (*slot && !(*slot)->closed)) {
-        close_capture(*capture);
-        throw std::runtime_error("capture owner changed while opening capture");
-    }
-    ext_image_capture_source_v1* source = nullptr;
-    if (workspace) {
-        source = hyprland_workspace_image_capture_source_manager_v1_create_source(
-            gui.workspace_capture_manager, capture->workspace, static_cast<std::uint32_t>(mode));
-    } else {
-        const auto& value = *capture->catalog;
-        const auto target = std::ranges::find_if(value.targets, [&](const auto& item) { return item->id == capture->capture_id; });
-        if (target == value.targets.end()) {
-            close_capture(*capture);
-            throw std::runtime_error("window capture target is unavailable");
-        }
-        source = ext_foreign_toplevel_image_capture_source_manager_v1_create_source(value.capture_sources, (*target)->native);
-    }
-    if (!source) { close_capture(*capture); throw std::runtime_error("cannot create capture source"); }
-    capture->session = ext_image_copy_capture_manager_v1_create_session(gui.capture_manager, source, 0);
-    ext_image_capture_source_v1_destroy(source);
-    if (!capture->session) { close_capture(*capture); throw std::runtime_error("cannot create capture session"); }
-    ext_image_copy_capture_session_v1_add_listener(capture->session, &capture_session_listener, capture.get());
-    capture->deadline = Clock::now() + std::chrono::seconds(2);
-    *slot = std::move(capture);
+    try {
+        const auto slot = std::ranges::find_if(gui.captures, [](const auto& item) { return !item || item->closed; });
+        if (slot == gui.captures.end()) throw std::runtime_error("at most eight captures may be active");
+        auto* source = resolve_source(*capture);
+        if (!source) throw std::runtime_error("cannot create capture source");
+        capture->session = ext_image_copy_capture_manager_v1_create_session(gui.capture_manager, source, 0);
+        ext_image_capture_source_v1_destroy(source);
+        if (!capture->session) throw std::runtime_error("cannot create capture session");
+        ext_image_copy_capture_session_v1_add_listener(capture->session, &capture_session_listener, capture.get());
+        capture->deadline = Clock::now() + std::chrono::seconds(2);
+        *slot = std::move(capture);
+    } catch (...) { close_capture(*capture); throw; }
     return 1;
+}
+
+int capture_window(lua_State* lua) {
+    auto& value = catalog(lua);
+    std::size_t length;
+    const char* id = check_string(lua, 2, &length);
+    return open_capture(lua, *value.gui, 3, 4, [&](Capture& capture) {
+        if (!value.capture_sources || !value.records) throw std::runtime_error("window capture is unavailable");
+        const std::string_view key(id, length);
+        const auto record = std::ranges::lower_bound(*value.records, key, {}, &WindowRecord::id);
+        if (record == value.records->end() || record->id != key || !record->mapped)
+            throw std::runtime_error("window identity is no longer mapped");
+        const auto target = std::ranges::find_if(value.targets, [&](const auto& item) { return item->id == record->capture_id; });
+        if (target == value.targets.end()) throw std::runtime_error("window capture target is unavailable");
+        capture.catalog = &value; capture.capture_id = record->capture_id;
+        return ext_foreign_toplevel_image_capture_source_manager_v1_create_source(value.capture_sources, (*target)->native);
+    });
+}
+
+int capture_workspace(lua_State* lua) {
+    auto& gui = gui_state(lua);
+    luaL_checktype(lua, 1, LUA_TTABLE);
+    const auto target_field = [&](const char* key, std::size_t limit) {
+        field(lua, 1, key);
+        std::size_t size;
+        const char* value = check_string(lua, -1, &size);
+        if (!size || size > limit) luaL_error(lua, "invalid workspace %s", key);
+        return std::string_view(value, size);
+    };
+    // The field values stay on the Lua stack through capture admission.
+    const auto name = target_field("name", 4096), output = target_field("output", 256);
+    static const char* modes[] = {"windows_only", "everything", nullptr};
+    const auto mode = static_cast<std::uint32_t>(enum_field(lua, 1, "mode", nullptr, modes));
+    return open_capture(lua, gui, 1, 2, [&](Capture& capture) {
+        if (!gui.workspace_capture_manager || !gui.capture_workspaces_ready)
+            throw std::runtime_error("workspace capture targets are unavailable");
+        const auto monitor = std::ranges::find_if(gui.outputs, [&](const auto& item) { return item->state.name == output; });
+        if (monitor == gui.outputs.end()) throw std::runtime_error("workspace output is unavailable");
+        for (const auto& target : gui.capture_targets) {
+            if (target->hidden || target->name != name || !target->group ||
+                !std::ranges::contains(target->group->outputs, (*monitor)->native)) continue;
+            if (capture.workspace) throw std::runtime_error("workspace capture name is ambiguous on this output");
+            capture.workspace = target->native;
+        }
+        if (!capture.workspace) throw std::runtime_error("workspace capture target is unavailable");
+        return hyprland_workspace_image_capture_source_manager_v1_create_source(gui.workspace_capture_manager, capture.workspace, mode);
+    });
 }
 
 void advance_capture(Capture& capture) {
@@ -789,20 +780,18 @@ void close_windows(WindowCatalog& catalog) noexcept {
 }
 
 void prepare_windows(WindowCatalog& catalog, WaitSet& wait) {
-    catalog.wait_offset = wait.fds.size();
-    wait.fds.push_back({catalog.fd, static_cast<short>(catalog.query == WindowCatalog::Query::reading ? POLLIN : POLLOUT), 0});
-    const auto deadline = [&](Clock::time_point time) { if (!wait.deadline || time < *wait.deadline) wait.deadline = time; };
-    if (catalog.protocol_error || catalog.change_pending || catalog.status_pending) deadline(Clock::time_point::min());
-    if (catalog.deadline) deadline(*catalog.deadline);
-    if (catalog.subscribed && catalog.query == WindowCatalog::Query::idle && catalog.refresh_at) deadline(*catalog.refresh_at);
+    catalog.wait_offset = wait.append({catalog.fd, static_cast<short>(catalog.query == WindowCatalog::Query::reading ? POLLIN : POLLOUT), 0});
+    if (catalog.protocol_error || catalog.change_pending || catalog.status_pending ||
+        (catalog.query == WindowCatalog::Query::complete && !catalog.sync)) wait.due(Clock::time_point::min());
+    wait.due(catalog.deadline);
+    if (catalog.subscribed && catalog.query == WindowCatalog::Query::idle) wait.due(catalog.refresh_at);
 }
 
 void prepare_captures(Gui& gui, WaitSet& wait) {
-    const auto deadline = [&](Clock::time_point time) { if (!wait.deadline || time < *wait.deadline) wait.deadline = time; };
     for (auto& capture : gui.captures) if (capture && !capture->closed) {
-        if (capture->ready || capture->pending) deadline(Clock::time_point::min());
-        if (capture->constraints && capture->next_frame) deadline(*capture->next_frame);
-        if (capture->deadline) deadline(*capture->deadline);
+        if (capture->ready || capture->pending) wait.due(Clock::time_point::min());
+        if (capture->constraints) wait.due(capture->next_frame);
+        wait.due(capture->deadline);
     }
 }
 
@@ -811,7 +800,7 @@ void read_windows(WindowCatalog& catalog, const WaitSet& wait) {
     const auto now = Clock::now();
     if (catalog.deadline && now >= *catalog.deadline) { fail(catalog, "window subscription timed out"); return; }
     if (!catalog.subscribed) return;
-    if (catalog.query == WindowCatalog::Query::synchronizing) return;
+    if (catalog.sync) return;
     if (catalog.query == WindowCatalog::Query::complete) {
         try {
             if (catalog.queried_invalidation == catalog.invalidation) {
@@ -831,62 +820,23 @@ void read_windows(WindowCatalog& catalog, const WaitSet& wait) {
         if (!catalog.refresh_at || now < *catalog.refresh_at) return;
         catalog.refresh_at.reset();
         catalog.queried_invalidation = catalog.invalidation;
-        catalog.fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-        if (catalog.fd < 0) { fail(catalog, std::strerror(errno)); return; }
-        sockaddr_un address{};
-        address.sun_family = AF_UNIX;
-        std::memcpy(address.sun_path, catalog.socket_path.c_str(), catalog.socket_path.size() + 1);
-        const int result = connect(catalog.fd, reinterpret_cast<sockaddr*>(&address),
-            static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + catalog.socket_path.size() + 1));
-        if (result < 0 && errno != EINPROGRESS) { fail(catalog, std::strerror(errno)); return; }
-        catalog.query = result == 0 ? WindowCatalog::Query::sending : WindowCatalog::Query::connecting;
+        const auto connected = native::protocol::connect_socket(catalog.fd, catalog.socket_path);
+        if (!connected) { fail(catalog, connected.error().message); return; }
+        catalog.query = *connected ? WindowCatalog::Query::sending : WindowCatalog::Query::connecting;
         catalog.deadline = now + std::chrono::seconds(2);
         return;
     }
     if (catalog.wait_offset >= wait.fds.size() || wait.fds[catalog.wait_offset].fd != catalog.fd) return;
     const auto events = wait.fds[catalog.wait_offset].revents;
     if (!events) return;
-    if (catalog.query == WindowCatalog::Query::connecting) {
-        int error = 0; socklen_t size = sizeof(error);
-        if (getsockopt(catalog.fd, SOL_SOCKET, SO_ERROR, &error, &size) < 0 || error) {
-            fail(catalog, std::strerror(error ? error : errno)); return;
-        }
-        catalog.query = WindowCatalog::Query::sending;
-    }
-    if (catalog.query == WindowCatalog::Query::sending) {
-        const auto count = send(catalog.fd, request.data(), request.size(), MSG_NOSIGNAL);
-        if (count < 0 && (errno == EAGAIN || errno == EINTR)) return;
-        // Socket1 treats its first read as a request; a short write ends this query.
-        if (count != static_cast<ssize_t>(request.size())) { fail(catalog, "incomplete window snapshot request"); return; }
-        catalog.query = WindowCatalog::Query::reading;
-        return;
-    }
-    for (unsigned attempt = 0; attempt < 16; ++attempt) {
-        char bytes[4096];
-        const auto count = recv(catalog.fd, bytes, sizeof(bytes), 0);
-        if (count < 0 && errno == EINTR) continue;
-        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !(events & (POLLERR | POLLHUP))) return;
-        if (count < 0) { fail(catalog, std::strerror(errno)); return; }
-        if (count > 0) {
-            if (catalog.reply.size() + static_cast<std::size_t>(count) > max_reply) { fail(catalog, "window snapshot exceeds 4 MiB"); return; }
-            catalog.reply.append(bytes, static_cast<std::size_t>(count));
-            continue;
-        }
+    bool wrote = false;
+    const auto next = native::protocol::advance_request(catalog.fd, events, catalog.query, request, catalog.reply, max_reply, wrote);
+    if (!next) { fail(catalog, next.error().message); return; }
+    catalog.query = *next;
+    if (catalog.query == WindowCatalog::Query::complete) {
         close(std::exchange(catalog.fd, -1));
-        catalog.query = WindowCatalog::Query::synchronizing;
         synchronize(catalog);
-        return;
     }
-}
-
-int dispatch_windows(WindowCatalog& catalog) {
-    auto* lua = catalog.gui->owner.lua;
-    const auto generation = catalog.generation;
-    const bool status = std::exchange(catalog.status_pending, false);
-    const bool change = std::exchange(catalog.change_pending, false);
-    if (status && dispatch_callback(lua, catalog, catalog.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    if (change && dispatch_callback(lua, catalog, catalog.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    return 0;
 }
 
 int dispatch_captures(Gui& gui) {
@@ -925,15 +875,15 @@ void register_windows(lua_State* lua) {
     luaL_newmetatable(lua, window_type);
     const luaL_Reg methods[] = {{"snapshot", guarded<get_snapshot>}, {"status", guarded<get_status>},
         {"on_change", guarded<on_change>}, {"on_status", guarded<on_status>},
-        {"restart", guarded<restart>}, {"close", guarded<shutdown>}, {"capture", operation_call<capture_open<false>>}, {nullptr, nullptr}};
+        {"restart", guarded<restart>}, {"close", guarded<shutdown>}, {"capture", operation_call<capture_window>}, {nullptr, nullptr}};
     luaL_setfuncs(lua, methods, 0); lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
     lua_pushcfunction(lua, guarded<shutdown>); lua_setfield(lua, -2, "__close");
     lua_pushliteral(lua, "hyprworks window catalog"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);
     lua_pushcfunction(lua, guarded<open>); lua_setfield(lua, -2, "windows");
-    lua_pushcfunction(lua, operation_call<capture_open<true>>); lua_setfield(lua, -2, "capture_workspace");
+    lua_pushcfunction(lua, operation_call<capture_workspace>); lua_setfield(lua, -2, "capture_workspace");
     luaL_newmetatable(lua, capture_type);
-    lua_pushcfunction(lua, guarded<capture_close>); lua_setfield(lua, -2, "close");
-    lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
+    const luaL_Reg capture_methods[] = {{"close", guarded<capture_close>}, {nullptr, nullptr}};
+    userdata_methods(lua, capture_methods);
     lua_pushcfunction(lua, guarded<capture_close>); lua_setfield(lua, -2, "__close");
     lua_pushcfunction(lua, guarded<capture_gc>); lua_setfield(lua, -2, "__gc");
     lua_pushliteral(lua, "hyprworks capture"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);

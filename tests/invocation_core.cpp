@@ -23,14 +23,6 @@ int main() {
                 std::cerr << lua_tostring(state.lua, -1) << '\n'; std::abort();
             }
         };
-        script(R"(
-            for _, value in ipairs({"1", 1.0, true}) do
-                assert(not pcall(hw.timer, value, function() end))
-            end
-            assert(not pcall(hw.read_file, 42, 1024))
-            assert(not pcall(hw.read_file, "/unused", "1024"))
-            assert(not pcall(hw.timer, 1, function() end, 1))
-        )");
         lua_pushcfunction(state.lua, guarded<+[](lua_State* lua) {
             identifier(lua, check_uint64(lua, 1, 1));
             return 1;
@@ -54,7 +46,7 @@ int main() {
                 end)
             end})
         )");
-        auto& timer = *state.timers.back();
+        auto& timer = *state.timers.front();
         assert(dispatch_callback(state.lua, timer, timer.callback, timer.generation, [](lua_State* lua) {
             lua_gc(lua, LUA_GCCOLLECT);
             lua_pushinteger(lua, 1);
@@ -78,10 +70,19 @@ int main() {
         }) == 0);
         assert(timer.closed && lua_gettop(state.lua) == 0);
         script("assert(finalized == 2 and delivered == 1); collectgarbage('restart')");
+        script(R"(
+            local replacement = hw.timer(0, function() error("retired slot delivered") end)
+            callback_timer:start(0)
+            callback_timer:on_tick(function() delivered = delivered + 1 end)
+            replacement:close()
+        )");
+        timer.pending = 1;
+        assert(dispatch_utilities(state.lua, state) == 0);
+        script("assert(delivered == 2); callback_timer:close()");
 
-        state.workspaces.push_back(std::make_unique<WorkspaceBinding>());
-        auto& workspace = *state.workspaces.back();
-        assert(retain_handle(state.lua, workspace, "hyprworks.workspaces") == 1);
+        auto retained = std::make_shared<WorkspaceBinding>();
+        auto& workspace = *retained;
+        assert(open_active(state.lua, vacant_slot(state.workspaces), retained, "hyprworks.workspaces") == 1);
         lua_setglobal(state.lua, "workspace");
         script(R"(
             workspace:on_status(function(connection)

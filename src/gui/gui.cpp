@@ -326,34 +326,29 @@ void prepare_gui(Gui& gui, WaitSet& wait) {
     if (gui.read_prepared) { wl_display_cancel_read(gui.display); gui.read_prepared = false; }
     wl_display_dispatch_pending(gui.display);
     check_display(gui);
-    gui.wait_offset = wait.fds.size();
-    wait.fds.push_back({wl_display_get_fd(gui.display), POLLIN, 0});
+    gui.wait_offset = wait.append({wl_display_get_fd(gui.display), POLLIN, 0});
     gui.transfer_wait_count = gui.transfers.size();
-    const auto deadline = [&](Clock::time_point time) {
-        if (!wait.deadline || time < *wait.deadline) wait.deadline = time;
-    };
     for (const auto& transfer : gui.transfers) {
         wait.fds.push_back({transfer.fd, static_cast<short>(transfer.writing ? POLLOUT : POLLIN), 0});
-        deadline(transfer.deadline);
-        if (transfer.fd < 0) deadline(Clock::time_point::min());
+        wait.due(transfer.fd < 0 ? Clock::time_point::min() : transfer.deadline);
     }
-    if (gui.event_count || gui.outputs_pending || gui.focus_pending) deadline(Clock::time_point::min());
-    for (const auto& seat : gui.seats) if (seat->repeat_at) deadline(*seat->repeat_at);
+    if (gui.event_count || gui.outputs_pending || gui.focus_pending) wait.due(Clock::time_point::min());
+    for (const auto& seat : gui.seats) wait.due(seat->repeat_at);
     for (const auto& surface : gui.surfaces) if (surface) {
         if (surface->closed || surface->close_pending || (surface->configured && surface->configure_pending) || surface->grab_pending ||
             (surface->mapped && surface->popup_reposition_pending) ||
             (surface->dirty && surface->configured && !surface->frame && !surface->waiting_buffer))
-            deadline(Clock::time_point::min());
+            wait.due(Clock::time_point::min());
         for (const int index : surface->image_elements) {
             const auto& element = surface->elements[static_cast<std::size_t>(index)];
             if (element.image && !element.image_notified && element.image->ready.load(std::memory_order_acquire))
-                deadline(Clock::time_point::min());
+                wait.due(Clock::time_point::min());
         }
     }
     if (gui.windows) prepare_windows(*gui.windows, wait);
     prepare_captures(gui, wait);
     if (wl_display_prepare_read(gui.display) == 0) gui.read_prepared = true;
-    else deadline(Clock::time_point::min());
+    else wait.due(Clock::time_point::min());
     if (wl_display_flush(gui.display) < 0) {
         if (errno == EAGAIN) wait.fds[gui.wait_offset].events |= POLLOUT;
         else {
@@ -403,7 +398,7 @@ int dispatch_gui(Gui& gui) {
     }
     for (auto& surface : gui.surfaces)
         if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
-    if (gui.windows && dispatch_windows(*gui.windows) < 0) return -1;
+    if (gui.windows && deliver_observer(state.lua, *gui.windows) < 0) return -1;
     if (dispatch_captures(gui) < 0) return -1;
     if (std::exchange(gui.outputs_pending, false) && notify(gui, 0, -1, gui.on_outputs) < 0) return -1;
     if (dispatch_input(gui) < 0) return -1;
@@ -421,10 +416,11 @@ int dispatch_gui(Gui& gui) {
             const int index = surface->image_elements[i];
             auto& element = surface->elements[static_cast<std::size_t>(index)];
             if (element.image && !element.image->icon.empty()) {
-                const auto pixels = static_cast<int>(std::clamp(std::ceil(std::max(1.0, element.box.w) * surface->scale), 1.0, 4096.0));
+                const auto pixels = static_cast<int>(std::clamp(std::ceil(element.image->icon_size * surface->scale), 1.0, 4096.0));
                 if (element.image->pixels != pixels) {
                     auto image = std::make_shared<Image>(gui.images);
                     image->icon = element.image->icon; image->theme = element.image->theme; image->pixels = pixels;
+                    image->icon_size = element.image->icon_size;
                     element.image = std::move(image); element.image_notified = false;
                 }
             }

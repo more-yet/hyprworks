@@ -1,4 +1,5 @@
 #include "../runtime/invocation.hpp"
+#include "../native/dbus_body.hpp"
 
 namespace hyprworks::lua {
 namespace {
@@ -7,9 +8,11 @@ constexpr char metatable[] = "hyprworks.dbus";
 using Bus = InvocationState::BusBinding;
 
 Bus& bus_handle(lua_State* lua, bool closed = false) {
-    auto& bus = **static_cast<Bus**>(luaL_checkudata(lua, 1, metatable));
-    if (invocation(lua).closing) luaL_error(lua, "invocation is shutting down");
-    if (bus.closed && !closed) luaL_error(lua, "D-Bus connection is closed");
+    auto* handle = static_cast<std::shared_ptr<Bus>*>(luaL_testudata(lua, 1, metatable));
+    if (!handle) throw std::runtime_error("D-Bus handle expected");
+    if (invocation(lua).closing) throw std::runtime_error("invocation is shutting down");
+    auto& bus = **handle;
+    if (bus.closed && !closed) throw std::runtime_error("D-Bus connection is closed");
     return bus;
 }
 
@@ -21,19 +24,17 @@ std::string text(lua_State* lua, int index, std::size_t limit = 16384) {
     return {data, size};
 }
 
-struct Budget {
-    std::size_t nodes = 0, bytes = 0;
-};
-
-void read_value(lua_State* lua, int index, dbus::Value& value, Budget& budget, unsigned depth) {
-    if (depth > 32 || ++budget.nodes > 65536) throw std::length_error("D-Bus value limit exceeded");
+void read_value(lua_State* lua, int index, dbus::Value& value, dbus::BodyBudget& budget, unsigned depth) {
+    budget.node(depth);
     if (!lua_checkstack(lua, 8)) throw std::runtime_error("cannot grow Lua stack");
     index = lua_absindex(lua, index);
     const char type = value.signature[0];
     if (type == 's' || type == 'o' || type == 'g' || value.signature == "ay") {
-        value.data = text(lua, index, 8 * 1024 * 1024);
-        budget.bytes += std::get<std::string>(value.data).size();
-        if (budget.bytes > 8 * 1024 * 1024) throw std::length_error("D-Bus payload exceeds 8 MiB");
+        if (lua_type(lua, index) != LUA_TSTRING) throw std::runtime_error("expected D-Bus string");
+        std::size_t size;
+        const char* data = lua_tolstring(lua, index, &size);
+        budget.payload(size);
+        value.data = std::string(data, size);
     } else if (type == 'b') {
         if (lua_type(lua, index) != LUA_TBOOLEAN) throw std::runtime_error("expected D-Bus boolean");
         value.data = lua_toboolean(lua, index) != 0;
@@ -60,48 +61,53 @@ void read_value(lua_State* lua, int index, dbus::Value& value, Budget& budget, u
             field(lua, index, "signature");
             body.push_back({text(lua, -1, 255), false});
             lua_pop(lua, 1);
-            if (dbus::split_signature(body[0].signature).size() != 1) throw std::runtime_error("variant needs one complete type");
+            std::string_view rest = body[0].signature;
+            dbus::take_type(rest);
+            if (!rest.empty()) throw std::runtime_error("variant needs one complete type");
             field(lua, index, "value");
             read_value(lua, -1, body[0], budget, depth + 1);
             lua_pop(lua, 1);
         } else if (value.signature.starts_with("a{")) {
-            const auto types = dbus::split_signature(value.signature.substr(2, value.signature.size() - 3));
+            const auto dict = std::string_view(value.signature);
             lua_pushnil(lua);
             while (lua_next(lua, index)) {
-                body.push_back({value.signature.substr(1), dbus::Body{{types[0], false}, {types[1], false}}});
+                budget.node(depth + 1);
+                body.push_back({value.signature.substr(1), dbus::Body{{std::string(dict.substr(2, 1)), false},
+                    {std::string(dict.substr(3, dict.size() - 4)), false}}});
                 auto& pair = std::get<dbus::Body>(body.back().data);
-                read_value(lua, -2, pair[0], budget, depth + 1);
-                read_value(lua, -1, pair[1], budget, depth + 1);
+                read_value(lua, -2, pair[0], budget, depth + 2);
+                read_value(lua, -1, pair[1], budget, depth + 2);
                 lua_pop(lua, 1);
             }
         } else {
-            const auto types = dbus::split_signature(type == 'a' ? value.signature.substr(1) :
-                value.signature.substr(1, value.signature.size() - 2));
+            const bool array = type == 'a';
+            auto types = std::string_view(value.signature).substr(1, array ? std::string_view::npos : value.signature.size() - 2);
             const auto size = lua_rawlen(lua, index);
-            if (size > 65536 || (type != 'a' && size != types.size())) throw std::runtime_error("invalid D-Bus container length");
-            body.reserve(size);
+            if (size > dbus::BodyBudget::max_nodes - budget.nodes)
+                throw std::runtime_error("invalid D-Bus container length");
             for (std::size_t i = 0; i < size; ++i) {
-                body.push_back({types[type == 'a' ? 0 : i], false});
+                body.push_back({std::string(array ? types : dbus::take_type(types)), false});
                 lua_rawgeti(lua, index, static_cast<lua_Integer>(i + 1));
                 read_value(lua, -1, body.back(), budget, depth + 1);
                 lua_pop(lua, 1);
             }
+            if (!array && !types.empty()) throw std::runtime_error("invalid D-Bus struct length");
         }
     }
 }
 
-void read_body(lua_State* lua, int index, const std::string& signature, dbus::Body& body) {
-    const auto types = dbus::split_signature(signature);
-    if (lua_type(lua, index) != LUA_TTABLE || lua_rawlen(lua, index) != types.size())
-        throw std::runtime_error("D-Bus arguments must match signature arity");
-    Budget budget;
+void read_body(lua_State* lua, int index, std::string_view signature, dbus::Body& body) {
+    if (lua_type(lua, index) != LUA_TTABLE) throw std::runtime_error("expected D-Bus arguments");
+    dbus::BodyBudget budget;
     index = lua_absindex(lua, index);
-    for (std::size_t i = 0; i < types.size(); ++i) {
-        body.push_back({types[i], false});
+    const auto count = lua_rawlen(lua, index);
+    for (std::size_t i = 0; i < count; ++i) {
+        body.push_back({std::string(dbus::take_type(signature)), false});
         lua_rawgeti(lua, index, static_cast<lua_Integer>(i + 1));
         read_value(lua, -1, body.back(), budget, 0);
         lua_pop(lua, 1);
     }
+    if (!signature.empty()) throw std::runtime_error("D-Bus arguments must match signature arity");
 }
 
 void push_value(lua_State* lua, const dbus::Value& value) {
@@ -137,7 +143,6 @@ int bus_open(lua_State* lua) {
     auto& state = invocation(lua);
     if (state.closing) return luaL_error(lua, "invocation is shutting down");
     luaL_checktype(lua, 1, LUA_TTABLE);
-    auto bus = std::make_unique<Bus>();
     std::string address;
     bool system = false;
     lua_pushvalue(lua, 1);
@@ -148,18 +153,14 @@ int bus_open(lua_State* lua) {
         return 0;
     }, 0, 0, 1);
     if (parsed < 0) return -1;
-    if (state.buses.size() >= 8) throw std::runtime_error("D-Bus handle limit reached");
+    auto& slot = vacant_slot(state.buses);
+    auto bus = std::make_shared<Bus>();
     const auto result = bus->connection.start(system, address);
     if (!result) return operation_result(lua, result);
-    auto& binding = *bus;
-    state.buses.push_back(std::move(bus));
-    const int status = retain_handle(lua, binding, metatable);
-    if (status < 0) { binding.closed = true; binding.connection.stop(); }
-    return status;
+    return open_active(lua, slot, bus, metatable);
 }
 
 int bus_call(lua_State* lua) {
-    auto& bus = bus_handle(lua);
     luaL_checktype(lua, 2, LUA_TTABLE);
     dbus::Call call;
     std::string signature;
@@ -177,7 +178,7 @@ int bus_call(lua_State* lua) {
         return 0;
     }, 0, 0, 1);
     if (parsed < 0) return -1;
-    return request_result(lua, bus.connection.call(call));
+    return request_result(lua, bus_handle(lua).connection.call(call));
 }
 
 int bus_subscribe(lua_State* lua) {
@@ -196,7 +197,6 @@ int bus_unsubscribe(lua_State* lua) {
 }
 
 int bus_export(lua_State* lua) {
-    auto& bus = bus_handle(lua);
     luaL_checktype(lua, 2, LUA_TTABLE);
     std::string path, interface;
     std::vector<dbus::Method> methods;
@@ -219,11 +219,10 @@ int bus_export(lua_State* lua) {
         return 0;
     }, 0, 0, 1);
     if (parsed < 0) return -1;
-    return operation_result(lua, bus.connection.export_methods(path, interface, methods, timeout));
+    return operation_result(lua, bus_handle(lua).connection.export_methods(path, interface, methods, timeout));
 }
 
 int bus_reply(lua_State* lua) {
-    auto& bus = bus_handle(lua);
     const auto id = check_uint64(lua, 2, 1);
     const auto signature = text(lua, 3, 255);
     dbus::Body body;
@@ -232,7 +231,7 @@ int bus_reply(lua_State* lua) {
         read_body(lua, 2, signature, body); return 0;
     }, 0, 0, 1);
     if (parsed < 0) return -1;
-    return operation_result(lua, bus.connection.reply(id, body));
+    return operation_result(lua, bus_handle(lua).connection.reply(id, body));
 }
 
 int bus_error(lua_State* lua) {
@@ -271,6 +270,7 @@ int bus_close(lua_State* lua) {
     bus.closed = true; ++bus.generation; bus.status_pending = false;
     bus.connection.stop(); bus.events.clear();
     unref(lua, bus.on_event); unref(lua, bus.on_status);
+    untrack(lua, invocation(lua).buses, bus);
     return 0;
 }
 
@@ -309,8 +309,8 @@ void register_dbus(lua_State* lua) {
         {"status", guarded<bus_status>}, {"on_status", guarded<bus_on_status>}, {"on_event", guarded<bus_on_event>},
         {"close", guarded<bus_close>}, {nullptr, nullptr},
     };
-    luaL_setfuncs(lua, methods, 0);
-    lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
+    userdata_methods(lua, methods);
+    lua_pushcfunction(lua, release_userdata<Bus>); lua_setfield(lua, -2, "__gc");
     lua_pushcfunction(lua, guarded<bus_close>); lua_setfield(lua, -2, "__close");
     lua_pushliteral(lua, "hyprworks D-Bus connection"); lua_setfield(lua, -2, "__metatable");
     lua_pop(lua, 1);

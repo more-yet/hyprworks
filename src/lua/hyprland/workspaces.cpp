@@ -9,10 +9,9 @@ namespace {
 
 constexpr char workspace_metatable[] = "hyprworks.workspaces";
 constexpr char error_metatable[] = "hyprworks.error";
-constexpr std::size_t max_workspace_handles = 32;
 
 WorkspaceBinding& workspace(lua_State* lua, int index = 1, bool allow_closed = false) {
-    auto& binding = **static_cast<WorkspaceBinding**>(luaL_checkudata(lua, index, workspace_metatable));
+    auto& binding = **static_cast<std::shared_ptr<WorkspaceBinding>*>(luaL_checkudata(lua, index, workspace_metatable));
     if (invocation(lua).closing)
         luaL_error(lua, "invocation is shutting down");
     if (binding.closed && !allow_closed)
@@ -151,50 +150,35 @@ int push_request(lua_State* lua, const std::expected<std::uint64_t, native::Erro
     return 2;
 }
 
-std::expected<WorkspaceBinding*, native::Error> open_workspace(InvocationState& state, const char* path, std::size_t length) {
+int workspace_open(lua_State* lua) {
+    auto& state = invocation(lua);
+    if (state.closing) return luaL_error(lua, "invocation is shutting down");
+    std::size_t length = 0;
+    const char* path = lua_isnoneornil(lua, 1) ? nullptr : check_string(lua, 1, &length);
+    const auto failure = [&](const native::Error& error) {
+        return protected_call(lua, [&](lua_State* lua) { lua_pushnil(lua); push_error(lua, error); return 2; }, 2);
+    };
     auto target = path ? std::expected<native::SessionTarget, native::Error>(native::SessionTarget{std::string(path, length)}) :
                          native::session_from_environment();
     if (!target)
-        return std::unexpected(target.error());
-    if (target->directory.empty() || target->directory.front() != '/' || target->directory.contains('\0'))
-        return std::unexpected(native::Error{native::ErrorCode::invalid_target, "session", "session directory must be an absolute path without NUL"});
+        return failure(target.error());
     target->directory = std::filesystem::path(target->directory).lexically_normal().string();
     if (target->directory.size() > 1 && target->directory.back() == '/')
         target->directory.pop_back();
     for (const auto& existing : state.workspaces) {
-        if (!existing->closed && existing->target.directory == target->directory) {
+        if (existing && existing->target.directory == target->directory) {
             if (existing->handle < 0)
-                return std::unexpected(native::Error{native::ErrorCode::busy, "workspaces", "connection is being opened"});
-            return existing.get();
+                return failure({native::ErrorCode::busy, "workspaces", "connection is being opened"});
+            lua_rawgeti(lua, LUA_REGISTRYINDEX, existing->handle);
+            return 1;
         }
     }
-    if (state.workspaces.size() == max_workspace_handles)
-        return std::unexpected(native::Error{native::ErrorCode::limit_exceeded, "workspaces", "invocation workspace handle limit reached"});
-    auto binding = std::make_unique<WorkspaceBinding>();
+    auto& slot = vacant_slot(state.workspaces);
+    auto binding = std::make_shared<WorkspaceBinding>();
     binding->target = std::move(*target);
     if (auto started = binding->connection.start(binding->target); !started)
-        return std::unexpected(started.error());
-    auto* pointer = binding.get();
-    state.workspaces.push_back(std::move(binding));
-    return pointer;
-}
-
-int workspace_open(lua_State* lua) {
-    auto& state = invocation(lua);
-    if (state.closing)
-        return luaL_error(lua, "invocation is shutting down");
-    std::size_t length = 0;
-    const char* path = lua_isnoneornil(lua, 1) ? nullptr : check_string(lua, 1, &length);
-    auto result = open_workspace(state, path, length);
-    if (!result) return protected_call(lua, [&](lua_State* lua) {
-        lua_pushnil(lua); push_error(lua, result.error()); return 2;
-    }, 2);
-    const int status = retain_handle(lua, **result, workspace_metatable);
-    if (status < 0) {
-        (*result)->closed = true;
-        (*result)->connection.stop();
-    }
-    return status;
+        return failure(started.error());
+    return open_active(lua, slot, binding, workspace_metatable);
 }
 
 int workspace_snapshot(lua_State* lua) {
@@ -235,6 +219,7 @@ int workspace_refresh(lua_State* lua) {
 
 int workspace_restart(lua_State* lua) {
     auto& binding = workspace(lua, 1, true);
+    if (resume_handle(lua, invocation(lua).workspaces, binding) < 0) return -1;
     const auto before = binding.connection.status();
     const bool had_snapshot = bool(binding.connection.snapshot());
     auto result = binding.result ?
@@ -268,7 +253,7 @@ int on_result(lua_State* lua) {
 
 int workspace_close(lua_State* lua) {
     auto& binding = workspace(lua, 1, true);
-    binding.closed = true;
+    untrack(lua, invocation(lua).workspaces, binding);
     ++binding.generation;
     binding.status_pending = binding.change_pending = false;
     unref(lua, binding.on_status); unref(lua, binding.on_change); unref(lua, binding.on_result);
@@ -291,6 +276,7 @@ void register_workspaces(lua_State* lua) {
     lua_setfield(lua, -2, "__tostring");
     lua_pop(lua, 1);
     luaL_newmetatable(lua, workspace_metatable);
+    lua_pushcfunction(lua, release_userdata<WorkspaceBinding>); lua_setfield(lua, -2, "__gc");
     const luaL_Reg methods[] = {
         {"snapshot", guarded<workspace_snapshot>}, {"status", guarded<workspace_status>},
         {"switch", guarded<workspace_switch>}, {"refresh", guarded<workspace_refresh>},
@@ -298,9 +284,7 @@ void register_workspaces(lua_State* lua) {
         {"on_change", guarded<on_change>}, {"on_status", guarded<on_status>},
         {"on_result", guarded<on_result>}, {nullptr, nullptr}
     };
-    luaL_setfuncs(lua, methods, 0);
-    lua_pushvalue(lua, -1);
-    lua_setfield(lua, -2, "__index");
+    userdata_methods(lua, methods);
     lua_pushcfunction(lua, guarded<workspace_close>);
     lua_setfield(lua, -2, "__close");
     lua_pushliteral(lua, "hyprworks workspace connection");
@@ -311,22 +295,8 @@ void register_workspaces(lua_State* lua) {
 }
 
 int dispatch_workspaces(lua_State* lua, InvocationState& state) {
-    const auto count = state.workspaces.size();
-    for (std::size_t i = 0; i < count; ++i) {
-        auto& binding = *state.workspaces[i];
-        const auto generation = binding.generation;
-        const bool status = std::exchange(binding.status_pending, false);
-        const bool change = std::exchange(binding.change_pending, false);
-        if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-        if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
-        if (binding.result && !binding.closed && generation == binding.generation && !state.requests.load(std::memory_order_relaxed)) {
-            const auto result = std::exchange(binding.result, {});
-            if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
-                push_switch_result(lua, *result);
-                return 1;
-            }) < 0) return -1;
-        }
-    }
+    for (auto binding : std::span(state.workspaces))
+        if (binding && deliver_observer(lua, *binding, push_switch_result) < 0) return -1;
     return 0;
 }
 

@@ -76,12 +76,10 @@ Workspace identity(json_object* object) {
 
 std::optional<WorkspaceKey> reference(json_object* object, const char* name, WorkspaceType type) {
     auto* value = member(object, name);
-    if (text(value, "address").empty())
+    auto address = text(value, "address");
+    if (address.empty())
         return std::nullopt;
-    auto workspace = identity(value);
-    if (workspace.key.type != type)
-        invalid("workspace reference has the wrong type");
-    return std::move(workspace.key);
+    return WorkspaceKey{type, std::move(address)};
 }
 
 Json array(std::string_view input) {

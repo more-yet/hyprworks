@@ -128,14 +128,6 @@ int desktop_launch(lua_State* lua) {
 
 }
 
-int dispatch_desktop(lua_State* lua, DesktopBinding& binding) {
-    const bool status = std::exchange(binding.status_pending, false), change = std::exchange(binding.change_pending, false);
-    const auto generation = binding.generation;
-    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    return 0;
-}
-
 void register_desktop(lua_State* lua) {
     luaL_newmetatable(lua, desktop_metatable);
     const luaL_Reg desktop_methods[] = {{"status", guarded<desktop_status>}, {"snapshot", guarded<desktop_snapshot>},

@@ -1,6 +1,12 @@
 local hw = require("hyprworks")
 local server = assert(hw.dbus {bus = "session"})
 local client = assert(hw.dbus {bus = "session"})
+-- Hold closed userdata across slot reuse, including collection during delivery.
+local retired = {}
+for i = 1, 12 do
+    retired[i] = assert(hw.dbus {bus = "session"})
+    retired[i]:close()
+end
 local destination, path, interface = "org.hyprworks.Test", "/org/hyprworks/Test", "org.hyprworks.Test"
 local pending, methods, expired, finished = {}, 0, false, false
 assert(server:export {path = path, interface = interface, timeout = 40, methods = {
@@ -20,6 +26,10 @@ server:on_event(function(_, event)
             assert(not server:reply(event.id, "a{sv}t", {{bad = {signature = "y", value = 256}}, "0"}))
             assert(server:reply(event.id, "a{sv}t", event.arguments))
             assert(not server:reply(event.id, "a{sv}t", event.arguments))
+        elseif event.member == "Wait" then
+            assert(os.execute("sleep 0.08"))
+            assert(not server:reply(event.id, "", {}))
+            assert(not server:error(event.id, "org.hyprworks.Test.Error", "late"))
         end
     elseif event.kind == "expired" then
         expired = true
@@ -42,6 +52,11 @@ server:on_event(function(_, event)
     end
 end)
 client:on_event(function(_, event)
+    if retired then
+        for _, handle in ipairs(retired) do assert(handle:status().phase == "closed"); handle:close() end
+        retired = nil
+        collectgarbage("collect")
+    end
     if event.kind == "reply" then
         assert(pending[event.id], "unexpected reply")(event)
         pending[event.id] = nil

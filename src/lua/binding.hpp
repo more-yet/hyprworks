@@ -160,6 +160,12 @@ inline void callback_field(lua_State* lua, int table, const char* name, int& ref
     reference = luaL_ref(lua, LUA_REGISTRYINDEX);
 }
 
+inline void userdata_methods(lua_State* lua, const luaL_Reg* methods) {
+    lua_newtable(lua);
+    luaL_setfuncs(lua, methods, 0);
+    lua_setfield(lua, -2, "__index");
+}
+
 inline char interrupted;
 
 /// Translate native failures after C++ locals unwind. Lua calls inside Function

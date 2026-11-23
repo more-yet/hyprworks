@@ -37,6 +37,8 @@
 
 #include "../lua/binding.hpp"
 #include <atomic>
+#include <algorithm>
+#include <array>
 
 namespace hyprworks::lua {
 
@@ -45,9 +47,82 @@ struct Gui;
 struct WaitSet {
     std::vector<pollfd> fds;
     std::optional<std::chrono::steady_clock::time_point> deadline;
+    void due(std::optional<native::TimePoint> at) {
+        if (at && (!deadline || at < deadline)) deadline = at;
+    }
+    std::size_t append(pollfd fd) {
+        const auto index = fds.size();
+        fds.push_back(fd);
+        return index;
+    }
 };
 
+template<class T>
+auto& vacant_slot(std::vector<std::shared_ptr<T>>& active) {
+    const auto slot = std::ranges::find(active, nullptr);
+    if (slot != active.end()) return *slot;
+    if (active.size() == T::limit) throw std::runtime_error("active handle limit reached (" + std::to_string(T::limit) + ")");
+    // The slot stays at this address across Lua allocation and reentrant opens.
+    if (active.empty()) active.reserve(T::limit);
+    return active.emplace_back();
+}
+
+template<class T>
+int release_userdata(lua_State* lua) {
+    // Resurrected userdata no longer exposes methods for the released owner.
+    lua_pushnil(lua); lua_setmetatable(lua, 1);
+    std::destroy_at(static_cast<std::shared_ptr<T>*>(lua_touserdata(lua, 1)));
+    return 0;
+}
+
+template<class T>
+int open_active(lua_State* lua, std::shared_ptr<T>& slot, const std::shared_ptr<T>& binding, const char* metatable) {
+    if (!lua_checkstack(lua, 4)) throw std::runtime_error("cannot grow Lua stack");
+    slot = binding;
+    constexpr bool has_callback = requires { binding->callback; };
+    if constexpr (has_callback) lua_pushvalue(lua, 2);
+    const auto result = protected_call(lua, [&](lua_State* lua) {
+        auto* handle = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<T>), 0)) std::shared_ptr<T>();
+        luaL_setmetatable(lua, metatable);
+        if constexpr (has_callback) { lua_pushvalue(lua, 2); binding->callback = luaL_ref(lua, LUA_REGISTRYINDEX); }
+        lua_pushvalue(lua, -1); binding->handle = luaL_ref(lua, LUA_REGISTRYINDEX);
+        *handle = binding;
+        return 1;
+    }, 1, 0, has_callback ? 1 : 0);
+    if (result < 0) {
+        unref(lua, binding->handle);
+        if constexpr (has_callback) unref(lua, binding->callback);
+        slot.reset();
+    }
+    return result;
+}
+
+template<class T>
+void untrack(lua_State* lua, std::vector<std::shared_ptr<T>>& active, T& binding) {
+    unref(lua, binding.handle);
+    for (auto& slot : active) if (slot.get() == &binding) { slot.reset(); break; }
+    binding.closed = true;
+}
+
+template<class T>
+int resume_handle(lua_State* lua, std::vector<std::shared_ptr<T>>& active, T& binding) {
+    if (!binding.closed) return 0;
+    auto& slot = vacant_slot(active);
+    const auto& handle = *static_cast<std::shared_ptr<T>*>(lua_touserdata(lua, 1));
+    lua_pushvalue(lua, 1);
+    const auto generation = binding.generation;
+    int ref;
+    if (protected_call(lua, [&](lua_State* lua) { ref = luaL_ref(lua, LUA_REGISTRYINDEX); return 0; }, 0, 0, 1) < 0) return -1;
+    if (slot || binding.generation != generation) {
+        luaL_unref(lua, LUA_REGISTRYINDEX, ref);
+        throw std::runtime_error("handle changed during restart");
+    }
+    slot = handle; binding.handle = ref; binding.closed = false;
+    return 0;
+}
+
 struct TimerBinding {
+    static constexpr std::size_t limit = 128;
     host::Timer timer;
     int handle = LUA_NOREF, callback = LUA_NOREF;
     std::uint64_t pending = 0, generation = 0;
@@ -55,16 +130,19 @@ struct TimerBinding {
 };
 
 struct ProcessBinding {
+    static constexpr std::size_t limit = 64;
     host::Process process;
     host::ProcessWait wait;
+    std::size_t offset = 0;
     int handle = LUA_NOREF, callback = LUA_NOREF;
     std::uint64_t generation = 0;
     bool pending = false, closed = false;
 };
 
 struct WatchBinding {
+    static constexpr std::size_t limit = 64;
     host::FileWatch watch;
-    pollfd wait;
+    std::size_t offset = 0;
     int handle = LUA_NOREF, callback = LUA_NOREF;
     host::FileUpdate pending;
     std::uint64_t generation = 0;
@@ -75,6 +153,9 @@ struct WatchBinding {
 struct CommandBinding {
     commands::CommandServer server;
     commands::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || !requests.empty(); }
+    void retain(commands::Update update) { status_pending |= update.status_changed; requests = std::move(update.requests); }
     std::string name;
     std::vector<std::string> commands;
     std::vector<commands::Request> requests;
@@ -88,6 +169,9 @@ struct CommandBinding {
 struct DesktopBinding {
     desktop::DesktopEntries entries;
     desktop::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || change_pending; }
+    void retain(desktop::Update update) { status_pending |= update.status_changed; change_pending |= update.snapshot_changed; }
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_change = LUA_NOREF;
     std::uint64_t generation = 0;
     bool closed = false, status_pending = false, change_pending = false;
@@ -99,6 +183,9 @@ namespace shortcuts = hyprworks::hyprland::shortcuts;
 struct ShortcutBinding {
     shortcuts::ShortcutConnection connection;
     shortcuts::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || !events.empty(); }
+    void retain(shortcuts::Update update) { status_pending |= update.status_changed; events = std::move(update.events); }
     std::string app_id, display;
     std::vector<shortcuts::Shortcut> shortcuts;
     std::vector<shortcuts::Event> events;
@@ -109,9 +196,16 @@ struct ShortcutBinding {
 #endif
 
 struct WorkspaceBinding {
+    static constexpr std::size_t limit = 32;
     native::SessionTarget target;
     native::WorkspaceConnection connection;
     native::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || change_pending || result; }
+    void retain(native::DispatchResult update) {
+        status_pending |= update.status_changed; change_pending |= update.snapshot_changed;
+        if (update.switch_result) result = std::move(update.switch_result);
+    }
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_change = LUA_NOREF, on_result = LUA_NOREF;
     std::uint64_t generation = 0;
     bool closed = false;
@@ -123,14 +217,28 @@ struct WorkspaceBinding {
 struct TrayBinding {
     tray::TrayConnection connection;
     tray::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || change_pending || result; }
+    void retain(tray::Update update) {
+        status_pending |= update.status_changed; change_pending |= update.snapshot_changed;
+        if (update.result) result = std::move(update.result);
+    }
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_change = LUA_NOREF, on_result = LUA_NOREF;
     bool closed = false, own_watcher = false, status_pending = false, change_pending = false;
     std::uint64_t generation = 0;
     std::optional<tray::RequestResult> result;
 };
 struct MenuBinding {
+    static constexpr std::size_t limit = 32;
     dbusmenu::MenuConnection connection;
     dbusmenu::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || change_pending || result || !activations.empty(); }
+    void retain(dbusmenu::Update update) {
+        status_pending |= update.status_changed; change_pending |= update.snapshot_changed;
+        if (update.result) result = std::move(update.result);
+        activations = std::move(update.activations);
+    }
     dbusmenu::Target target;
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_change = LUA_NOREF, on_result = LUA_NOREF, on_activation = LUA_NOREF;
     bool closed = false, status_pending = false, change_pending = false;
@@ -144,6 +252,9 @@ struct MenuBinding {
 struct NotificationBinding {
     notifications::NotificationServer server;
     notifications::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || !events.empty(); }
+    void retain(notifications::Update update) { status_pending |= update.status_changed; events = std::move(update.events); }
     notifications::Options options;
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_event = LUA_NOREF;
     bool closed = false, status_pending = false;
@@ -156,6 +267,12 @@ struct NotificationBinding {
 struct MediaBinding {
     mpris::MediaConnection connection;
     mpris::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || change_pending || result; }
+    void retain(mpris::Update update) {
+        status_pending |= update.status_changed; change_pending |= update.snapshot_changed;
+        if (update.result) result = std::move(update.result);
+    }
     int handle = LUA_NOREF, on_change = LUA_NOREF, on_status = LUA_NOREF, on_result = LUA_NOREF;
     bool closed = false, change_pending = false, status_pending = false;
     std::uint64_t generation = 0;
@@ -167,6 +284,12 @@ struct MediaBinding {
 struct AudioBinding {
     audio::AudioConnection connection;
     audio::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || change_pending || result; }
+    void retain(audio::Update update) {
+        status_pending |= update.status_changed; change_pending |= update.snapshot_changed;
+        if (update.result) result = std::move(update.result);
+    }
     int handle = LUA_NOREF, on_change = LUA_NOREF, on_status = LUA_NOREF, on_result = LUA_NOREF;
     bool closed = false, change_pending = false, status_pending = false;
     std::uint64_t generation = 0;
@@ -178,6 +301,9 @@ struct AudioBinding {
 struct PowerBinding {
     upower::PowerConnection connection;
     upower::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || change_pending; }
+    void retain(upower::Update update) { status_pending |= update.status_changed; change_pending |= update.snapshot_changed; }
     int handle = LUA_NOREF, on_change = LUA_NOREF, on_status = LUA_NOREF;
     std::uint64_t generation = 0;
     bool closed = false, change_pending = false, status_pending = false;
@@ -189,6 +315,9 @@ struct PolkitBinding {
     polkit::Agent agent;
     polkit::Options options;
     polkit::WaitSet wait;
+    std::size_t offset = 0;
+    bool pending() const { return status_pending || !events.empty(); }
+    void retain(polkit::Update update) { status_pending |= update.status_changed; events = std::move(update.events); }
     std::vector<polkit::Event> events;
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_event = LUA_NOREF;
     std::uint64_t generation = 0;
@@ -205,9 +334,9 @@ struct InvocationState {
     EventLoop loop = EventLoop::headless;
     std::atomic<unsigned> requests{0};
     std::string configuration_directory;
-    std::vector<std::string> configuration_files;
     int wake_fd = -1;
     int clock_fd = -1, on_clock_change = LUA_NOREF;
+    std::size_t clock_offset = 0, timezone_offset = 0, reload_offset = 0;
     bool clock_pending = false;
     std::uint64_t clock_generation = 0;
     host::FileWatch timezone_watch;
@@ -216,20 +345,24 @@ struct InvocationState {
     bool closing = false;
     int exit_code = 0;
     WaitSet wait;
-    std::vector<std::unique_ptr<WorkspaceBinding>> workspaces;
-    std::vector<std::unique_ptr<TimerBinding>> timers;
-    std::vector<std::unique_ptr<ProcessBinding>> processes;
-    std::vector<std::unique_ptr<WatchBinding>> watches;
+    std::vector<std::shared_ptr<WorkspaceBinding>> workspaces;
+    std::vector<std::shared_ptr<TimerBinding>> timers;
+    std::vector<std::shared_ptr<ProcessBinding>> processes;
+    std::vector<std::shared_ptr<WatchBinding>> watches;
 #ifdef HYPRWORKS_HAS_DBUS
     struct BusBinding {
+        static constexpr std::size_t limit = 8;
         dbus::Connection connection;
         dbus::WaitSet wait;
+        std::size_t offset = 0;
+        bool pending() const { return status_pending || !events.empty(); }
+        void retain(dbus::Update update) { status_pending |= update.status_changed; events = std::move(update.events); }
         std::vector<dbus::Event> events;
         int handle = LUA_NOREF, on_event = LUA_NOREF, on_status = LUA_NOREF;
         std::uint64_t generation = 0;
         bool closed = false, status_pending = true;
     };
-    std::vector<std::unique_ptr<BusBinding>> buses;
+    std::vector<std::shared_ptr<BusBinding>> buses;
 #endif
     host::FileWatch reload_watch;
     std::optional<host::Clock::time_point> reload_at;
@@ -244,7 +377,7 @@ struct InvocationState {
 #endif
 #ifdef HYPRWORKS_HAS_TRAY
     std::optional<TrayBinding> tray;
-    std::vector<std::unique_ptr<MenuBinding>> menus;
+    std::vector<std::shared_ptr<MenuBinding>> menus;
 #endif
 #ifdef HYPRWORKS_HAS_NOTIFICATIONS
     std::optional<NotificationBinding> notifications;
@@ -292,6 +425,40 @@ int dispatch_callback(lua_State* lua, Binding& binding, const int& callback,
     return result;
 }
 
+template<class Binding, class... Options>
+std::expected<void, std::string> restart_observer(Binding& binding, const Options&... options) {
+    if (binding.result) return std::unexpected("a result awaits delivery");
+    const auto before = binding.connection.status();
+    const bool published = bool(binding.connection.snapshot());
+    const auto result = binding.connection.start(options...);
+    binding.closed = false;
+    if (result || before != binding.connection.status()) {
+        ++binding.generation;
+        binding.status_pending = true;
+    }
+    binding.change_pending |= published && !binding.connection.snapshot();
+    return result;
+}
+
+template<class Binding, class Push = std::nullptr_t>
+int deliver_observer(lua_State* lua, Binding& binding, Push push_result = nullptr) {
+    const auto generation = binding.generation;
+    const bool status = std::exchange(binding.status_pending, false), change = std::exchange(binding.change_pending, false);
+    const auto no_args = [](lua_State*) { return 0; };
+    if (status && dispatch_callback(lua, binding, binding.on_status, generation, no_args) < 0) return -1;
+    if (change && dispatch_callback(lua, binding, binding.on_change, generation, no_args) < 0) return -1;
+    if constexpr (requires { binding.result; }) {
+        // close() may take the result from either of the preceding callbacks.
+        if (binding.result && !binding.closed && binding.generation == generation && !invocation(lua).requests.load()) {
+            const auto result = std::exchange(binding.result, {});
+            return dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
+                push_result(lua, *result); return 1;
+            });
+        }
+    }
+    return 0;
+}
+
 void wake(InvocationState& state) noexcept;
 
 void register_workspaces(lua_State* lua);
@@ -310,7 +477,6 @@ int dispatch_dbus(lua_State* lua, InvocationState::BusBinding& binding);
 
 #ifdef HYPRWORKS_HAS_UPOWER
 void register_upower(lua_State* lua);
-int dispatch_power(lua_State* lua, PowerBinding& binding);
 #endif
 
 #ifdef HYPRWORKS_HAS_AUDIO
@@ -341,7 +507,6 @@ int dispatch_commands(lua_State* lua, CommandBinding& binding);
 
 #ifdef HYPRWORKS_HAS_DESKTOP
 void register_desktop(lua_State* lua);
-int dispatch_desktop(lua_State* lua, DesktopBinding& binding);
 #endif
 
 #ifdef HYPRWORKS_HAS_SHORTCUTS

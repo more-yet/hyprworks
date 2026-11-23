@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <lua.hpp>
 #include <wayland-client.h>
+#include <hyprworks/hyprland/workspaces.hpp>
 #include "wlr-foreign-toplevel-management-unstable-v1-client.h"
 #include "ext-foreign-toplevel-list-v1-client.h"
 #include "ext-image-capture-source-v1-client.h"
@@ -85,7 +86,7 @@ struct WindowCatalog {
     const char* protocol_error = nullptr;
     enum class Phase { stopped, connecting, synchronizing, ready, failed };
     Phase phase = Phase::stopped;
-    enum class Query { idle, connecting, sending, reading, synchronizing, complete };
+    using Query = hyprworks::hyprland::SocketPhase;
     Query query = Query::idle;
     int fd = -1, handle = LUA_NOREF, on_change = LUA_NOREF, on_status = LUA_NOREF;
     std::uint64_t generation = 0, revision = 0, invalidation = 0, queried_invalidation = 0;
@@ -99,7 +100,6 @@ void register_windows(lua_State* lua);
 void close_windows(WindowCatalog& catalog) noexcept;
 void prepare_windows(WindowCatalog& catalog, WaitSet& wait);
 void read_windows(WindowCatalog& catalog, const WaitSet& wait);
-int dispatch_windows(WindowCatalog& catalog);
 void bind_captures(Gui& gui, wl_registry* registry, std::uint32_t name, const char* interface);
 void remove_capture_global(Gui& gui, std::uint32_t name);
 void close_captures(Gui& gui) noexcept;

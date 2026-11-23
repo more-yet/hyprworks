@@ -109,17 +109,7 @@ void push_audio_result(lua_State* lua, const audio::RequestResult& result) {
 
 int audio_restart(lua_State* lua) {
     auto& binding = audio_handle(lua, true);
-    if (binding.result) { lua_pushnil(lua); lua_pushliteral(lua, "an audio result awaits delivery"); return 2; }
-    const auto before = binding.connection.status();
-    const bool had_snapshot = bool(binding.connection.snapshot());
-    auto result = binding.connection.start();
-    binding.closed = false;
-    if (result || before != binding.connection.status()) {
-        ++binding.generation;
-        binding.status_pending = true;
-    }
-    binding.change_pending |= had_snapshot && !binding.connection.snapshot();
-    return operation_result(lua, result);
+    return operation_result(lua, restart_observer(binding));
 }
 
 int audio_refresh(lua_State* lua) {
@@ -189,19 +179,7 @@ int audio_close(lua_State* lua) {
 }
 
 int dispatch_audio(lua_State* lua, AudioBinding& binding) {
-    const bool status = std::exchange(binding.status_pending, false);
-    const bool change = std::exchange(binding.change_pending, false);
-    const auto generation = binding.generation;
-    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    if (change && dispatch_callback(lua, binding, binding.on_change, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    if (binding.result && !binding.closed && generation == binding.generation && !invocation(lua).requests.load(std::memory_order_relaxed)) {
-        const auto result = std::exchange(binding.result, {});
-        if (dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
-            push_audio_result(lua, *result);
-            return 1;
-        }) < 0) return -1;
-    }
-    return 0;
+    return deliver_observer(lua, binding, push_audio_result);
 }
 
 void register_audio(lua_State* lua) {

@@ -49,19 +49,19 @@ int on_clock_change(lua_State* lua) {
 }
 
 TimerBinding& timer_handle(lua_State* lua) {
-    auto& binding = **static_cast<TimerBinding**>(luaL_checkudata(lua, 1, timer_metatable));
+    auto& binding = **static_cast<std::shared_ptr<TimerBinding>*>(luaL_checkudata(lua, 1, timer_metatable));
     if (invocation(lua).closing) luaL_error(lua, "invocation is shutting down");
     return binding;
 }
 
 ProcessBinding& process_handle(lua_State* lua) {
-    auto& binding = **static_cast<ProcessBinding**>(luaL_checkudata(lua, 1, process_metatable));
+    auto& binding = **static_cast<std::shared_ptr<ProcessBinding>*>(luaL_checkudata(lua, 1, process_metatable));
     if (invocation(lua).closing) luaL_error(lua, "invocation is shutting down");
     return binding;
 }
 
 WatchBinding& watch_handle(lua_State* lua) {
-    auto& binding = **static_cast<WatchBinding**>(luaL_checkudata(lua, 1, watch_metatable));
+    auto& binding = **static_cast<std::shared_ptr<WatchBinding>*>(luaL_checkudata(lua, 1, watch_metatable));
     if (invocation(lua).closing) luaL_error(lua, "invocation is shutting down");
     return binding;
 }
@@ -73,30 +73,24 @@ int timer_open(lua_State* lua) {
     luaL_checktype(lua, 2, LUA_TFUNCTION);
     if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TBOOLEAN);
     const bool repeat = lua_toboolean(lua, 3);
-    if (state.timers.size() == 128) return luaL_error(lua, "timer handle limit reached; reuse existing timers");
-    auto timer = std::make_unique<TimerBinding>();
+    auto& slot = vacant_slot(state.timers);
+    auto timer = std::make_shared<TimerBinding>();
     if (auto result = timer->timer.start(std::chrono::milliseconds(milliseconds), repeat); !result) throw std::runtime_error(result.error());
-    auto& binding = *timer;
-    state.timers.push_back(std::move(timer));
-    lua_pushvalue(lua, 2);
-    const int status = protected_call(lua, [&](lua_State* lua) {
-        *static_cast<TimerBinding**>(lua_newuserdatauv(lua, sizeof(TimerBinding*), 0)) = &binding;
-        luaL_setmetatable(lua, timer_metatable);
-        lua_pushvalue(lua, -1); binding.handle = luaL_ref(lua, LUA_REGISTRYINDEX);
-        replace_callback(lua, 2, binding.callback, binding.closed);
-        return 1;
-    }, 1, 0, 1);
-    if (status < 0) { binding.closed = true; binding.timer.stop(); }
-    return status;
+    return open_active(lua, slot, timer, timer_metatable);
 }
 
 int timer_start(lua_State* lua) {
     auto& binding = timer_handle(lua);
     const auto milliseconds = check_integer(lua, 2);
     if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TBOOLEAN);
+    const bool closed = binding.closed;
+    if (resume_handle(lua, invocation(lua).timers, binding) < 0) return -1;
     auto result = binding.timer.start(std::chrono::milliseconds(milliseconds), lua_toboolean(lua, 3));
-    if (!result) throw std::runtime_error(result.error());
-    binding.closed = false; binding.pending = 0; ++binding.generation;
+    if (!result) {
+        if (closed) untrack(lua, invocation(lua).timers, binding);
+        throw std::runtime_error(result.error());
+    }
+    binding.pending = 0; ++binding.generation;
     return 0;
 }
 
@@ -109,7 +103,7 @@ int timer_stop(lua_State* lua) {
 int timer_close(lua_State* lua) {
     auto& binding = timer_handle(lua);
     binding.timer.stop(); binding.pending = 0; ++binding.generation;
-    binding.closed = true;
+    untrack(lua, invocation(lua).timers, binding);
     unref(lua, binding.callback);
     return 0;
 }
@@ -176,15 +170,11 @@ int process_open(lua_State* lua) {
     lua_pushvalue(lua, 1);
     lua_pushvalue(lua, 2);
     if (protected_call(lua, [&](lua_State* lua) { parse_arguments(lua, 2, arguments); parse_process_options(lua, 3, options); return 0; }, 0, 0, 2) < 0) return -1;
-    if (state.processes.size() >= 64) throw std::runtime_error("process handle limit reached; reuse existing handles");
-    auto created = std::make_unique<ProcessBinding>();
-    auto& binding = *created;
-    const auto result = binding.process.start(arguments, options);
+    auto& slot = vacant_slot(state.processes);
+    auto binding = std::make_shared<ProcessBinding>();
+    const auto result = binding->process.start(arguments, options);
     if (!result) return operation_result(lua, result);
-    state.processes.push_back(std::move(created));
-    const int status = retain_handle(lua, binding, process_metatable);
-    if (status < 0) { binding.closed = true; binding.process.cancel(); }
-    return status;
+    return open_active(lua, slot, binding, process_metatable);
 }
 
 int process_start(lua_State* lua) {
@@ -197,8 +187,11 @@ int process_start(lua_State* lua) {
     lua_pushvalue(lua, 3);
     if (protected_call(lua, [&](lua_State* lua) { parse_arguments(lua, 2, arguments); parse_process_options(lua, 3, options); return 0; }, 0, 0, 2) < 0) return -1;
     if (binding.generation != generation) throw std::runtime_error("process changed while parsing options");
+    const bool closed = binding.closed;
+    if (resume_handle(lua, invocation(lua).processes, binding) < 0) return -1;
     const auto result = binding.process.start(arguments, options);
-    if (result) { binding.closed = false; binding.pending = false; ++binding.generation; }
+    if (result) { binding.pending = false; ++binding.generation; }
+    else if (closed) untrack(lua, invocation(lua).processes, binding);
     return operation_result(lua, result);
 }
 
@@ -220,7 +213,7 @@ int process_callback(lua_State* lua) {
 
 int process_close(lua_State* lua) {
     auto& binding = process_handle(lua);
-    binding.process.cancel(); binding.closed = true; binding.pending = false; ++binding.generation;
+    binding.process.cancel(); untrack(lua, invocation(lua).processes, binding); binding.pending = false; ++binding.generation;
     unref(lua, binding.callback);
     const auto result = binding.process.result();
     return protected_call(lua, [&](lua_State* lua) { push_process_result(lua, result); return 1; }, 1);
@@ -281,26 +274,16 @@ int watch_open(lua_State* lua) {
     luaL_checktype(lua, 2, LUA_TFUNCTION);
     if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TBOOLEAN);
     const bool directory = lua_toboolean(lua, 3);
-    if (state.watches.size() == 64) return luaL_error(lua, "file watch handle limit reached");
-    auto watch = std::make_unique<WatchBinding>();
+    auto& slot = vacant_slot(state.watches);
+    auto watch = std::make_shared<WatchBinding>();
     const auto result = watch->watch.start(std::string(path, length), directory);
     if (!result) return operation_result(lua, result);
-    auto& binding = *watch;
-    state.watches.push_back(std::move(watch));
-    lua_pushvalue(lua, 2);
-    const int status = protected_call(lua, [&](lua_State* lua) {
-        *static_cast<WatchBinding**>(lua_newuserdatauv(lua, sizeof(WatchBinding*), 0)) = &binding;
-        luaL_setmetatable(lua, watch_metatable);
-        lua_pushvalue(lua, -1); binding.handle = luaL_ref(lua, LUA_REGISTRYINDEX);
-        replace_callback(lua, 2, binding.callback, binding.closed); return 1;
-    }, 1, 0, 1);
-    if (status < 0) { binding.closed = true; binding.watch.stop(); }
-    return status;
+    return open_active(lua, slot, watch, watch_metatable);
 }
 
 int watch_close(lua_State* lua) {
     auto& binding = watch_handle(lua);
-    binding.closed = true; binding.watch.stop(); binding.pending = {}; ++binding.generation;
+    untrack(lua, invocation(lua).watches, binding); binding.watch.stop(); binding.pending = {}; ++binding.generation;
     unref(lua, binding.callback); return 0;
 }
 
@@ -310,8 +293,11 @@ int watch_start(lua_State* lua) {
     const char* path = check_string(lua, 2, &length);
     luaL_argcheck(lua, length <= 16384, 2, "path exceeds 16 KiB");
     if (!lua_isnoneornil(lua, 3)) luaL_checktype(lua, 3, LUA_TBOOLEAN);
+    const bool closed = binding.closed;
+    if (resume_handle(lua, invocation(lua).watches, binding) < 0) return -1;
     const auto result = binding.watch.start(std::string(path, length), lua_toboolean(lua, 3));
-    binding.closed = false; binding.pending = {}; ++binding.generation;
+    if (!result && closed) untrack(lua, invocation(lua).watches, binding);
+    binding.pending = {}; ++binding.generation;
     return operation_result(lua, result);
 }
 
@@ -347,10 +333,10 @@ int dispatch_utilities(lua_State* lua, InvocationState& state) {
         }, 0, 1) < 0) return -1;
         lua_settop(lua, 0);
     }
-    const auto timers = state.timers.size(), processes = state.processes.size(), watches = state.watches.size();
-    for (std::size_t i = 0; i < timers; ++i) {
+    for (auto timer : std::span(state.timers)) {
+        if (!timer) continue;
         if (state.requests.load(std::memory_order_relaxed)) return 0;
-        auto& binding = *state.timers[i];
+        auto& binding = *timer;
         if (binding.closed || !binding.pending) continue;
         const auto ticks = std::exchange(binding.pending, 0);
         const auto generation = binding.generation;
@@ -359,9 +345,10 @@ int dispatch_utilities(lua_State* lua, InvocationState& state) {
             return 1;
         }) < 0) return -1;
     }
-    for (std::size_t i = 0; i < processes; ++i) {
+    for (auto process : std::span(state.processes)) {
+        if (!process) continue;
         if (state.requests.load(std::memory_order_relaxed)) return 0;
-        auto& binding = *state.processes[i];
+        auto& binding = *process;
         if (binding.closed || !binding.pending) continue;
         binding.pending = false;
         if (binding.callback < 0) continue;
@@ -372,9 +359,10 @@ int dispatch_utilities(lua_State* lua, InvocationState& state) {
             return 1;
         }) < 0) return -1;
     }
-    for (std::size_t i = 0; i < watches; ++i) {
+    for (auto watch : std::span(state.watches)) {
+        if (!watch) continue;
         if (state.requests.load(std::memory_order_relaxed)) return 0;
-        auto& binding = *state.watches[i];
+        auto& binding = *watch;
         if (binding.closed || !binding.pending.changed) continue;
         const auto event = std::exchange(binding.pending, {});
         const auto generation = binding.generation;
@@ -401,15 +389,15 @@ void register_host(lua_State* lua) {
     const luaL_Reg process_methods[] = {{"start", guarded<process_start>}, {"close", guarded<process_close>},
         {"running", guarded<process_running>}, {"result", guarded<process_result>}, {"on_exit", guarded<process_callback>}, {nullptr, nullptr}};
     const luaL_Reg watch_methods[] = {{"close", guarded<watch_close>}, {"start", guarded<watch_start>}, {"on_change", guarded<watch_callback>}, {nullptr, nullptr}};
-    const struct { const char* name; const luaL_Reg* methods; lua_CFunction close; } metatables[] = {
-        {timer_metatable, timer_methods, guarded<timer_close>},
-        {process_metatable, process_methods, guarded<process_close>},
-        {watch_metatable, watch_methods, guarded<watch_close>}
+    const struct { const char* name; const luaL_Reg* methods; lua_CFunction close, gc; } metatables[] = {
+        {timer_metatable, timer_methods, guarded<timer_close>, release_userdata<TimerBinding>},
+        {process_metatable, process_methods, guarded<process_close>, release_userdata<ProcessBinding>},
+        {watch_metatable, watch_methods, guarded<watch_close>, release_userdata<WatchBinding>}
     };
     for (const auto& metatable : metatables) {
         luaL_newmetatable(lua, metatable.name);
-        luaL_setfuncs(lua, metatable.methods, 0);
-        lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
+        lua_pushcfunction(lua, metatable.gc); lua_setfield(lua, -2, "__gc");
+        userdata_methods(lua, metatable.methods);
         lua_pushcfunction(lua, metatable.close); lua_setfield(lua, -2, "__close");
         lua_pushliteral(lua, "hyprworks host utility"); lua_setfield(lua, -2, "__metatable");
         lua_pop(lua, 1);

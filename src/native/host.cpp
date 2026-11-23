@@ -360,7 +360,10 @@ std::expected<void, std::string> FileWatch::add(const std::string& path, bool di
         valid_path(path);
         const auto target = std::filesystem::absolute(path).lexically_normal();
         const auto parent = directory ? target : target.parent_path();
-        Target added{.filename = directory ? "" : target.filename().string()};
+        Target added{.path = target.string(), .name_offset = 0};
+        added.name_offset = added.path.size() - (directory ? 0 : target.filename().native().size());
+        for (const auto& existing : targets_)
+            if (existing.path == added.path && existing.name_offset == added.name_offset) return {};
         if (targets_.size() == 256) throw std::runtime_error("file watch target limit reached (256)");
         if (targets_.size() == targets_.capacity())
             targets_.reserve(std::min<std::size_t>(256, std::max<std::size_t>(4, targets_.size() * 2)));
@@ -371,8 +374,6 @@ std::expected<void, std::string> FileWatch::add(const std::string& path, bool di
         added.descriptor = inotify_add_watch(fd_, parent.c_str(),
             IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR);
         check(added.descriptor, "watch directory");
-        for (const auto& existing : targets_)
-            if (existing.descriptor == added.descriptor && existing.filename == added.filename) return {};
         targets_.push_back(std::move(added));
         return {};
     } catch (const std::exception& error) {
@@ -397,7 +398,8 @@ FileUpdate FileWatch::dispatch() {
             if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT)) update.invalidated = update.changed = true;
             if (event->len)
                 for (const auto& target : targets_)
-                    if (target.descriptor == event->wd && (target.filename.empty() || target.filename == event->name))
+                    if (target.descriptor == event->wd && (target.name_offset == target.path.size() ||
+                        std::string_view(target.path).substr(target.name_offset) == event->name))
                         update.changed = true;
             offset += sizeof(inotify_event) + event->len;
         }

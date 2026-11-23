@@ -27,8 +27,7 @@ Desktop integrations have individual `HYPRWORKS_BUILD_<FEATURE>` options.
 ### Configuration directory
 
 Set `HYPRWORKS_CONFIG_DIR` to the absolute path of your configuration directory.
-`hyprworks` loads `main.lua` from that directory. An unset, empty or relative
-directory value, or a missing entry file, is a startup error.
+`hyprworks` loads `main.lua` from that directory.
 
 The package installs the `60-hyprworks-environment` systemd user-environment
 generator. At user-manager startup or reload, after `environment.d` processing,
@@ -91,8 +90,8 @@ to their ancestors. Their `on_change` callbacks report the final clamped offsets
 
 Descriptions supply `kind`; text and inputs supply a Pango `font` with family
 and size. Colors, backgrounds, padding, borders, corner radii, focus outlines,
-selection and caret painting are optional authored properties. Omitted paint is
-absent. Omitted element dimensions are computed from content and parent layout.
+selection and caret painting are optional authored properties. Element dimensions
+default to content and parent layout.
 Windows and popups require integer `width` and `height`; layers additionally
 require `edge`, `layer` and `keyboard`. A layer dimension of zero asks the
 compositor to allocate that axis. Titles and application IDs are optional strings.
@@ -101,7 +100,8 @@ Inputs expose `selection_color`, `caret_color`, `caret_width` and
 `placeholder_color`; focus outlines use `focus_color` and `focus_width`.
 Password inputs require a one-character UTF-8 `mask`. Text clips at its bounds;
 `wrap = true` enables wrapping, and `ellipsize = true` enables end ellipsis for
-unwrapped text. Icon sources require `theme` and integer `pixels`.
+unwrapped text. Icon sources require `theme` and integer `pixels`: the icon's
+intrinsic logical size. The runtime selects a raster size for the output scale.
 SVG sources use intrinsic dimensions or an explicit `pixels` raster width.
 For SVGs with percentage dimensions, `pixels` is required; a `viewBox` supplies
 the aspect ratio, otherwise the authored size defines a square viewport.
@@ -171,10 +171,10 @@ failures return `nil, error`; malformed arguments raise Lua errors.
 
 Lua arguments retain their declared types: strings, booleans, integers and
 numbers are checked at ingress, including optional values when present. Integer
-fields require Lua integers; numeric strings and integral floating-point values
-are rejected. Optional `nil` means absence; in property updates, omitted fields
+fields require Lua integers. Optional `nil` means absence; in property updates, omitted fields
 retain their current state. An input callback returns a boolean or `nil`.
-Option and element tables use their stored fields; unrelated fields are ignored.
+Option and element tables use their stored fields. Element updates apply the
+properties used by that kind; structural properties belong to tree descriptions.
 
 Caller-owned policies are explicit: `hw.quit(code)`, `hw.read_file(path, limit)`,
 process `{timeout, output_limit}`, D-Bus `{bus}` and call/export `{timeout}`,
@@ -297,45 +297,16 @@ Release captures when their previews leave the viewport.
 This requires `ext-workspace-v1`, `hyprland-workspace-image-capture-source-v1`
 and `ext-image-copy-capture-v1`, as provided by Hyprland 0.57.2.
 
-## Find the code
-
-| Path | Responsibility |
-|---|---|
-| [`include/hyprworks/`](include/hyprworks/) | Public native and embedding contracts |
-| [`src/native/`](src/native/) | Protocol connections, snapshots, requests and OS resources |
-| [`src/lua/binding.hpp`](src/lua/binding.hpp) | Lua error boundary, registry references and protected marshalling |
-| [`src/runtime/invocation.cpp`](src/runtime/invocation.cpp) | Configuration lifetime, readiness collection and callback delivery |
-| [`src/lua/`](src/lua/) | Lua argument translation and integration bindings |
-| [`src/gui/gui.cpp`](src/gui/gui.cpp) | Display lifetime, readiness and ordered GUI dispatch |
-| [`src/gui/surface.cpp`](src/gui/surface.cpp) | Surface roles, transactional element trees and Lua handles |
-| [`src/gui/input.cpp`](src/gui/input.cpp) | Seat events, editing, clipboard transfers and input delivery |
-| [`src/gui/render.cpp`](src/gui/render.cpp) | Text geometry, layout, painting and presentation buffers |
-| [`src/gui/images.cpp`](src/gui/images.cpp) and [`icons.cpp`](src/gui/icons.cpp) | Image worker, storage accounting and icon lookup |
-| [`src/gui/windows.cpp`](src/gui/windows.cpp) | Synchronized window observation and shared window/workspace capture |
-| [`src/runner.cpp`](src/runner.cpp) | CLI configuration, process signals and reload loop |
-| [`protocols/`](protocols/) and [`cmake/`](cmake/) | Wayland definitions, installed targets and user services |
-
-Read [ARCHITECTURE.md](ARCHITECTURE.md) for end-to-end execution paths,
-failure/cancellation branches, ownership and simplification tradeoffs.
-
 ## Develop and verify
 
-Follow a change from its input through native state, publication, Lua delivery
-and cleanup. Keep protocol validation with the connection, Lua conversion with
-the binding, and UI interaction state with the surface. Validate at ingress and
-mutation boundaries; consumers rely on the resulting invariants. Revalidate
-identities across callbacks, Lua allocation and asynchronous completion.
-
-The invocation checks cover teardown, finalizer/callback mutation and result
-ownership in GUI and headless builds. GUI checks cover transactional replacement,
-clipboard ownership and image-worker synchronization. Live checks run against
-their corresponding desktop services:
+See [ARCHITECTURE.md](ARCHITECTURE.md) for resource ownership and execution
+order. CTest runs the core lifetime checks and the isolated D-Bus fixtures for
+the enabled features. Run these Wayland fixtures in a Hyprland session:
 
 ```sh
 HYPRWORKS_CONFIG_DIR="$PWD/tests" build/local/hyprworks --entry gui.lua
 HYPRWORKS_CONFIG_DIR="$PWD/tests" build/local/hyprworks --entry windows.lua
 HYPRWORKS_CONFIG_DIR="$PWD/tests" build/local/hyprworks --entry workspace_capture.lua
-HYPRWORKS_CONFIG_DIR="$PWD/tests" dbus-run-session -- build/local/hyprworks --headless --entry dbus.lua
 ```
 
 With the existing session agent stopped, `tests/polkit.lua` checks real Polkit
