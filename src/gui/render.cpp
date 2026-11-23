@@ -178,8 +178,9 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
     for (std::size_t index = 0; index < surface.elements.size(); ++index) {
         auto& element = surface.elements[index];
         const auto box = element.box;
-        const auto visible = intersect(element.clip, damaged);
-        if (visible.w <= 0 || visible.h <= 0) continue;
+        const auto clip = element.clip;
+        if (clip.w <= 0 || clip.h <= 0 || clip.x >= damaged.x + damaged.w || clip.y >= damaged.y + damaged.h ||
+            clip.x + clip.w <= damaged.x || clip.y + clip.h <= damaged.y) continue;
         const auto background = element.background;
         const bool border = element.border_width > 0 && (element.border_color & 255);
         const bool outline = static_cast<int>(index) == outlined && element.focus_width > 0 && (element.focus_color & 255);

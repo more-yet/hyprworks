@@ -834,7 +834,7 @@ int dispatch_captures(Gui& gui) {
         if (!capture || capture->closed || gui.owner.requests.load(std::memory_order_relaxed)) continue;
         advance_capture(*capture);
         if (!std::exchange(capture->pending, false) || capture->callback < 0) continue;
-        const auto image = capture->image;
+        const auto image = std::move(capture->image);
         const int reference = capture->callback;
         lua_pushcfunction(lua, traceback);
         if (protected_call(lua, [&](lua_State* lua) {

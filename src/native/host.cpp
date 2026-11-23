@@ -621,11 +621,13 @@ FileUpdate FileWatch::dispatch() {
             const auto* event = reinterpret_cast<const inotify_event*>(buffer + offset);
             if (event->mask & IN_Q_OVERFLOW) update.overflow = update.changed = true;
             if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT)) update.invalidated = update.changed = true;
-            if (event->len)
+            if (!update.changed && event->len)
                 for (const auto& target : targets_)
                     if (target.descriptor == event->wd && (target.name_offset == target.path.size() ||
-                        std::string_view(target.path).substr(target.name_offset) == event->name))
+                        std::string_view(target.path).substr(target.name_offset) == event->name)) {
                         update.changed = true;
+                        break;
+                    }
             offset += sizeof(inotify_event) + event->len;
         }
     }

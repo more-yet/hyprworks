@@ -250,6 +250,7 @@ static void capture_lifetimes() {
             if event.kind == "frame" then
                 capture_frames = capture_frames + 1
                 retained_source = retained_source or event.source
+                latest_source = event.source
             else
                 assert(event.kind == "unavailable")
                 capture_ended = capture_ended + 1
@@ -273,8 +274,14 @@ static void capture_lifetimes() {
         wl_proxy_get_listener(reinterpret_cast<wl_proxy*>(capture->frame)));
     std::fill_n(static_cast<std::uint32_t*>(capture->pixels), 32, 0x80402010u);
     frame_events.ready(capture.get(), capture->frame);
-    assert(dispatch_captures(gui) == 0 && capture->image && !capture->deadline);
-    auto retained = capture->image;
+    assert(dispatch_captures(gui) == 0 && !capture->image && !capture->deadline);
+    const auto latest = [&] {
+        lua_getglobal(state.lua, "latest_source");
+        auto image = *static_cast<std::shared_ptr<Image>*>(luaL_checkudata(state.lua, -1, captured_image_type));
+        lua_pop(state.lua, 1);
+        return image;
+    };
+    auto retained = latest();
     const auto* retained_pixels = reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(retained->surface));
     assert(retained_pixels[0] == 0x80402010u);
     capture->next_frame = Clock::now();
@@ -282,7 +289,7 @@ static void capture_lifetimes() {
     session_events.buffer_size(capture.get(), capture->session, 4, 8);
     assert(!capture->constraints && capture->format == UINT32_MAX);
     frame_events.ready(capture.get(), capture->frame);
-    assert(dispatch_captures(gui) == 0 && !capture->frame && capture->image == retained);
+    assert(dispatch_captures(gui) == 0 && !capture->frame && latest() == retained);
     script("assert(capture_frames == 1)");
     session_events.shm_format(capture.get(), capture->session, WL_SHM_FORMAT_XRGB8888);
     session_events.done(capture.get(), capture->session);
@@ -295,10 +302,11 @@ static void capture_lifetimes() {
     }
     std::fill_n(static_cast<std::uint32_t*>(capture->pixels), 32, 0x00204060u);
     frame_events.ready(capture.get(), capture->frame);
-    assert(dispatch_captures(gui) == 0 && capture->image != retained && capture->constraint_failures == 0);
-    assert(*reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(capture->image->surface)) == 0xff204060u);
+    assert(dispatch_captures(gui) == 0 && latest() != retained && capture->constraint_failures == 0);
+    assert(*reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(latest()->surface)) == 0xff204060u);
     assert(retained_pixels[0] == 0x80402010u);
-    script("assert(capture_frames == 2)");
+    script("assert(capture_frames == 2); latest_source = nil; collectgarbage('collect')");
+    assert(gui.images.bytes.load() == retained->bytes);
     script(R"(
         retry_capture = assert(hw.capture_workspace(capture_options, function(handle, event)
             assert(event.kind == "error")

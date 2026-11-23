@@ -248,20 +248,26 @@ void WorkspaceConnection::read_events(short events, TimePoint now, DispatchResul
             return;
         }
         consumed += static_cast<std::size_t>(count);
-        for (std::ptrdiff_t i = 0; i < count; ++i) {
-            if (buffer[static_cast<std::size_t>(i)] == '\n') {
-                if (protocol::invalidates_workspaces(event_line_))
-                    schedule_refresh(now + options_.event_coalesce);
-                if (!subscription_ready_ && event_line_ == "custom>>" + subscription_marker_)
-                    subscription_ready_ = true;
-                event_line_.clear();
-            } else {
-                if (event_line_.size() == protocol::max_event_bytes) {
-                    fail_connection(Error{ErrorCode::limit_exceeded, "events", "event exceeds byte limit"}, ConnectionPhase::failed, result);
-                    return;
-                }
-                event_line_ += buffer[static_cast<std::size_t>(i)];
+        std::string_view bytes(buffer.data(), static_cast<std::size_t>(count));
+        while (!bytes.empty()) {
+            const auto newline = bytes.find('\n');
+            auto line = bytes.substr(0, newline);
+            if (line.size() > protocol::max_event_bytes - event_line_.size()) {
+                fail_connection(Error{ErrorCode::limit_exceeded, "events", "event exceeds byte limit"}, ConnectionPhase::failed, result);
+                return;
             }
+            if (newline == bytes.npos || !event_line_.empty()) {
+                event_line_.append(line);
+                if (newline == bytes.npos) break;
+                line = event_line_;
+            }
+            if (protocol::invalidates_workspaces(line))
+                schedule_refresh(now + options_.event_coalesce);
+            constexpr std::string_view prefix = "custom>>";
+            if (!subscription_ready_ && line.starts_with(prefix) && line.substr(prefix.size()) == subscription_marker_)
+                subscription_ready_ = true;
+            event_line_.clear();
+            bytes.remove_prefix(newline + 1);
         }
     }
 }
