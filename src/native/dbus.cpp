@@ -46,7 +46,7 @@ Value read_value(sd_bus_message* message, BodyBudget& budget, unsigned depth) {
     Value value;
     value.signature = std::string(1, type);
     switch (type) {
-        case 'b': { int data; require(sd_bus_message_read_basic(message, type, &data)); value.data = data != 0; break; }
+        case 'b': value.data = boolean(message); break;
         case 'y': { std::uint8_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = std::uint64_t(data); break; }
         case 'q': { std::uint16_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = std::uint64_t(data); break; }
         case 'u': { std::uint32_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = std::uint64_t(data); break; }
@@ -54,11 +54,7 @@ Value read_value(sd_bus_message* message, BodyBudget& budget, unsigned depth) {
         case 'n': { std::int16_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = std::int64_t(data); break; }
         case 'i': { std::int32_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = std::int64_t(data); break; }
         case 'x': { std::int64_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = data; break; }
-        case 'd': {
-            double data; require(sd_bus_message_read_basic(message, type, &data));
-            if (!std::isfinite(data)) throw std::runtime_error("nonfinite D-Bus number");
-            value.data = data; break;
-        }
+        case 'd': value.data = finite_number(message); break;
         case 's': case 'o': case 'g': {
             const char* data; require(sd_bus_message_read_basic(message, type, &data));
             const auto size = std::strlen(data); budget.payload(size);
@@ -229,24 +225,26 @@ struct Connection::State {
     }
     void queue(Event event, sd_bus_message* message = nullptr) {
         if (events.size() >= 256) throw std::length_error("D-Bus event queue exceeds 256 entries");
+        if (event.path.size() > 16384) throw std::length_error("D-Bus path exceeds 16 KiB");
+        std::size_t bytes = event.path.size() + event.interface.size() + event.member.size();
         if (message) {
             const char* sender = sd_bus_message_get_sender(message);
             event.sender = sender ? sender : "";
+            bytes += event.sender.size();
             if (const auto* error = sd_bus_message_get_error(message)) {
                 event.error_name = error->name;
                 const char* detail = error->message ? error->message : error->name;
                 event.error.assign(detail, ::strnlen(detail, 16384));
-                event_bytes += event.error.size() + event.error_name.size();
+                bytes += event.error.size() + event.error_name.size();
             } else {
                 BodyBudget budget;
                 while (!check(sd_bus_message_at_end(message, false))) event.arguments.push_back(read_value(message, budget, 0));
-                event_bytes += budget.bytes + budget.nodes * sizeof(Value);
+                bytes += budget.bytes + budget.nodes * sizeof(Value);
             }
         }
-        if (event.path.size() > 16384) throw std::length_error("D-Bus path exceeds 16 KiB");
-        event_bytes += event.path.size() + event.interface.size() + event.member.size() + event.sender.size();
-        if (event_bytes > 16 * 1024 * 1024) throw std::length_error("D-Bus event queue exceeds 16 MiB");
+        if (bytes > 16 * 1024 * 1024 - event_bytes) throw std::length_error("D-Bus event queue exceeds 16 MiB");
         events.push_back(std::move(event));
+        event_bytes += bytes;
     }
     void disconnect() noexcept {
         incoming.clear(); pending.clear(); subscriptions.clear(); exports.clear();

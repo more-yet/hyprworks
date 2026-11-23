@@ -329,7 +329,7 @@ void prepare_gui(Gui& gui, WaitSet& wait) {
     gui.wait_offset = wait.append({wl_display_get_fd(gui.display), POLLIN, 0});
     gui.transfer_wait_count = gui.transfers.size();
     for (const auto& transfer : gui.transfers) {
-        wait.fds.push_back({transfer.fd, static_cast<short>(transfer.writing ? POLLOUT : POLLIN), 0});
+        wait.fds.push_back({transfer.fd, static_cast<short>(transfer.source ? POLLOUT : POLLIN), 0});
         wait.due(transfer.fd < 0 ? Clock::time_point::min() : transfer.deadline);
     }
     if (gui.event_count || gui.outputs_pending || gui.focus_pending) wait.due(Clock::time_point::min());
@@ -392,7 +392,7 @@ int dispatch_gui(Gui& gui) {
     for (auto& surface : gui.surfaces) {
         if (!surface || surface->closed || !std::exchange(surface->grab_pending, false)) continue;
         const auto generation = surface->grab_generation;
-        if (notify(gui, surface->id, -1, surface->on_grab_cleared) < 0) return -1;
+        if (notify_surface(*surface, surface->on_grab_cleared, generation) < 0) return -1;
         if (!surface->closed && !surface->grab && surface->grab_generation == generation && surface->dismiss_grab_cleared)
             request_surface_close(*surface, "grab_cleared");
     }
@@ -400,15 +400,15 @@ int dispatch_gui(Gui& gui) {
         if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
     if (gui.windows && deliver_observer(state.lua, *gui.windows) < 0) return -1;
     if (dispatch_captures(gui) < 0) return -1;
-    if (std::exchange(gui.outputs_pending, false) && notify(gui, 0, -1, gui.on_outputs) < 0) return -1;
+    if (std::exchange(gui.outputs_pending, false) && gui.on_outputs >= 0 && !state.requests.load(std::memory_order_relaxed) &&
+        call_no_args(state.lua, gui.on_outputs) < 0) return -1;
     if (dispatch_input(gui) < 0) return -1;
     for (auto& surface : gui.surfaces)
         if (surface && surface->close_pending && dispatch_close(*surface) < 0) return -1;
     for (auto& surface : gui.surfaces) {
         if (!surface || surface->closed) continue;
-        const auto id = surface->id;
         if (surface->configured && std::exchange(surface->configure_pending, false) &&
-            notify(gui, id, -1, surface->on_configure) < 0) return -1;
+            notify_surface(*surface, surface->on_configure) < 0) return -1;
         if (surface->closed) continue;
         const auto revision = surface->revision;
         layout(*surface);
@@ -427,8 +427,7 @@ int dispatch_gui(Gui& gui) {
             if (element.image && !element.image->submitted) gui.images.submit(element.image);
             if (!element.image || element.image_notified || !element.image->ready.load(std::memory_order_acquire)) continue;
             element.image_notified = true; invalidate_element(*surface, index, true);
-            const auto image = element.image;
-            if (notify(gui, id, index, element.callback, "loaded", &image->error) < 0) return -1;
+            if (notify_element(*surface, index, "loaded", element.image) < 0) return -1;
         }
     }
     for (auto& surface : gui.surfaces)
@@ -437,9 +436,8 @@ int dispatch_gui(Gui& gui) {
     for (auto& surface : gui.surfaces) {
         if (!surface || surface->closed || surface->close_pending) continue;
         const auto current = surface_focus(*surface);
-        if (surface->on_focus_change < 0) surface->reported_focus = current;
-        else if (current != surface->reported_focus &&
-            notify(gui, surface->id, -1, surface->on_focus_change) < 0) return -1;
+        if (current != std::exchange(surface->reported_focus, current) &&
+            notify_surface(*surface, surface->on_focus_change) < 0) return -1;
     }
     for (auto& seat : gui.seats) update_ime(*seat);
     for (auto& surface : gui.surfaces) if (surface && surface->closed) destroy_surface(*surface);

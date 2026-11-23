@@ -11,6 +11,10 @@
 #include <fcntl.h>
 #include <linux/close_range.h>
 #include <spawn.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <pthread.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/random.h>
@@ -59,6 +63,21 @@ void valid_path(const std::string& path) {
     if (path.empty() || path.size() > 16384 || path.contains('\0')) throw std::runtime_error("invalid file path");
 }
 
+std::string executable_path(const std::string& program, const std::string& directory, const char* path) {
+    if (program.contains('/')) return program;
+    const auto base = std::filesystem::absolute(directory.empty() ? "." : directory);
+    std::string_view search(path ? path : "/bin:/usr/bin");
+    for (;;) {
+        const auto colon = search.find(':');
+        const auto candidate = base / search.substr(0, colon) / program;
+        struct stat status{};
+        if (stat(candidate.c_str(), &status) == 0 && S_ISREG(status.st_mode) && access(candidate.c_str(), X_OK) == 0)
+            return candidate.string();
+        if (colon == search.npos) throw std::runtime_error("executable not found in PATH: " + program);
+        search.remove_prefix(colon + 1);
+    }
+}
+
 }
 
 std::expected<void, std::string> Timer::start(std::chrono::milliseconds delay, bool repeat) {
@@ -86,18 +105,29 @@ std::uint64_t Timer::dispatch(Clock::time_point now) noexcept {
 
 struct Process::State {
     pid_t pid = -1;
-    int pidfd = -1, output = -1, error = -1;
+    int pidfd = -1, output = -1, error = -1, input = -1;
     std::uint64_t generation = 0;
     std::size_t limit = 0;
     Clock::time_point deadline{};
     ProcessResult pending;
     std::optional<ProcessResult> result;
     bool exited = false;
+    bool terminal = false, eof = true;
+    std::size_t input_limit = 0, sent = 0;
+    std::string queue;
+
+    void end_input() noexcept {
+        pending.stdin_discarded += queue.size() - sent;
+        close_fd(input); queue.clear(); sent = 0; eof = true;
+    }
 
     void finish(ProcessOutcome outcome) noexcept {
         if (pid < 0) return;
         // The unreaped leader reserves the process-group ID through cancellation.
         ::kill(-pid, SIGKILL);
+        if (!exited) ::kill(pid, SIGKILL);
+        end_input();
+        close_fd(output); close_fd(error);
         int status = 0;
         pid_t waited;
         do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
@@ -109,7 +139,7 @@ struct Process::State {
         if (outcome == ProcessOutcome::exited && pending.signal) pending.outcome = ProcessOutcome::signalled;
         result = std::move(pending);
         pid = -1;
-        close_fd(pidfd); close_fd(output); close_fd(error);
+        close_fd(pidfd);
         ++generation;
     }
 };
@@ -120,47 +150,110 @@ Process::~Process() { cancel(); }
 std::expected<void, std::string> Process::start(std::span<const std::string> arguments, const ProcessOptions& options) {
     auto& state = *state_;
     if (state.pid >= 0) return std::unexpected("process is already running");
-    int out[2]{-1, -1}, err[2]{-1, -1};
+    int in[2]{-1, -1}, out[2]{-1, -1}, err[2]{-1, -1};
     posix_spawn_file_actions_t actions{};
     posix_spawnattr_t attributes{};
     bool have_actions = false, have_attributes = false;
     try {
         const auto argv = argv_for(arguments, options.directory);
-        if (options.timeout.count() <= 0 || options.timeout > std::chrono::hours(24) || options.output_limit > 16 * 1024 * 1024)
-            throw std::runtime_error("process timeout must be 1 ms..24 h and output limit at most 16 MiB per stream");
-        check(pipe2(out, O_CLOEXEC), "stdout pipe"); check(pipe2(err, O_CLOEXEC), "stderr pipe");
-        for (auto* fd : {&out[0], &out[1], &err[0], &err[1]}) private_fd(*fd);
-        check(fcntl(out[0], F_SETFL, O_NONBLOCK), "nonblocking stdout"); check(fcntl(err[0], F_SETFL, O_NONBLOCK), "nonblocking stderr");
+        if (options.timeout.count() <= 0 || options.timeout > std::chrono::hours(24) || options.output_limit > 16 * 1024 * 1024 ||
+            !options.input_limit || options.input_limit > 1024 * 1024)
+            throw std::runtime_error("invalid process timeout or stream limit");
+        std::vector<std::string> overrides;
+        std::vector<char*> environment;
+        const char* search_path = getenv("PATH");
+        if (!options.environment.empty()) {
+            if (options.environment.size() > 128) throw std::runtime_error("environment exceeds 128 overrides");
+            std::size_t size = 0;
+            for (const auto& [name, value] : options.environment) {
+                if (name.empty() || name.size() > 255 || name.contains('=') || name.contains('\0') ||
+                    value.size() > 65536 || value.contains('\0') || (size += name.size() + value.size() + 2) > 1024 * 1024)
+                    throw std::runtime_error("invalid process environment");
+                if (name == "PATH") search_path = value.c_str();
+                if (std::ranges::any_of(overrides, [&](const std::string& entry) {
+                    return std::string_view(entry).substr(0, entry.find('=')) == name;
+                })) throw std::runtime_error("duplicate process environment override");
+                overrides.push_back(name + "=" + value);
+            }
+            for (char** variable = environ; *variable; ++variable) {
+                const std::string_view entry(*variable);
+                if (!std::ranges::any_of(options.environment, [&](const auto& pair) { return entry.substr(0, entry.find('=')) == pair.first; }))
+                    environment.push_back(*variable);
+            }
+            for (auto& entry : overrides) environment.push_back(entry.data());
+            environment.push_back(nullptr);
+        }
+        const auto executable = executable_path(arguments[0], options.directory, search_path);
         spawn_check(posix_spawn_file_actions_init(&actions)); have_actions = true;
         spawn_check(posix_spawnattr_init(&attributes)); have_attributes = true;
-        spawn_check(posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0));
-        spawn_check(posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO));
-        spawn_check(posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO));
         if (!options.directory.empty()) spawn_check(posix_spawn_file_actions_addchdir_np(&actions, options.directory.c_str()));
+        if (options.terminal) {
+            if (!options.terminal->rows || !options.terminal->columns) throw std::runtime_error("terminal dimensions must be positive");
+            out[0] = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK); check(out[0], "open PTY master");
+            private_fd(out[0]);
+            check(grantpt(out[0]), "grant PTY"); check(unlockpt(out[0]), "unlock PTY");
+            char slave[128]; spawn_check(ptsname_r(out[0], slave, sizeof(slave)));
+            termios settings{};
+            check(tcgetattr(out[0], &settings), "read terminal settings");
+            if (options.terminal->raw) cfmakeraw(&settings);
+            if (options.terminal->echo) settings.c_lflag |= ECHO; else settings.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+            check(tcsetattr(out[0], TCSANOW, &settings), "set terminal settings");
+            const winsize size{options.terminal->rows, options.terminal->columns, 0, 0};
+            check(ioctl(out[0], TIOCSWINSZ, &size), "set terminal size");
+            // POSIX_SPAWN_SETSID runs before file actions. Opening the slave makes it the controlling terminal.
+            spawn_check(posix_spawn_file_actions_addopen(&actions, 0, slave, O_RDWR, 0));
+            spawn_check(posix_spawn_file_actions_adddup2(&actions, 0, 1));
+            spawn_check(posix_spawn_file_actions_adddup2(&actions, 0, 2));
+        } else {
+            const auto stream = [&](int (&pipe)[2], const std::string& path, int target) {
+                if (!path.empty()) {
+                    valid_path(path);
+                    spawn_check(posix_spawn_file_actions_addopen(&actions, target, path.c_str(),
+                        target ? O_WRONLY | O_CREAT | O_EXCL : O_RDONLY | O_NOCTTY | O_NONBLOCK | O_NOFOLLOW, 0600));
+                    return;
+                }
+                check(pipe2(pipe, O_CLOEXEC), "create process pipe");
+                private_fd(pipe[0]); private_fd(pipe[1]);
+                const auto child_end = target == STDIN_FILENO ? 0 : 1;
+                check(fcntl(pipe[1 - child_end], F_SETFL, O_NONBLOCK), "set process pipe nonblocking");
+                spawn_check(posix_spawn_file_actions_adddup2(&actions, pipe[child_end], target));
+            };
+            stream(in, options.stdin_file, 0); stream(out, options.stdout_file, 1); stream(err, options.stderr_file, 2);
+        }
         spawn_check(posix_spawn_file_actions_addclosefrom_np(&actions, 3));
         sigset_t empty, defaults;
         sigemptyset(&empty); sigfillset(&defaults);
         spawn_check(posix_spawnattr_setsigmask(&attributes, &empty));
         spawn_check(posix_spawnattr_setsigdefault(&attributes, &defaults));
         spawn_check(posix_spawnattr_setpgroup(&attributes, 0));
-        spawn_check(posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF));
-        state.pending = {}; state.result.reset(); state.exited = false;
+        spawn_check(posix_spawnattr_setflags(&attributes, (options.terminal ? POSIX_SPAWN_SETSID : POSIX_SPAWN_SETPGROUP) | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF));
         pid_t child = -1;
-        spawn_check(posix_spawnp(&child, argv[0], &actions, &attributes, argv.data(), environ));
+        char* const* env = environment.empty() ? environ : environment.data();
+        spawn_check(posix_spawn(&child, executable.c_str(), &actions, &attributes, argv.data(), env));
+        const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, child, 0));
+        if (pidfd < 0) {
+            const int error = errno;
+            ::kill(-child, SIGKILL); ::kill(child, SIGKILL);
+            while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
+            throw std::system_error(error, std::generic_category(), "process pidfd");
+        }
+        state.pending = {}; state.result.reset(); state.exited = false;
+        state.terminal = options.terminal.has_value();
+        state.eof = !state.terminal && in[1] < 0;
+        state.input_limit = options.input_limit;
         state.pid = child;
+        state.input = std::exchange(in[1], -1);
         state.output = std::exchange(out[0], -1); state.error = std::exchange(err[0], -1);
-        state.pidfd = static_cast<int>(syscall(SYS_pidfd_open, state.pid, 0));
-        check(state.pidfd, "process pidfd");
+        state.pidfd = pidfd;
         state.limit = options.output_limit; state.deadline = Clock::now() + options.timeout;
         ++state.generation;
         posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attributes);
-        close_fd(out[1]); close_fd(err[1]);
+        close_fd(in[0]); close_fd(out[1]); close_fd(err[1]);
         return {};
     } catch (const std::exception& error) {
         if (have_actions) posix_spawn_file_actions_destroy(&actions);
         if (have_attributes) posix_spawnattr_destroy(&attributes);
-        close_fd(out[0]); close_fd(out[1]); close_fd(err[0]); close_fd(err[1]);
-        if (state.pid >= 0) state.finish(ProcessOutcome::failed);
+        close_fd(in[0]); close_fd(in[1]); close_fd(out[0]); close_fd(out[1]); close_fd(err[0]); close_fd(err[1]);
         return std::unexpected(error.what());
     }
 }
@@ -169,12 +262,67 @@ void Process::cancel() noexcept { state_->finish(ProcessOutcome::cancelled); }
 bool Process::running() const noexcept { return state_->pid >= 0; }
 const std::optional<ProcessResult>& Process::result() const noexcept { return state_->result; }
 
+std::string_view Process::output(bool stderr_stream) const noexcept {
+    const auto& r = state_->result ? *state_->result : state_->pending;
+    return stderr_stream ? r.stderr_text : r.stdout_text;
+}
+
+std::size_t Process::queued() const noexcept { return state_->queue.size() - state_->sent; }
+std::size_t Process::input_discarded() const noexcept {
+    return state_->result ? state_->result->stdin_discarded : state_->pending.stdin_discarded;
+}
+
+std::expected<std::size_t, std::string> Process::write(std::string_view data) {
+    auto& s = *state_;
+    if (s.eof) return std::unexpected("process input is closed");
+    const auto accepted = std::min(data.size(), s.input_limit - queued());
+    if (!accepted) return 0;
+    if (accepted > s.input_limit - s.queue.size()) { s.queue.erase(0, s.sent); s.sent = 0; }
+    s.queue.append(data.substr(0, accepted));
+    ++s.generation;
+    return accepted;
+}
+
+std::expected<void, std::string> Process::close_input() {
+    auto& s = *state_;
+    if (s.terminal) return std::unexpected("a PTY is bidirectional; send the terminal EOF character or a signal");
+    s.eof = true;
+    if (!queued()) s.end_input();
+    ++s.generation;
+    return {};
+}
+
+std::expected<void, std::string> Process::resize(unsigned short rows, unsigned short columns) {
+    if (!state_->terminal || state_->output < 0 || !rows || !columns) return std::unexpected("resize requires an active PTY and positive dimensions");
+    const winsize size{rows, columns, 0, 0};
+    if (ioctl(state_->output, TIOCSWINSZ, &size) < 0) return std::unexpected(std::strerror(errno));
+    return {};
+}
+
+std::expected<void, std::string> Process::hangup() {
+    if (!state_->terminal || state_->output < 0) return std::unexpected("hangup requires an active PTY");
+    state_->end_input();
+    close_fd(state_->output);
+    ++state_->generation;
+    return {};
+}
+
+std::expected<void, std::string> Process::signal(int number) {
+    if (!running() || number <= 0 || number >= NSIG) return std::unexpected("signal requires an active process and valid signal");
+    const auto group = state_->terminal && state_->output >= 0 ? tcgetpgrp(state_->output) : state_->pid;
+    if (!group) return std::unexpected("terminal has no foreground process group");
+    if (group < 0 || kill(-group, number) < 0) return std::unexpected(std::strerror(errno));
+    return {};
+}
+
 ProcessWait Process::prepare_wait() {
     auto& state = *state_;
     ProcessWait wait;
     wait.generation = ++state.generation;
     if (state.pid < 0) return wait;
-    wait.fds = {{{state.output, POLLIN, 0}, {state.error, POLLIN, 0}, {state.exited ? -1 : state.pidfd, POLLIN, 0}}};
+    wait.fds = {{{state.output, POLLIN, 0}, {state.error, POLLIN, 0}, {state.exited ? -1 : state.pidfd, POLLIN, 0},
+        {queued() ? state.input : -1, POLLOUT, 0}}};
+    if (state.terminal && queued()) wait.fds[0].events |= POLLOUT;
     wait.deadline = state.deadline;
     return wait;
 }
@@ -182,23 +330,37 @@ ProcessWait Process::prepare_wait() {
 bool Process::dispatch(const ProcessWait& ready) {
     auto& state = *state_;
     if (ready.generation != state.generation || ready.fds[0].fd != state.output || ready.fds[1].fd != state.error ||
-        ready.fds[2].fd != (state.exited ? -1 : state.pidfd)) return false;
+        ready.fds[2].fd != (state.exited ? -1 : state.pidfd) || ready.fds[3].fd != (queued() ? state.input : -1)) return false;
     ++state.generation;
     if (state.pid < 0) return false;
     try {
+        const auto& writer = ready.fds[state.terminal ? 0 : 3];
+        if (queued() && (writer.revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL))) {
+            const auto count = write_pipe(writer.fd, state.queue.data() + state.sent, std::min<std::size_t>(queued(), 65536));
+            if (count < 0 && (errno == EPIPE || (state.terminal && errno == EIO))) state.end_input();
+            else if (count < 0 && errno != EAGAIN && errno != EINTR) check(-1, "write process input");
+            else if (count > 0) {
+                state.sent += static_cast<std::size_t>(count);
+                if (!queued()) { state.queue.clear(); state.sent = 0; if (state.eof) state.end_input(); }
+            }
+        }
         for (unsigned stream = 0; stream < 2; ++stream) {
             int& fd = stream == 0 ? state.output : state.error;
             auto& text = stream == 0 ? state.pending.stdout_text : state.pending.stderr_text;
-            if (fd < 0 || !ready.fds[stream].revents) continue;
+            if (!(ready.fds[stream].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) || fd < 0) continue;
             for (unsigned reads = 0; reads < 4; ++reads) {
                 char buffer[16384];
                 const auto size = ::read(fd, buffer, sizeof(buffer));
+                if (size == 0 || (size < 0 && state.terminal && errno == EIO)) {
+                    close_fd(fd);
+                    if (state.terminal) state.end_input();
+                    break;
+                }
                 if (size < 0) {
                     if (errno == EINTR) continue;
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                     check(-1, "read process output");
                 }
-                if (!size) { close_fd(fd); break; }
                 const auto count = static_cast<std::size_t>(size);
                 const auto accepted = std::min(count, state.limit - text.size());
                 text.append(buffer, accepted);
@@ -222,26 +384,7 @@ std::expected<void, std::string> launch(std::span<const std::string> arguments, 
     int report[2]{-1, -1}, nullfd = -1;
     try {
         const auto argv = argv_for(arguments, directory);
-        std::string executable = arguments[0];
-        if (!executable.contains('/')) {
-            const auto base = directory.empty() ? std::filesystem::current_path() : std::filesystem::absolute(directory);
-            const char* env_path = std::getenv("PATH");
-            if (!env_path) throw std::runtime_error("PATH is unset; supply an executable path");
-            const std::string_view search(env_path);
-            bool found = false;
-            for (std::size_t begin = 0; begin <= search.size();) {
-                const auto end = search.find(':', begin);
-                const auto part = search.substr(begin, end == std::string::npos ? end : end - begin);
-                auto candidate = (base / part / executable).string();
-                struct stat status{};
-                if (stat(candidate.c_str(), &status) == 0 && S_ISREG(status.st_mode) && access(candidate.c_str(), X_OK) == 0) {
-                    executable = std::move(candidate); found = true; break;
-                }
-                if (end == std::string::npos) break;
-                begin = end + 1;
-            }
-            if (!found) throw std::runtime_error("application executable was not found in PATH");
-        }
+        const auto executable = executable_path(arguments[0], directory, getenv("PATH"));
         nullfd = open("/dev/null", O_RDWR | O_CLOEXEC); check(nullfd, "open /dev/null");
         check(pipe2(report, O_CLOEXEC), "launch result pipe");
         for (auto* fd : {&nullfd, &report[0], &report[1]}) private_fd(*fd);
@@ -303,46 +446,128 @@ std::expected<std::string, std::string> read_file(const std::string& path, std::
     } catch (const std::exception& error) { close_fd(fd); return std::unexpected(error.what()); }
 }
 
-std::expected<void, std::string> write_file(const std::string& path, const std::string& contents) {
-    int fd = -1, parent = -1;
-    std::string temporary;
-    bool created = false, renamed = false;
+ssize_t write_pipe(int fd, const char* data, std::size_t size) {
+    sigset_t block, previous, pending;
+    sigemptyset(&block); sigaddset(&block, SIGPIPE);
+    const int error = pthread_sigmask(SIG_BLOCK, &block, &previous);
+    if (error) { errno = error; return -1; }
+    sigpending(&pending); const bool existed = sigismember(&pending, SIGPIPE);
+    const auto result = write(fd, data, size); const int saved = errno;
+    if (result < 0 && saved == EPIPE && !existed) {
+        timespec timeout{};
+        while (sigtimedwait(&block, nullptr, &timeout) < 0 && errno == EINTR) {}
+    }
+    pthread_sigmask(SIG_SETMASK, &previous, nullptr); errno = saved; return result;
+}
+
+FileWriter::FileWriter(const std::string& path) {
+    valid_path(path);
+    const auto target = std::filesystem::absolute(path);
+    destination_ = target.filename().string();
+    parent_ = open(target.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(parent_, "open destination directory");
     try {
-        valid_path(path);
-        if (contents.size() > 16 * 1024 * 1024) throw std::runtime_error("file write exceeds 16 MiB");
-        const auto destination = std::filesystem::absolute(path);
-        parent = open(destination.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC); check(parent, "open destination directory");
         for (unsigned attempt = 0; attempt < 16; ++attempt) {
             std::uint64_t random;
-            const auto received = getrandom(&random, sizeof(random), 0);
-            if (received < 0 && errno == EINTR) continue;
-            check(static_cast<int>(received), "temporary filename randomness");
-            if (received != sizeof(random)) throw std::runtime_error("incomplete temporary filename randomness");
-            temporary = ".hyprworks-" + std::to_string(random);
-            fd = openat(parent, temporary.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-            if (fd >= 0) { created = true; break; }
+            const auto count = getrandom(&random, sizeof(random), 0);
+            if (count < 0 && errno == EINTR) continue;
+            check(static_cast<int>(count), "temporary filename randomness");
+            if (count != sizeof(random)) throw std::runtime_error("incomplete temporary filename randomness");
+            temporary_ = ".hyprworks-" + std::to_string(random);
+            fd_ = openat(parent_, temporary_.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+            if (fd_ >= 0) return;
             if (errno != EEXIST) check(-1, "create temporary file");
         }
-        if (!created) throw std::runtime_error("temporary filename attempts exhausted");
-        std::size_t written = 0;
-        while (written < contents.size()) {
-            const auto count = ::write(fd, contents.data() + written, contents.size() - written);
-            if (count < 0 && errno == EINTR) continue;
-            check(static_cast<int>(count), "write file");
-            if (!count) throw std::runtime_error("file write made no progress");
-            written += static_cast<std::size_t>(count);
-        }
-        check(fsync(fd), "sync file");
-        close_fd(fd);
-        check(renameat(parent, temporary.c_str(), parent, destination.filename().c_str()), "replace file"); renamed = true;
-        check(fsync(parent), "sync destination directory");
-        close_fd(parent); return {};
-    } catch (const std::exception& error) {
-        close_fd(fd);
-        if (created && !renamed) unlinkat(parent, temporary.c_str(), 0);
-        close_fd(parent);
-        return std::unexpected(std::string(renamed ? "file replaced, durability uncertain: " : "") + error.what());
+        throw std::runtime_error("temporary filename attempts exhausted");
+    } catch (...) { close_fd(parent_); throw; }
+}
+
+FileWriter::~FileWriter() {
+    if (fd_ >= 0) unlinkat(parent_, temporary_.c_str(), 0);
+    close_fd(fd_); close_fd(parent_);
+}
+
+void FileWriter::append(std::string_view bytes) {
+    while (!bytes.empty()) {
+        const auto count = ::write(fd_, bytes.data(), bytes.size());
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) check(-1, "write temporary file");
+        if (!count) throw std::runtime_error("file write made no progress");
+        bytes.remove_prefix(static_cast<std::size_t>(count));
     }
+}
+
+void FileWriter::commit(bool replace) {
+    check(fsync(fd_), "sync file");
+    check(renameat2(parent_, temporary_.c_str(), parent_, destination_.c_str(), replace ? 0u : RENAME_NOREPLACE), "publish destination");
+    close_fd(fd_);
+    check(fsync(parent_), "file published, durability uncertain");
+}
+
+std::expected<void, std::string> write_file(const std::string& path, std::string_view contents, bool replace) {
+    try {
+        if (contents.size() > 16 * 1024 * 1024) throw std::runtime_error("file write exceeds 16 MiB");
+        FileWriter file(path); file.append(contents); file.commit(replace); return {};
+    } catch (const std::exception& e) { return std::unexpected(e.what()); }
+}
+
+std::expected<void, std::string> copy_file(const std::string& source, const std::string& destination, std::size_t limit) {
+    int fd = -1;
+    try {
+        valid_path(source);
+        fd = open(source.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC); check(fd, "open copy source");
+        struct stat st{}; check(fstat(fd, &st), "stat copy source");
+        if (!S_ISREG(st.st_mode)) throw std::runtime_error("copy source must be a regular file");
+        FileWriter file(destination);
+        for (;;) {
+            char data[65536]; const auto n = read(fd, data, sizeof(data));
+            if (n < 0 && errno == EINTR) continue;
+            check(static_cast<int>(n), "read copy source");
+            if (!n) break;
+            const auto size = static_cast<std::size_t>(n);
+            if (size > limit) throw std::runtime_error("copy limit exceeded");
+            file.append({data, size}); limit -= size;
+        }
+        close_fd(fd); file.commit(false); return {};
+    } catch (const std::exception& e) { close_fd(fd); return std::unexpected(e.what()); }
+}
+
+std::expected<std::string, std::string> temporary(const std::string& parent, bool directory) {
+    try {
+        valid_path(parent);
+        auto path = (std::filesystem::absolute(parent) / "hyprworks-XXXXXX").string();
+        if (directory) { if (!mkdtemp(path.data())) check(-1, "create temporary directory"); }
+        else { const int fd = mkostemp(path.data(), O_CLOEXEC); check(fd, "create temporary file"); close(fd); }
+        return path;
+    } catch (const std::exception& e) { return std::unexpected(e.what()); }
+}
+
+std::expected<void, std::string> make_directory(const std::string& path) {
+    try {
+        valid_path(path);
+        if (mkdir(path.c_str(), 0700) < 0) {
+            if (errno != EEXIST) check(-1, "create directory");
+            const int fd = open(path.c_str(), O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_PATH);
+            check(fd, "open existing directory"); close(fd);
+        }
+        return {};
+    } catch (const std::exception& e) { return std::unexpected(e.what()); }
+}
+
+FileLock::~FileLock() { release(); }
+void FileLock::release() noexcept { close_fd(fd_); }
+
+std::expected<void, std::string> FileLock::acquire(const std::string& path) {
+    if (fd_ >= 0) return std::unexpected("lock already held");
+    int fd = -1;
+    try {
+        valid_path(path);
+        fd = open(path.c_str(), O_CREAT | O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW, 0600); check(fd, "open lock file");
+        struct stat st{}; check(fstat(fd, &st), "stat lock file");
+        if (!S_ISREG(st.st_mode)) throw std::runtime_error("lock requires a regular file");
+        check(flock(fd, LOCK_EX | LOCK_NB), "acquire lock");
+        fd_ = fd; return {};
+    } catch (const std::exception& e) { close_fd(fd); return std::unexpected(e.what()); }
 }
 
 FileWatch::~FileWatch() { stop(); }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "images.hpp"
+#include <hyprworks/host.hpp>
 #include "windows.hpp"
 #include <lua.hpp>
 #include <array>
@@ -159,7 +160,19 @@ struct Output {
 
 struct Offer {
     wl_data_offer* native = nullptr;
-    const char* mime = nullptr;
+    std::vector<std::string> types;
+    Gui* gui = nullptr;
+};
+
+struct ClipboardPayload {
+    std::string data;
+    int file = -1;
+    std::size_t size = 0;
+    ~ClipboardPayload();
+};
+struct ClipboardFormat {
+    std::string mime;
+    std::shared_ptr<ClipboardPayload> payload;
 };
 
 struct Seat {
@@ -173,7 +186,7 @@ struct Seat {
     zwp_text_input_v3* ime = nullptr;
     wl_data_device* data_device = nullptr;
     wl_data_source* source = nullptr;
-    std::string clipboard;
+    std::vector<ClipboardFormat> clipboard;
     std::vector<std::unique_ptr<Offer>> offers;
     Offer* selection = nullptr;
     xkb_keymap* keymap = nullptr;
@@ -210,9 +223,10 @@ struct Input {
 
 struct Transfer {
     int fd = -1, callback = -2;
-    bool writing = false;
+    std::shared_ptr<const ClipboardPayload> source;
+    std::unique_ptr<host::FileWriter> destination;
     std::string data, error;
-    std::size_t offset = 0;
+    std::size_t offset = 0, limit = 1024 * 1024;
     std::uint64_t surface = 0, revision = 0, edit_revision = 0;
     int element = -1;
     std::chrono::steady_clock::time_point deadline;
@@ -307,8 +321,8 @@ void destroy_surface(Surface& surface);
 void reposition_popup(Surface& surface);
 void initialize_popup(Surface& surface);
 void update_scale(Surface& surface);
-int notify(Gui& gui, std::uint64_t id, int element_index, int reference,
-    const char* kind = nullptr, const std::string* error = nullptr);
+int notify_surface(Surface& surface, int callback, std::optional<std::uint64_t> grab_generation = {});
+int notify_element(Surface& surface, int index, const char* kind, std::shared_ptr<Image> loaded = {});
 void register_surfaces(lua_State* lua);
 
 void layout(Surface& surface);
@@ -317,6 +331,7 @@ int layout_index(const Element& element, int index);
 PangoRectangle input_cursor(Element& element, bool focused);
 void render(Surface& surface);
 Box paint_buffer(Surface& surface, Buffer& buffer);
+wl_buffer* create_shm_buffer(wl_shm* shm, int width, int height, std::uint32_t format, void*& mapping);
 
 extern const wl_seat_listener seat_listener;
 extern const wl_keyboard_listener keyboard_listener;
@@ -328,8 +343,6 @@ int process_input(Surface& surface, Input& event);
 int dispatch_input(Gui& gui);
 int dispatch_scroll(Surface& surface);
 bool replace_text(Surface& surface, Element& element, int begin, int end, std::string_view inserted);
-void paste(Seat& seat, Surface* surface, int callback = -2);
-ssize_t write_pipe(int fd, const char* data, std::size_t size);
 void transfer_io(Transfer& transfer, short events);
 void register_input(lua_State* lua);
 

@@ -157,7 +157,7 @@ int dispatch_close(Surface& surface) {
     auto& gui = *surface.gui;
     for (auto& child : gui.surfaces)
         if (child && child->parent == surface.id && child->close_pending && dispatch_close(*child) < 0) return -1;
-    if (notify(gui, surface.id, -1, surface.on_close) < 0) return -1;
+    if (notify_surface(surface, surface.on_close) < 0) return -1;
     close_surface(surface);
     return 0;
 }
@@ -479,13 +479,15 @@ void read_properties(lua_State* lua, int table, ElementPatch& patch, Gui& gui, K
             luaL_checktype(lua, -1, LUA_TTABLE);
             patch.image = std::make_shared<Image>(gui.images);
             auto& image = *patch.image;
-            text_field(lua, -1, "path", image.path, 4096);
-            text_field(lua, -1, "icon", image.icon, 256);
-            field(lua, -1, "data");
-            const bool data = !lua_isnil(lua, -1);
-            if (int(!image.path.empty()) + int(!image.icon.empty()) + int(data) != 1)
-                luaL_error(lua, "image source requires exactly one of path, icon or data");
-            if (data) {
+            if (text_field(lua, -1, "path", image.path, 4096)) {
+                image.pixels = static_cast<int>(integer_field(lua, -1, "pixels", 0, 0, 4096));
+            } else if (text_field(lua, -1, "icon", image.icon, 256)) {
+                text_field(lua, -1, "theme", image.theme, 256);
+                if (image.theme.empty()) luaL_error(lua, "icon source requires a theme");
+                image.icon_size = static_cast<int>(integer_field(lua, -1, "pixels", std::nullopt, 1, 4096));
+                image.pixels = image.icon_size;
+            } else {
+                field(lua, -1, "data");
                 std::size_t length; const char* bytes = check_string(lua, -1, &length);
                 image.channels = static_cast<int>(integer_field(lua, -2, "channels", 0, 0, 4));
                 if (image.channels) {
@@ -494,16 +496,10 @@ void read_properties(lua_State* lua, int table, ElementPatch& patch, Gui& gui, K
                     image.height = static_cast<int>(integer_field(lua, -2, "height", std::nullopt, 1, 4096));
                     if (length != static_cast<std::size_t>(image.width * image.height * image.channels))
                         luaL_error(lua, "raw image dimensions do not match its data");
-                }
+                } else image.pixels = static_cast<int>(integer_field(lua, -2, "pixels", 0, 0, 4096));
                 image.set_data({bytes, length});
+                lua_pop(lua, 1);
             }
-            lua_pop(lua, 1);
-            if (!image.icon.empty()) {
-                text_field(lua, -1, "theme", image.theme, 256);
-                if (image.theme.empty()) luaL_error(lua, "icon source requires a theme");
-                image.icon_size = static_cast<int>(integer_field(lua, -1, "pixels", std::nullopt, 1, 4096));
-                image.pixels = image.icon_size;
-            } else if (!image.channels) image.pixels = static_cast<int>(integer_field(lua, -1, "pixels", 0, 0, 4096));
         }
         lua_pop(lua, 1);
     }
@@ -530,9 +526,14 @@ Damage apply_properties(Element& element, ElementPatch& patch, std::size_t& byte
     bytes = total;
     Damage damage = unchanged;
     if (edit || password != element.password) { ++element.edit_revision; element.preedit.clear(); }
-    for (auto& prop : patch.strings)
-        if (prop.member == &Element::font && prop.value != element.font && element.layout)
-            g_object_unref(std::exchange(element.layout, nullptr));
+    for (auto& prop : patch.strings) {
+        auto& current = element.*prop.member;
+        if (current == prop.value) continue;
+        if (prop.member == &Element::font && element.layout) g_object_unref(std::exchange(element.layout, nullptr));
+        current = std::move(prop.value);
+        damage = std::max(damage, prop.damage);
+    }
+    patch.strings.clear();
     const auto apply = [&](auto& changes) {
         for (auto& prop : changes) {
             auto& current = element.*prop.member;
@@ -540,7 +541,7 @@ Damage apply_properties(Element& element, ElementPatch& patch, std::size_t& byte
         }
         changes.clear();
     };
-    apply(patch.strings); apply(patch.numbers); apply(patch.flags); apply(patch.enums); apply(patch.colors);
+    apply(patch.numbers); apply(patch.flags); apply(patch.enums); apply(patch.colors);
     if (edit) element.cursor = element.anchor = static_cast<int>(element.text.size());
     if (patch.specified & scroll_specified) element.scroll_origin.reset();
     if (patch.callback >= 0) { unref(patch.lua, element.callback); element.callback = std::exchange(patch.callback, LUA_NOREF); }
@@ -608,11 +609,12 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
     const int delta = static_cast<int>(parsed.elements.size()) - (end - begin);
     if (static_cast<int>(old.size()) + delta > 2048) throw std::runtime_error("tree exceeds 2048 elements");
     std::vector<int> remap(old.size(), -1);
-    for (int i = 0; i < static_cast<int>(old.size()); ++i)
-        if (i < begin || i >= end) remap[static_cast<std::size_t>(i)] = i < begin ? i : i + delta;
     std::size_t bytes = parsed.bytes;
-    for (int i = 0; i < static_cast<int>(old.size()); ++i)
-        if (i < begin || i >= end) bytes += element_text_bytes(old[static_cast<std::size_t>(i)]);
+    for (int i = 0; i < static_cast<int>(old.size()); ++i) {
+        if (i >= begin && i < end) continue;
+        remap[static_cast<std::size_t>(i)] = i < begin ? i : i + delta;
+        bytes += element_text_bytes(old[static_cast<std::size_t>(i)]);
+    }
     if (bytes > max_content) throw std::runtime_error("content strings exceed 1 MiB");
     if (preserve) {
         for (std::size_t i = 0; i < parsed.elements.size(); ++i) {
@@ -702,14 +704,9 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
     if (!whole_tree) combined.reserve(static_cast<std::size_t>(count));
     const int previous_focus = surface.focused;
     int next_focus = previous_focus < 0 ? -1 : remap[static_cast<std::size_t>(previous_focus)];
-    const Element* next_editor = nullptr;
-    if (next_focus >= 0) {
-        next_editor = previous_focus >= begin && previous_focus < end ?
-            &parsed.elements[static_cast<std::size_t>(next_focus - begin)] : &old[static_cast<std::size_t>(previous_focus)];
-        if (!focusable(*next_editor)) next_focus = -1;
-    }
+    if (next_focus >= 0 && !focusable(next_element(next_focus))) next_focus = -1;
     const bool same_editor = next_focus >= 0 &&
-        next_editor->edit_revision == old[static_cast<std::size_t>(previous_focus)].edit_revision;
+        next_element(next_focus).edit_revision == old[static_cast<std::size_t>(previous_focus)].edit_revision;
     const auto remap_drag = [&](int index) {
         if (index < 0 || old[static_cast<std::size_t>(index)].kind != Kind::slider) return -1;
         const int mapped = remap[static_cast<std::size_t>(index)];
@@ -724,7 +721,7 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
                 next_element(target).horizontal != old[static_cast<std::size_t>(previous.target_index)].horizontal)
                 return -1;
         }
-        return next.kind == Kind::slider && next.enabled &&
+        return next.enabled &&
             next.horizontal == previous.horizontal && next.scroll_target == previous.scroll_target ? mapped : -1;
     };
     const int next_drag = remap_drag(surface.pressed);
@@ -1272,46 +1269,45 @@ void initialize_popup(Surface& surface) {
     wl_surface_commit(surface.native);
 }
 
-int notify(Gui& gui, std::uint64_t id, int element_index, int reference, const char* kind, const std::string* error) {
-    if (reference < 0 || gui.owner.requests.load(std::memory_order_relaxed)) return 0;
-    auto* surface = id ? find_surface(gui, id) : nullptr;
-    if (id && !surface) return 0;
-    const auto revision = surface ? surface->revision : 0;
-    const bool grab_cleared = surface && reference == surface->on_grab_cleared;
-    const bool focus_change = surface && reference == surface->on_focus_change;
-    const auto grab_generation = grab_cleared ? surface->grab_generation : 0;
-    std::string text, message = error ? *error : "";
-    double value = 0, scroll = 0;
-    bool scrolling = false;
-    if (surface && element_index >= 0) {
-        const auto& element = surface->elements[static_cast<std::size_t>(element_index)];
-        text = element.text; value = element.value; scroll = element.scroll;
-        scrolling = element.kind == Kind::scroll;
-    }
-    lua_pushcfunction(gui.owner.lua, traceback);
-    const int result = protected_call(gui.owner.lua, [&](lua_State* lua) {
-        lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-        if (id) push_handle(lua, {id, revision, element_index}, element_index < 0 ? surface_type : element_type);
-        if (element_index >= 0) {
-            lua_createtable(lua, 0, 4);
-            string_field(lua, "text", text); lua_pushnumber(lua, value); lua_setfield(lua, -2, "value");
-            if (scrolling) { lua_pushnumber(lua, scroll); lua_setfield(lua, -2, "scroll"); }
-            if (kind) { lua_pushstring(lua, kind); lua_setfield(lua, -2, "kind"); }
-            if (!message.empty()) string_field(lua, "error", message);
-        }
-        if (id) {
-            auto* live = find_surface(gui, id);
-            if (!live || (element_index >= 0 && (live->revision != revision ||
-                live->elements[static_cast<std::size_t>(element_index)].callback != reference))) return 0;
-            if (grab_cleared && live->grab_generation != grab_generation) return 0;
-            if (focus_change) {
-                const auto current = surface_focus(*live);
-                if (current == live->reported_focus) return 0;
-                live->reported_focus = current;
-            }
-        }
-        lua_call(lua, id ? (element_index >= 0 ? 2 : 1) : 0, 0); return 0;
+int notify_surface(Surface& surface, int callback, std::optional<std::uint64_t> grab_generation) {
+    auto& state = surface.gui->owner;
+    if (callback < 0 || surface.closed || state.requests.load(std::memory_order_relaxed)) return 0;
+    lua_pushcfunction(state.lua, traceback);
+    const int result = protected_call(state.lua, [&](lua_State* lua) {
+        lua_rawgeti(lua, LUA_REGISTRYINDEX, callback);
+        push_handle(lua, {surface.id, 0, -1}, surface_type);
+        if (surface.closed || state.requests.load(std::memory_order_relaxed)) return 0;
+        if (grab_generation && *grab_generation != surface.grab_generation) return 0;
+        lua_call(lua, 1, 0); return 0;
     }, 0, 1);
+    if (result >= 0) lua_settop(state.lua, 0);
+    return result;
+}
+
+int notify_element(Surface& surface, int index, const char* kind, std::shared_ptr<Image> loaded) {
+    auto& gui = *surface.gui;
+    const auto& element = surface.elements[static_cast<std::size_t>(index)];
+    const int reference = element.callback;
+    if (reference < 0 || gui.owner.requests.load(std::memory_order_relaxed)) return 0;
+    const auto revision = surface.revision;
+    const auto text = element.text;
+    const double value = element.value, scroll = element.scroll;
+    const bool scrolling = element.kind == Kind::scroll;
+    lua_pushcfunction(gui.owner.lua, traceback);
+    lua_rawgeti(gui.owner.lua, LUA_REGISTRYINDEX, reference);
+    const int result = protected_call(gui.owner.lua, [&](lua_State* lua) {
+        push_handle(lua, {surface.id, revision, index}, element_type);
+        lua_createtable(lua, 0, 5);
+        lua_pushstring(lua, kind); lua_setfield(lua, -2, "kind");
+        string_field(lua, "text", text); lua_pushnumber(lua, value); lua_setfield(lua, -2, "value");
+        if (gui.event_seat) { lua_pushinteger(lua, gui.event_seat->id); lua_setfield(lua, -2, "seat"); }
+        if (scrolling) { lua_pushnumber(lua, scroll); lua_setfield(lua, -2, "scroll"); }
+        if (loaded && !loaded->error.empty()) string_field(lua, "error", loaded->error);
+        if (surface.closed || surface.revision != revision || gui.owner.requests.load(std::memory_order_relaxed)) return 0;
+        const auto& live = surface.elements[static_cast<std::size_t>(index)];
+        if ((loaded && live.image != loaded) || !callback_matches(lua, live.callback, reference, 2)) return 0;
+        lua_call(lua, 2, 0); return 0;
+    }, 0, 1, 1);
     if (result >= 0) lua_settop(gui.owner.lua, 0);
     return result;
 }

@@ -102,15 +102,6 @@ int media_on_result(lua_State* lua) {
     return 0;
 }
 
-void push_media_result(lua_State* lua, const mpris::RequestResult& result) {
-    static const char* outcomes[] = {"acknowledged", "rejected", "failed", "cancelled"};
-    lua_createtable(lua, 0, 4);
-    identifier(lua, result.id); lua_setfield(lua, -2, "id");
-    lua_pushstring(lua, outcomes[static_cast<unsigned>(result.outcome)]); lua_setfield(lua, -2, "outcome");
-    lua_pushboolean(lua, result.may_have_executed); lua_setfield(lua, -2, "may_have_executed");
-    if (!result.error.empty()) string_field(lua, "error", result.error);
-}
-
 int media_refresh(lua_State* lua) {
     return operation_result(lua, media_handle(lua).connection.refresh());
 }
@@ -231,13 +222,9 @@ int media_close(lua_State* lua) {
     unref(lua, binding.on_change);
     unref(lua, binding.on_status);
     unref(lua, binding.on_result);
-    return protected_call(lua, [&](lua_State* lua) { if (result) push_media_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
+    return protected_call(lua, [&](lua_State* lua) { if (result) push_action_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
 }
 
-}
-
-int dispatch_media(lua_State* lua, MediaBinding& binding) {
-    return deliver_observer(lua, binding, push_media_result);
 }
 
 void register_mpris(lua_State* lua) {

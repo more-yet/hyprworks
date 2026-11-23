@@ -23,58 +23,34 @@ void read_properties(sd_bus_message* message, Snapshot& snapshot, Device* device
     while (check(sd_bus_message_enter_container(message, 'e', "sv")) > 0) {
         if (++count > 128)
             throw std::runtime_error("UPower property limit exceeded");
-        const char* name = nullptr;
-        require(sd_bus_message_read(message, "s", &name));
-        const std::string_view key(name);
-        bool* boolean = nullptr;
-        double* number = nullptr;
-        std::uint32_t* integer = nullptr;
-        std::int64_t* seconds = nullptr;
-        std::string* text = nullptr;
+        const auto key = dbus::enter_property(message);
         if (!device) {
-            if (key == "OnBattery") boolean = &snapshot.on_battery;
-            else if (key == "LidIsPresent") boolean = &snapshot.lid_present;
-            else if (key == "LidIsClosed") boolean = &snapshot.lid_closed;
-        } else {
-            if (key == "IsPresent") boolean = &device->present;
-            else if (key == "PowerSupply") boolean = &device->power_supply;
-            else if (key == "Online") boolean = &device->online;
-            else if (key == "IsRechargeable") boolean = &device->rechargeable;
-            else if (key == "Percentage") number = &device->percentage;
-            else if (key == "Capacity") number = &device->capacity;
-            else if (key == "Energy") number = &device->energy;
-            else if (key == "EnergyFull") number = &device->energy_full;
-            else if (key == "EnergyRate") number = &device->energy_rate;
-            else if (key == "Type") integer = &device->type;
-            else if (key == "State") integer = &device->state;
-            else if (key == "WarningLevel") integer = &device->warning_level;
-            else if (key == "BatteryLevel") integer = &device->battery_level;
-            else if (key == "TimeToEmpty") seconds = &device->time_to_empty;
-            else if (key == "TimeToFull") seconds = &device->time_to_full;
-            else if (key == "Vendor") text = &device->vendor;
-            else if (key == "Model") text = &device->model;
-            else if (key == "IconName") text = &device->icon_name;
-        }
-        if (!boolean && !number && !integer && !seconds && !text)
-            require(sd_bus_message_skip(message, "v"));
-        else {
-            require(sd_bus_message_enter_container(message, 'v', boolean ? "b" : number ? "d" : integer ? "u" : seconds ? "x" : "s"));
-            if (boolean) {
-                int value = 0;
-                require(sd_bus_message_read(message, "b", &value));
-                *boolean = value != 0;
-            } else if (number) {
-                require(sd_bus_message_read(message, "d", number));
-                if (!std::isfinite(*number) || (key == "Percentage" && (*number < 0 || *number > 100)))
-                    throw std::runtime_error("invalid UPower numeric property");
-            } else if (integer)
-                require(sd_bus_message_read(message, "u", integer));
-            else if (seconds)
-                require(sd_bus_message_read(message, "x", seconds));
-            else
-                *text = dbus::text(message, 's', bytes);
-            check(sd_bus_message_exit_container(message));
-        }
+            if (key == "OnBattery") snapshot.on_battery = dbus::boolean(message);
+            else if (key == "LidIsPresent") snapshot.lid_present = dbus::boolean(message);
+            else if (key == "LidIsClosed") snapshot.lid_closed = dbus::boolean(message);
+            else require(sd_bus_message_skip(message, nullptr));
+        } else if (key == "Percentage") {
+            device->percentage = dbus::finite_number(message);
+            if (device->percentage < 0 || device->percentage > 100) throw std::runtime_error("invalid UPower percentage");
+        } else if (key == "IsPresent") device->present = dbus::boolean(message);
+        else if (key == "PowerSupply") device->power_supply = dbus::boolean(message);
+        else if (key == "Online") device->online = dbus::boolean(message);
+        else if (key == "IsRechargeable") device->rechargeable = dbus::boolean(message);
+        else if (key == "Capacity") device->capacity = dbus::finite_number(message);
+        else if (key == "Energy") device->energy = dbus::finite_number(message);
+        else if (key == "EnergyFull") device->energy_full = dbus::finite_number(message);
+        else if (key == "EnergyRate") device->energy_rate = dbus::finite_number(message);
+        else if (key == "Type") require(sd_bus_message_read(message, "u", &device->type));
+        else if (key == "State") require(sd_bus_message_read(message, "u", &device->state));
+        else if (key == "WarningLevel") require(sd_bus_message_read(message, "u", &device->warning_level));
+        else if (key == "BatteryLevel") require(sd_bus_message_read(message, "u", &device->battery_level));
+        else if (key == "TimeToEmpty") require(sd_bus_message_read(message, "x", &device->time_to_empty));
+        else if (key == "TimeToFull") require(sd_bus_message_read(message, "x", &device->time_to_full));
+        else if (key == "Vendor") device->vendor = dbus::text(message, 's', bytes);
+        else if (key == "Model") device->model = dbus::text(message, 's', bytes);
+        else if (key == "IconName") device->icon_name = dbus::text(message, 's', bytes);
+        else require(sd_bus_message_skip(message, nullptr));
+        check(sd_bus_message_exit_container(message));
         check(sd_bus_message_exit_container(message));
     }
     check(sd_bus_message_exit_container(message));

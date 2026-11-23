@@ -107,7 +107,10 @@ int desktop_launch(lua_State* lua) {
     if (protected_call(lua, [&](lua_State* lua) {
         std::size_t length; const char* text = check_string(lua, 2, &length);
         luaL_argcheck(lua, length <= 65536, 2, "desktop id exceeds 64 KiB"); id.assign(text, length);
-        if (!lua_isnil(lua, 3)) {
+        if (!lua_isnil(lua, 4)) {
+            text = check_string(lua, 4, &length); luaL_argcheck(lua, length <= 65536, 4, "action id exceeds 64 KiB"); action.assign(text, length);
+        }
+        if (action.empty() && !lua_isnil(lua, 3)) {
             luaL_checktype(lua, 3, LUA_TTABLE); const auto count = lua_rawlen(lua, 3);
             luaL_argcheck(lua, count <= 256, 3, "expected at most 256 URIs"); std::size_t bytes = 0;
             for (std::size_t i = 0; i < count; ++i) {
@@ -115,9 +118,6 @@ int desktop_launch(lua_State* lua) {
                 luaL_argcheck(lua, length <= 65536 && (bytes += length) <= 1024 * 1024, 3, "URI budget exceeded");
                 uris.emplace_back(text, length); lua_pop(lua, 1);
             }
-        }
-        if (!lua_isnil(lua, 4)) {
-            text = check_string(lua, 4, &length); luaL_argcheck(lua, length <= 65536, 4, "action id exceeds 64 KiB"); action.assign(text, length);
         }
         return 0;
     }, 0, 0, 3) < 0) return -1;

@@ -1,4 +1,5 @@
 #pragma once
+#include <hyprworks/action.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -59,14 +60,6 @@ struct Status {
 };
 
 enum class Action { play, pause, play_pause, stop, next, previous, raise, quit };
-enum class Outcome { acknowledged, rejected, failed, cancelled };
-struct RequestResult {
-    std::uint64_t id = 0;
-    Outcome outcome = Outcome::cancelled;
-    bool may_have_executed = false;
-    std::string error;
-};
-
 struct WaitSet {
     pollfd fd{-1, 0, 0};
     std::optional<Clock::time_point> deadline;
@@ -77,7 +70,7 @@ private:
 
 struct Update {
     bool status_changed = false, snapshot_changed = false;
-    std::optional<RequestResult> result;
+    std::optional<ActionResult> result;
 };
 
 class MediaConnection {
@@ -88,7 +81,7 @@ public:
     MediaConnection& operator=(const MediaConnection&) = delete;
 
     std::expected<void, std::string> start(const std::string& address = {});
-    std::optional<RequestResult> stop() noexcept;
+    std::optional<ActionResult> stop() noexcept;
     std::expected<void, std::string> refresh();
     std::expected<std::uint64_t, std::string> action(const PlayerKey& player, Action action);
     std::expected<std::uint64_t, std::string> seek(const PlayerKey& player, std::int64_t offset);

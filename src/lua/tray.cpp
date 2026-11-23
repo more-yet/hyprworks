@@ -54,22 +54,6 @@ int menu_open(lua_State* lua) {
     return open_active(lua, slot, created, menu_metatable);
 }
 
-void push_tray_result(lua_State* lua, const tray::RequestResult& result) {
-    static const char* outcomes[] = {"acknowledged", "rejected", "failed", "cancelled"};
-    lua_createtable(lua, 0, 4); identifier(lua, result.id); lua_setfield(lua, -2, "id");
-    lua_pushstring(lua, outcomes[static_cast<unsigned>(result.outcome)]); lua_setfield(lua, -2, "outcome");
-    lua_pushboolean(lua, result.may_have_executed); lua_setfield(lua, -2, "may_have_executed");
-    if (!result.error.empty()) string_field(lua, "error", result.error);
-}
-
-void push_menu_result(lua_State* lua, const dbusmenu::RequestResult& result) {
-    static const char* outcomes[] = {"acknowledged", "rejected", "failed", "cancelled"};
-    lua_createtable(lua, 0, 4); identifier(lua, result.id); lua_setfield(lua, -2, "id");
-    lua_pushstring(lua, outcomes[static_cast<unsigned>(result.outcome)]); lua_setfield(lua, -2, "outcome");
-    lua_pushboolean(lua, result.may_have_executed); lua_setfield(lua, -2, "may_have_executed");
-    if (!result.error.empty()) string_field(lua, "error", result.error);
-}
-
 void push_tray_icon(lua_State* lua, const tray::Icon& icon) {
     lua_createtable(lua, 0, 2); string_field(lua, "name", icon.name);
     lua_createtable(lua, static_cast<int>(icon.pixmaps.size()), 0);
@@ -249,7 +233,7 @@ int tray_close(lua_State* lua) {
     auto result = binding.connection.stop(); if (binding.result) result = std::exchange(binding.result, {});
     binding.closed = true; ++binding.generation; binding.status_pending = binding.change_pending = false;
     for (auto* reference : {&binding.on_status, &binding.on_change, &binding.on_result}) unref(lua, *reference);
-    return protected_call(lua, [&](lua_State* lua) { if (result) push_tray_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
+    return protected_call(lua, [&](lua_State* lua) { if (result) push_action_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
 }
 
 int menu_close(lua_State* lua) {
@@ -258,7 +242,7 @@ int menu_close(lua_State* lua) {
     untrack(lua, invocation(lua).menus, binding); ++binding.generation; binding.status_pending = binding.change_pending = false;
     binding.activations.clear();
     for (auto* reference : {&binding.on_status, &binding.on_change, &binding.on_result, &binding.on_activation}) unref(lua, *reference);
-    return protected_call(lua, [&](lua_State* lua) { if (result) push_menu_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
+    return protected_call(lua, [&](lua_State* lua) { if (result) push_action_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
 }
 
 int tray_action(lua_State* lua) {
@@ -325,14 +309,10 @@ int menu_event(lua_State* lua) {
 
 }
 
-int dispatch_tray(lua_State* lua, TrayBinding& binding) {
-    return deliver_observer(lua, binding, push_tray_result);
-}
-
 int dispatch_menu(lua_State* lua, MenuBinding& binding) {
     const auto generation = binding.generation;
     const auto activations = std::exchange(binding.activations, {});
-    if (deliver_observer(lua, binding, push_menu_result) < 0) return -1;
+    if (deliver_observer(lua, binding, push_action_result) < 0) return -1;
     for (const auto& activation : activations) {
         if (dispatch_callback(lua, binding, binding.on_activation, generation, [&](lua_State* lua) {
             lua_createtable(lua, 0, 2); lua_pushinteger(lua, activation.id); lua_setfield(lua, -2, "id");

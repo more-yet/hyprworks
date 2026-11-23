@@ -42,36 +42,30 @@ void read_item(sd_bus_message* message, Item& item, std::size_t& bytes, std::siz
     unsigned count = 0;
     while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
         if (++count > 128) throw std::runtime_error("tray item exceeds 128 properties");
-        const auto key = dbus::text(message, 's', bytes);
-        std::string* text = nullptr;
-        std::vector<Pixmap>* pixmaps = nullptr;
-        if (key == "Id") text = &item.id;
-        else if (key == "Title") text = &item.title;
-        else if (key == "Category") text = &item.category;
-        else if (key == "Status") text = &item.status;
-        else if (key == "IconThemePath") text = &item.icon_theme_path;
-        else if (key == "Menu") text = &item.menu_path;
-        else if (key == "IconName") text = &item.icon.name;
-        else if (key == "AttentionIconName") text = &item.attention_icon.name;
-        else if (key == "OverlayIconName") text = &item.overlay_icon.name;
-        else if (key == "AttentionMovieName") text = &item.attention_movie;
-        else if (key == "IconPixmap") pixmaps = &item.icon.pixmaps;
-        else if (key == "AttentionIconPixmap") pixmaps = &item.attention_icon.pixmaps;
-        else if (key == "OverlayIconPixmap") pixmaps = &item.overlay_icon.pixmaps;
-        if (text || pixmaps || key == "ItemIsMenu" || key == "ToolTip") {
-            require(sd_bus_message_enter_container(message, 'v', text ? (key == "Menu" ? "o" : "s") : pixmaps ? "a(iiay)" : key == "ItemIsMenu" ? "b" : "(sa(iiay)ss)"));
-            if (text) *text = dbus::text(message, key == "Menu" ? 'o' : 's', bytes);
-            else if (pixmaps) read_pixmaps(message, *pixmaps, binary);
-            else if (key == "ItemIsMenu") { int value; require(sd_bus_message_read(message, "b", &value)); item.item_is_menu = value != 0; }
-            else {
-                require(sd_bus_message_enter_container(message, 'r', "sa(iiay)ss"));
-                item.tooltip_icon.name = dbus::text(message, 's', bytes);
-                read_pixmaps(message, item.tooltip_icon.pixmaps, binary);
-                item.tooltip_title = dbus::text(message, 's', bytes); item.tooltip_body = dbus::text(message, 's', bytes);
-                check(sd_bus_message_exit_container(message));
-            }
+        const auto key = dbus::enter_property(message);
+        if (key == "Id") item.id = dbus::text(message, 's', bytes);
+        else if (key == "Title") item.title = dbus::text(message, 's', bytes);
+        else if (key == "Category") item.category = dbus::text(message, 's', bytes);
+        else if (key == "Status") item.status = dbus::text(message, 's', bytes);
+        else if (key == "IconThemePath") item.icon_theme_path = dbus::text(message, 's', bytes);
+        else if (key == "Menu") item.menu_path = dbus::text(message, 'o', bytes);
+        else if (key == "IconName") item.icon.name = dbus::text(message, 's', bytes);
+        else if (key == "AttentionIconName") item.attention_icon.name = dbus::text(message, 's', bytes);
+        else if (key == "OverlayIconName") item.overlay_icon.name = dbus::text(message, 's', bytes);
+        else if (key == "AttentionMovieName") item.attention_movie = dbus::text(message, 's', bytes);
+        else if (key == "IconPixmap") read_pixmaps(message, item.icon.pixmaps, binary);
+        else if (key == "AttentionIconPixmap") read_pixmaps(message, item.attention_icon.pixmaps, binary);
+        else if (key == "OverlayIconPixmap") read_pixmaps(message, item.overlay_icon.pixmaps, binary);
+        else if (key == "ItemIsMenu") item.item_is_menu = dbus::boolean(message);
+        else if (key == "ToolTip") {
+            require(sd_bus_message_enter_container(message, 'r', "sa(iiay)ss"));
+            item.tooltip_icon.name = dbus::text(message, 's', bytes);
+            read_pixmaps(message, item.tooltip_icon.pixmaps, binary);
+            item.tooltip_title = dbus::text(message, 's', bytes);
+            item.tooltip_body = dbus::text(message, 's', bytes);
             check(sd_bus_message_exit_container(message));
-        } else require(sd_bus_message_skip(message, "v"));
+        } else require(sd_bus_message_skip(message, nullptr));
+        check(sd_bus_message_exit_container(message));
         check(sd_bus_message_exit_container(message));
     }
     check(sd_bus_message_exit_container(message));
@@ -85,7 +79,7 @@ struct TrayConnection::State {
     Status status;
     std::shared_ptr<const Snapshot> snapshot;
     Snapshot pending;
-    std::optional<RequestResult> result;
+    std::optional<ActionResult> result;
     ItemKey command_item;
     std::uint64_t generation = 0, last_request = 0;
     std::size_t item = 0, bytes = 0, binary = 0;
@@ -255,7 +249,7 @@ struct TrayConnection::State {
             if (!changed) return 0;
             if (watch) state.watcher_owner.clear();
             if (state.command && (watch || lost(state.command_item))) {
-                state.result = RequestResult{state.last_request, Outcome::failed, true, "tray owner changed"}; state.command = sd_bus_slot_unref(state.command);
+                state.result = ActionResult{state.last_request, ActionOutcome::failed, true, "tray owner changed"}; state.command = sd_bus_slot_unref(state.command);
             }
             state.query = sd_bus_slot_unref(state.query); state.pending = {}; state.invalidate();
         } catch (...) { state.callback_error = std::current_exception(); }
@@ -335,10 +329,7 @@ struct TrayConnection::State {
         auto& state = *static_cast<State*>(data);
         state.command = sd_bus_slot_unref(state.command);
         try {
-            const auto* error = sd_bus_message_get_error(message);
-            const bool uncertain = error && (sd_bus_error_has_name(error, SD_BUS_ERROR_NO_REPLY) || sd_bus_error_has_name(error, SD_BUS_ERROR_DISCONNECTED) || sd_bus_error_has_name(error, SD_BUS_ERROR_TIMEOUT));
-            state.result = RequestResult{state.last_request, !error ? Outcome::acknowledged : uncertain ? Outcome::failed : Outcome::rejected,
-                !error || uncertain, error ? (error->message ? error->message : error->name) : ""};
+            state.result = dbus::action_reply(state.last_request, message);
         } catch (...) { state.callback_error = std::current_exception(); }
         return 0;
     }
@@ -375,10 +366,10 @@ std::expected<void, std::string> TrayConnection::start(bool own_watcher, const s
         return {};
     } catch (const std::exception& error) { state.disconnect(); state.status = {Phase::failed, error.what()}; return std::unexpected(state.status.error); }
 }
-std::optional<RequestResult> TrayConnection::stop() noexcept {
+std::optional<ActionResult> TrayConnection::stop() noexcept {
     auto& state = *state_;
     auto result = std::exchange(state.result, {});
-    if (state.command && !result) result = RequestResult{state.last_request, Outcome::cancelled, true, {}};
+    if (state.command && !result) result = ActionResult{state.last_request, ActionOutcome::cancelled, true, {}};
     state.disconnect(); state.status = {}; ++state.generation; return result;
 }
 std::expected<void, std::string> TrayConnection::refresh() {
@@ -437,7 +428,7 @@ Update TrayConnection::dispatch(const WaitSet& ready) {
             state.send();
         }
     } catch (const std::exception& error) {
-        if (state.command && !state.result) state.result = RequestResult{state.last_request, Outcome::failed, true, error.what()};
+        if (state.command && !state.result) state.result = ActionResult{state.last_request, ActionOutcome::failed, true, error.what()};
         state.disconnect(); state.status = {Phase::failed, error.what()};
     }
     return {before != state.status, revision != (state.snapshot ? state.snapshot->revision : 0), std::exchange(state.result, {})};

@@ -7,8 +7,6 @@
 #include <fcntl.h>
 #include <limits>
 #include <linux/input-event-codes.h>
-#include <pthread.h>
-#include <signal.h>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -310,8 +308,10 @@ const zwp_text_input_v3_listener ime_listener{
 const wl_data_offer_listener offer_listener{
     .offer = [](void* data, wl_data_offer*, const char* mime) {
         auto& offer = *static_cast<Offer*>(data);
-        if (!std::strcmp(mime, "text/plain;charset=utf-8")) offer.mime = "text/plain;charset=utf-8";
-        else if (!offer.mime && !std::strcmp(mime, "text/plain")) offer.mime = "text/plain";
+        protocol(*offer.gui, [&] {
+            if (offer.types.size() < 64 && strnlen(mime, 256) < 256 && !std::ranges::contains(offer.types, mime))
+                offer.types.emplace_back(mime);
+        });
     },
     .source_actions = [](void*, wl_data_offer*, std::uint32_t) {},
     .action = [](void*, wl_data_offer*, std::uint32_t) {},
@@ -321,7 +321,7 @@ const wl_data_device_listener data_listener{
         auto& seat = *static_cast<Seat*>(data);
         protocol(*seat.gui, [&] {
             if (seat.offers.size() >= 64) { seat.gui->error = "clipboard offer limit reached"; return; }
-            auto offer = std::make_unique<Offer>(); offer->native = native;
+            auto offer = std::make_unique<Offer>(); offer->native = native; offer->gui = seat.gui;
             wl_data_offer_add_listener(native, &offer_listener, offer.get());
             seat.offers.push_back(std::move(offer));
             native = nullptr;
@@ -353,11 +353,12 @@ const wl_data_source_listener source_listener{
     .target = [](void*, wl_data_source*, const char*) {},
     .send = [](void* data, wl_data_source*, const char* mime, int fd) {
         auto& seat = *static_cast<Seat*>(data);
-        if ((std::strcmp(mime, "text/plain;charset=utf-8") && std::strcmp(mime, "text/plain")) || seat.gui->transfers.size() >= 16) { close(fd); return; }
+        const auto found = std::ranges::find(seat.clipboard, mime, &ClipboardFormat::mime);
+        if (found == seat.clipboard.end() || seat.gui->transfers.size() >= 16) { close(fd); return; }
         const int flags = fcntl(fd, F_GETFL);
         if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); return; }
         protocol(*seat.gui, [&] {
-            Transfer transfer; transfer.writing = true; transfer.data = seat.clipboard;
+            Transfer transfer; transfer.source = found->payload;
             transfer.deadline = Clock::now() + std::chrono::seconds(5);
             seat.gui->transfers.push_back(std::move(transfer));
             seat.gui->transfers.back().fd = fd; fd = -1;
@@ -366,7 +367,8 @@ const wl_data_source_listener source_listener{
     },
     .cancelled = [](void* data, wl_data_source* source) {
         auto& seat = *static_cast<Seat*>(data);
-        wl_data_source_destroy(source); if (seat.source == source) seat.source = nullptr;
+        wl_data_source_destroy(source);
+        if (seat.source == source) { seat.source = nullptr; seat.clipboard.clear(); }
     },
     .dnd_drop_performed = [](void*, wl_data_source*) {},
     .dnd_finished = [](void*, wl_data_source*) {},
@@ -413,7 +415,7 @@ int dispatch_scroll(Surface& surface) {
         auto& element = surface.elements[static_cast<std::size_t>(index)];
         const double origin = *std::exchange(element.scroll_origin, {});
         if (origin == element.scroll) continue;
-        if (notify(*surface.gui, surface.id, index, element.callback, "change") < 0) return -1;
+        if (notify_element(surface, index, "change") < 0) return -1;
     }
     return 0;
 }
@@ -498,104 +500,183 @@ static int adjacent_cursor(Element& element, int position, int direction) {
     return direction < 0 ? 0 : static_cast<int>(element.text.size());
 }
 
-static void copy_selection(Seat& seat, std::string_view text) {
-    if (!seat.gui->data || !seat.data_device || !seat.serial) throw std::runtime_error("clipboard write requires seat input");
-    seat.clipboard = text;
+ClipboardPayload::~ClipboardPayload() { if (file >= 0) close(file); }
+
+static void publish_selection(Seat& seat, std::vector<ClipboardFormat> formats) {
+    if (!seat.data_device || !seat.serial) throw std::runtime_error("clipboard write requires an input serial for this seat");
+    auto* source = wl_data_device_manager_create_data_source(seat.gui->data);
+    if (!source) throw std::runtime_error("cannot create clipboard source");
+    wl_data_source_add_listener(source, &source_listener, &seat);
+    for (const auto& format : formats) wl_data_source_offer(source, format.mime.c_str());
+    wl_data_device_set_selection(seat.data_device, source, seat.serial);
     if (seat.source) wl_data_source_destroy(seat.source);
-    seat.source = wl_data_device_manager_create_data_source(seat.gui->data);
-    if (!seat.source) throw std::runtime_error("cannot create clipboard source");
-    wl_data_source_add_listener(seat.source, &source_listener, &seat);
-    wl_data_source_offer(seat.source, "text/plain;charset=utf-8"); wl_data_source_offer(seat.source, "text/plain");
-    wl_data_device_set_selection(seat.data_device, seat.source, seat.serial);
+    seat.source = source; seat.clipboard = std::move(formats);
 }
 
-void paste(Seat& seat, Surface* surface, int callback) {
-    auto& gui = *seat.gui;
-    if (!seat.selection || !seat.selection->mime) throw std::runtime_error("clipboard has no text offer");
-    if (gui.transfers.size() >= 16) throw std::runtime_error("clipboard transfer limit reached");
-    Transfer transfer;
+static void copy_selection(Seat& seat, std::string_view text) {
+    auto payload = std::make_shared<ClipboardPayload>();
+    payload->data = text; payload->size = text.size();
+    publish_selection(seat, {{"text/plain;charset=utf-8", payload}, {"text/plain", payload}});
+}
+
+static void receive_selection(Seat& seat, std::string_view mime, Transfer transfer) {
+    if (!seat.selection) throw std::runtime_error("seat has no clipboard selection");
+    const auto type = std::ranges::find(seat.selection->types, mime);
+    if (type == seat.selection->types.end()) throw std::runtime_error("clipboard MIME type is unavailable");
+    auto& transfers = seat.gui->transfers;
+    if (transfers.size() == 16) throw std::runtime_error("clipboard transfer limit reached");
     transfer.deadline = Clock::now() + std::chrono::seconds(5);
-    if (surface) {
-        transfer.surface = surface->id; transfer.revision = surface->revision; transfer.element = surface->focused;
-        transfer.edit_revision = surface->elements[static_cast<std::size_t>(surface->focused)].edit_revision;
-    }
-    gui.transfers.push_back(std::move(transfer));
+    transfers.push_back(std::move(transfer));
     int pipe[2];
-    if (pipe2(pipe, O_CLOEXEC) < 0) { gui.transfers.pop_back(); throw std::runtime_error("cannot create clipboard pipe"); }
+    if (pipe2(pipe, O_CLOEXEC) < 0) { transfers.pop_back(); throw std::runtime_error("cannot create clipboard pipe"); }
     if (fcntl(pipe[0], F_SETFL, O_NONBLOCK) < 0) {
-        close(pipe[0]); close(pipe[1]); gui.transfers.pop_back();
-        throw std::runtime_error("cannot make clipboard reader nonblocking");
+        close(pipe[0]); close(pipe[1]); transfers.pop_back(); throw std::runtime_error("cannot make clipboard reader nonblocking");
     }
-    gui.transfers.back().fd = pipe[0]; gui.transfers.back().callback = callback;
-    wl_data_offer_receive(seat.selection->native, seat.selection->mime, pipe[1]); close(pipe[1]);
+    transfers.back().fd = pipe[0];
+    wl_data_offer_receive(seat.selection->native, type->c_str(), pipe[1]); close(pipe[1]);
+}
+
+static void paste(Seat& seat, Surface& surface) {
+    if (!seat.selection) return;
+    for (const auto mime : {"text/plain;charset=utf-8", "text/plain"}) {
+        if (!std::ranges::contains(seat.selection->types, mime)) continue;
+        Transfer transfer;
+        transfer.surface = surface.id; transfer.revision = surface.revision; transfer.element = surface.focused;
+        transfer.edit_revision = surface.elements[static_cast<std::size_t>(surface.focused)].edit_revision;
+        transfer.limit = max_text;
+        receive_selection(seat, mime, std::move(transfer)); return;
+    }
+}
+
+static Seat& clipboard_seat(lua_State* lua) {
+    const auto id = check_integer(lua, 1);
+    auto* seat = id > 0 && id <= UINT32_MAX ? find_seat(gui_state(lua), static_cast<std::uint32_t>(id)) : nullptr;
+    if (!seat) throw std::runtime_error("clipboard seat is unavailable");
+    return *seat;
+}
+
+static int clipboard_types(lua_State* lua) {
+    const auto& seat = clipboard_seat(lua);
+    const auto types = seat.selection ? seat.selection->types : std::vector<std::string>{};
+    return protected_call(lua, [&](lua_State* lua) { push_strings(lua, types); return 1; }, 1);
 }
 
 static int clipboard_read(lua_State* lua) {
-    auto& gui = gui_state(lua);
-    luaL_checktype(lua, 1, LUA_TFUNCTION);
-    Seat* seat = gui.event_seat;
-    if (!seat && !gui.seats.empty()) seat = gui.seats.front().get();
-    if (!seat) throw std::runtime_error("clipboard requires a seat");
-    lua_pushvalue(lua, 1); int reference = luaL_ref(lua, LUA_REGISTRYINDEX);
-    try { paste(*seat, nullptr, reference); }
-    catch (...) { unref(lua, reference); throw; }
+    std::size_t size;
+    const char* mime = check_string(lua, 2, &size);
+    luaL_checktype(lua, 3, LUA_TTABLE); luaL_checktype(lua, 4, LUA_TFUNCTION);
+    field(lua, 3, "file");
+    std::size_t length = 0;
+    const char* path = lua_isnil(lua, -1) ? nullptr : check_string(lua, -1, &length);
+    luaL_argcheck(lua, length <= 16384, 3, "clipboard destination path exceeds limit");
+    const auto limit = integer_field(lua, 3, "limit", std::nullopt, 0, (path ? 256 : 16) * 1024 * 1024);
+    auto& seat = clipboard_seat(lua);
+    lua_pushvalue(lua, 4); int callback = luaL_ref(lua, LUA_REGISTRYINDEX);
+    try {
+        Transfer transfer; transfer.callback = callback; transfer.limit = static_cast<std::size_t>(limit);
+        if (path) transfer.destination = std::make_unique<host::FileWriter>(std::string(path, length));
+        receive_selection(seat, {mime, size}, std::move(transfer));
+    } catch (...) { unref(lua, callback); throw; }
     lua_pushboolean(lua, true); return 1;
 }
 
 static int clipboard_write(lua_State* lua) {
-    auto& gui = gui_state(lua);
-    std::size_t length; const char* text = check_string(lua, 1, &length);
-    if (length > 1024 * 1024) luaL_error(lua, "clipboard text exceeds 1 MiB");
-    if (!g_utf8_validate(text, static_cast<gssize>(length), nullptr))
-        throw std::runtime_error("clipboard text must be valid UTF-8 without NUL");
-    if (!gui.event_seat) throw std::runtime_error("clipboard write requires an input callback");
-    copy_selection(*gui.event_seat, {text, length}); lua_pushboolean(lua, true); return 1;
-}
-
-ssize_t write_pipe(int fd, const char* data, std::size_t size) {
-    sigset_t block, previous, pending;
-    sigemptyset(&block); sigaddset(&block, SIGPIPE);
-    const int error = pthread_sigmask(SIG_BLOCK, &block, &previous);
-    if (error) { errno = error; return -1; }
-    sigpending(&pending); const bool existed = sigismember(&pending, SIGPIPE);
-    const auto result = write(fd, data, size); const int saved = errno;
-    if (result < 0 && saved == EPIPE && !existed) {
-        timespec timeout{};
-        while (sigtimedwait(&block, nullptr, &timeout) < 0 && errno == EINTR) {}
-    }
-    pthread_sigmask(SIG_SETMASK, &previous, nullptr); errno = saved; return result;
+    auto& seat = clipboard_seat(lua);
+    luaL_checktype(lua, 2, LUA_TTABLE);
+    std::vector<ClipboardFormat> formats;
+    lua_pushvalue(lua, 2);
+    if (protected_call(lua, [&](lua_State* lua) {
+        const auto count = lua_rawlen(lua, 2);
+        if (count == 0 || count > 16) return luaL_error(lua, "clipboard needs 1..16 representations");
+        std::size_t memory = 0;
+        for (std::size_t i = 1; i <= count; ++i) {
+            lua_rawgeti(lua, 2, static_cast<lua_Integer>(i)); luaL_checktype(lua, -1, LUA_TTABLE);
+            auto& format = formats.emplace_back();
+            text_field(lua, -1, "mime", format.mime, 255);
+            if (format.mime.empty() || std::ranges::count(formats, format.mime, &ClipboardFormat::mime) != 1)
+                return luaL_error(lua, "clipboard MIME types must be nonempty and unique");
+            format.payload = std::make_shared<ClipboardPayload>(); auto& payload = *format.payload;
+            field(lua, -1, "file");
+            if (!lua_isnil(lua, -1)) {
+                std::size_t length; const char* path = check_string(lua, -1, &length);
+                if (length > 16384 || std::string_view(path, length).contains('\0')) return luaL_error(lua, "invalid clipboard source path");
+                payload.file = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                struct stat st{};
+                if (payload.file < 0 || fstat(payload.file, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 256 * 1024 * 1024)
+                    return luaL_error(lua, "clipboard file must be readable, regular and at most 256 MiB");
+                payload.size = static_cast<std::size_t>(st.st_size);
+            } else {
+                field(lua, -2, "image");
+                if (!lua_isnil(lua, -1)) {
+                    const auto& image = *static_cast<std::shared_ptr<Image>*>(luaL_checkudata(lua, -1, captured_image_type));
+                    if (format.mime != "image/png") return luaL_error(lua, "captured images provide image/png");
+                    struct Sink { std::string& data; std::size_t limit; } sink{payload.data, 16 * 1024 * 1024 - memory};
+                    const auto status = cairo_surface_write_to_png_stream(image->surface,
+                        [](void* closure, const unsigned char* bytes, unsigned int n) noexcept {
+                            auto& sink = *static_cast<Sink*>(closure);
+                            if (n > sink.limit - sink.data.size()) return CAIRO_STATUS_WRITE_ERROR;
+                            try { sink.data.append(reinterpret_cast<const char*>(bytes), n); }
+                            catch (...) { return CAIRO_STATUS_NO_MEMORY; }
+                            return CAIRO_STATUS_SUCCESS;
+                        }, &sink);
+                    if (status != CAIRO_STATUS_SUCCESS) return luaL_error(lua, "cannot encode clipboard PNG: %s", cairo_status_to_string(status));
+                } else {
+                    lua_pop(lua, 1); field(lua, -2, "data");
+                    std::size_t length; const char* data = check_string(lua, -1, &length);
+                    if (length > 16 * 1024 * 1024 - memory) return luaL_error(lua, "clipboard representations exceed 16 MiB");
+                    payload.data.assign(data, length);
+                }
+                memory += payload.data.size(); payload.size = payload.data.size(); lua_pop(lua, 1);
+            }
+            lua_pop(lua, 2);
+        }
+        return 0;
+    }, 0, 0, 1) < 0) return -1;
+    publish_selection(seat, std::move(formats));
+    lua_pushboolean(lua, true); return 1;
 }
 
 void transfer_io(Transfer& transfer, short events) {
     if (transfer.fd < 0) return;
-    if (Clock::now() >= transfer.deadline) transfer.error = "clipboard transfer timed out";
-    else if (events & POLLNVAL) transfer.error = "invalid clipboard descriptor";
-    else if (events) {
-        std::size_t processed = 0;
-        while (processed < 65536) {
-            char bytes[8192];
-            const auto count = transfer.writing ?
-                write_pipe(transfer.fd, transfer.data.data() + transfer.offset, std::min<std::size_t>(8192, transfer.data.size() - transfer.offset)) :
-                read(transfer.fd, bytes, sizeof(bytes));
+    try {
+        if (Clock::now() >= transfer.deadline) throw std::runtime_error("clipboard transfer timed out");
+        if (events & POLLNVAL) throw std::runtime_error("invalid clipboard descriptor");
+        if (!events) return;
+        for (unsigned batch = 0;; ++batch) {
+            if (transfer.source && transfer.offset == transfer.source->size) break;
+            if (batch == 8) return;
+            char bytes[8192]; ssize_t count;
+            if (transfer.source) {
+                const auto& source = *transfer.source;
+                auto size = std::min(sizeof(bytes), source.size - transfer.offset);
+                const char* data = bytes;
+                if (source.file >= 0) {
+                    const auto n = pread(source.file, bytes, size, static_cast<off_t>(transfer.offset));
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) throw std::runtime_error("clipboard source file changed or became unreadable");
+                    size = static_cast<std::size_t>(n);
+                } else data = source.data.data() + transfer.offset;
+                count = host::write_pipe(transfer.fd, data, size);
+            } else count = read(transfer.fd, bytes, sizeof(bytes));
             if (count < 0) {
                 if (errno == EINTR) continue;
-                if (errno != EAGAIN && errno != EWOULDBLOCK) transfer.error = std::strerror(errno);
-                break;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+                throw std::system_error(errno, std::generic_category(), "clipboard transfer");
             }
             if (!count) {
-                close(std::exchange(transfer.fd, -1)); break;
+                if (transfer.source) throw std::runtime_error("clipboard write made no progress");
+                if (transfer.destination) transfer.destination->commit(false);
+                break;
             }
-            processed += static_cast<std::size_t>(count);
-            if (transfer.writing) {
-                transfer.offset += static_cast<std::size_t>(count);
-                if (transfer.offset == transfer.data.size()) { close(std::exchange(transfer.fd, -1)); break; }
-            } else {
-                if (transfer.data.size() + static_cast<std::size_t>(count) > 1024 * 1024) { transfer.error = "clipboard exceeds 1 MiB"; break; }
-                transfer.data.append(bytes, static_cast<std::size_t>(count));
+            const auto size = static_cast<std::size_t>(count);
+            if (!transfer.source) {
+                if (size > transfer.limit - transfer.offset) throw std::runtime_error("clipboard read limit exceeded");
+                if (transfer.destination) transfer.destination->append({bytes, size}); else transfer.data.append(bytes, size);
             }
+            transfer.offset += size;
         }
-    }
-    if (!transfer.error.empty() && transfer.fd >= 0) close(std::exchange(transfer.fd, -1));
+    } catch (const std::exception& e) { transfer.error = e.what(); }
+    close(std::exchange(transfer.fd, -1));
 }
 
 static void position_input_cursor(Surface& surface, Element& element, double x, double y, bool select) {
@@ -851,7 +932,7 @@ int process_input(Surface& s, Input& event) {
             return -1;
         }
         if (event.key == XKB_KEY_v || event.key == XKB_KEY_V) {
-            if (seat->selection && seat->selection->mime) paste(*seat, &s);
+            paste(*seat, s);
             return -1;
         }
     }
@@ -967,7 +1048,7 @@ int dispatch_input(Gui& gui) {
         }
         const int target = !surface || surface->close_pending || lifecycle || consumed || state.requests.load(std::memory_order_relaxed) ?
             -1 : process_input(*surface, event);
-        if (target >= 0 && notify(gui, surface->id, target, surface->elements[static_cast<std::size_t>(target)].callback,
+        if (target >= 0 && notify_element(*surface, target,
             surface->elements[static_cast<std::size_t>(target)].kind == Kind::button ? "activate" : "change") < 0) {
             gui.event_seat = nullptr; gui.event_serial = 0; gui.event_surface = 0; return -1;
         }
@@ -978,7 +1059,7 @@ int dispatch_input(Gui& gui) {
     for (std::size_t i = 0; i < gui.transfers.size();) {
         if (gui.transfers[i].fd >= 0) { ++i; continue; }
         auto transfer = std::move(gui.transfers[i]); gui.transfers.erase(gui.transfers.begin() + static_cast<std::ptrdiff_t>(i));
-        if (transfer.writing) continue;
+        if (transfer.source) continue;
         if (transfer.surface) {
             if (!transfer.error.empty()) continue;
             auto* surface = find_surface(gui, transfer.surface);
@@ -986,15 +1067,15 @@ int dispatch_input(Gui& gui) {
                 auto& element = surface->elements[static_cast<std::size_t>(transfer.element)];
                 if (element.edit_revision == transfer.edit_revision &&
                     replace_text(*surface, element, std::min(element.cursor, element.anchor), std::max(element.cursor, element.anchor), transfer.data) &&
-                    notify(gui, surface->id, transfer.element, element.callback, "change") < 0) return -1;
+                    notify_element(*surface, transfer.element, "change") < 0) return -1;
             }
         } else if (transfer.callback >= 0) {
-            if (transfer.error.empty() && !g_utf8_validate(transfer.data.data(), static_cast<gssize>(transfer.data.size()), nullptr))
-                transfer.error = "clipboard is not valid UTF-8 text";
             lua_pushcfunction(state.lua, traceback);
             const int result = protected_call(state.lua, [&](lua_State* lua) {
                 lua_rawgeti(lua, LUA_REGISTRYINDEX, transfer.callback);
-                if (transfer.error.empty()) lua_pushlstring(lua, transfer.data.data(), transfer.data.size()); else lua_pushnil(lua);
+                if (!transfer.error.empty()) lua_pushnil(lua);
+                else if (transfer.destination) lua_pushinteger(lua, static_cast<lua_Integer>(transfer.offset));
+                else lua_pushlstring(lua, transfer.data.data(), transfer.data.size());
                 if (transfer.error.empty()) lua_pushnil(lua); else lua_pushlstring(lua, transfer.error.data(), transfer.error.size());
                 if (!state.closing && !state.requests.load(std::memory_order_relaxed)) lua_call(lua, 2, 0);
                 return 0;
@@ -1009,7 +1090,7 @@ int dispatch_input(Gui& gui) {
 
 void register_input(lua_State* lua) {
     const luaL_Reg functions[] = {
-        {"clipboard_read", operation_call<clipboard_read>}, {"clipboard_write", operation_call<clipboard_write>},
+        {"clipboard_types", operation_call<clipboard_types>}, {"clipboard_read", operation_call<clipboard_read>}, {"clipboard_write", operation_call<clipboard_write>},
         {nullptr, nullptr}
     };
     luaL_setfuncs(lua, functions, 0);

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <hyprworks/action.hpp>
 #include <systemd/sd-bus.h>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -9,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -28,6 +31,26 @@ inline int check(int result) {
 
 inline void require(int result) {
     if (!check(result)) throw std::runtime_error("incomplete D-Bus message");
+}
+
+inline std::string_view enter_property(sd_bus_message* message) {
+    const char* name;
+    require(sd_bus_message_read(message, "s", &name));
+    require(sd_bus_message_enter_container(message, 'v', nullptr));
+    return name;
+}
+
+inline bool boolean(sd_bus_message* message) {
+    int value;
+    require(sd_bus_message_read(message, "b", &value));
+    return value != 0;
+}
+
+inline double finite_number(sd_bus_message* message) {
+    double value;
+    require(sd_bus_message_read(message, "d", &value));
+    if (!std::isfinite(value)) throw std::runtime_error("nonfinite D-Bus number");
+    return value;
 }
 
 inline std::string text(sd_bus_message* message, char type, std::size_t& bytes) {
@@ -79,6 +102,14 @@ inline Message method(sd_bus* bus, const char* destination, const char* path, co
     sd_bus_message* raw = nullptr;
     check(sd_bus_message_new_method_call(bus, &raw, destination, path, interface, member));
     return Message(raw, sd_bus_message_unref);
+}
+
+inline ActionResult action_reply(std::uint64_t id, sd_bus_message* reply) {
+    const auto* error = sd_bus_message_get_error(reply);
+    if (!error) return {id, ActionOutcome::acknowledged, true, {}};
+    const bool uncertain = sd_bus_error_has_name(error, SD_BUS_ERROR_NO_REPLY) ||
+        sd_bus_error_has_name(error, SD_BUS_ERROR_DISCONNECTED) || sd_bus_error_has_name(error, SD_BUS_ERROR_TIMEOUT);
+    return {id, uncertain ? ActionOutcome::failed : ActionOutcome::rejected, uncertain, error->message ? error->message : error->name};
 }
 
 inline void prepare(sd_bus* bus, pollfd& fd, std::optional<Clock::time_point>& deadline) {

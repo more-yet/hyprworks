@@ -28,7 +28,7 @@ public:
     Invocation(const Invocation&) = delete;
     Invocation& operator=(const Invocation&) = delete;
 
-    std::expected<void, std::string> load(const std::string& entry_file, std::span<const std::string> arguments = {});
+    std::expected<void, std::string> load(const std::string& entry_file, std::span<const std::string> arguments = {}, bool watch = true);
     std::expected<void, std::string> run();
     bool running() const noexcept;
     int exit_code() const noexcept;

@@ -1,4 +1,5 @@
 #pragma once
+#include <hyprworks/action.hpp>
 
 #include <array>
 #include <chrono>
@@ -47,14 +48,6 @@ struct Status {
     bool operator==(const Status&) const = default;
 };
 
-enum class Outcome { acknowledged, rejected, failed, cancelled };
-struct RequestResult {
-    std::uint64_t id = 0;
-    Outcome outcome = Outcome::cancelled;
-    bool may_have_executed = false;
-    std::string error;
-};
-
 struct WaitSet {
     std::array<pollfd, 64> fds;
     std::optional<Clock::time_point> deadline;
@@ -65,7 +58,7 @@ private:
 
 struct Update {
     bool status_changed = false, snapshot_changed = false;
-    std::optional<RequestResult> result;
+    std::optional<ActionResult> result;
 };
 
 /// Drive on one owning thread. Poll the prepared descriptors and dispatch their
@@ -78,7 +71,7 @@ public:
     AudioConnection& operator=(const AudioConnection&) = delete;
 
     std::expected<void, std::string> start(const std::string& server = {});
-    std::optional<RequestResult> stop() noexcept;
+    std::optional<ActionResult> stop() noexcept;
     std::expected<void, std::string> refresh();
     std::expected<std::uint64_t, std::string> set_volume(Direction direction, const std::string& name, std::span<const double> volumes);
     std::expected<std::uint64_t, std::string> set_mute(Direction direction, const std::string& name, bool mute);

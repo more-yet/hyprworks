@@ -47,7 +47,8 @@ the snapshot while building Lua values.
 Lua allocation may run author finalizers. Owning C++ locals live outside the
 `protected_call` frame that can raise a Lua error. Action targets resolve
 against live state after parsing. Callback delivery checks the handle,
-generation and callback reference across marshalling.
+generation and registered function across marshalling. Lua can recycle a registry
+slot while the original function is still pinned on the delivery stack.
 
 An invocation holds singleton bindings for its lifetime. For timers, processes,
 watches, workspace connections, buses and menus, active slots pin the native
@@ -67,12 +68,14 @@ destruction. On reload the CLI creates a fresh invocation.
 |---|---|
 | Workspace connection | Subscribes to the event socket, confirms a marker, coalesces invalidations and publishes a cross-checked workspace/output snapshot. Window and workspace queries share Socket1 connect, single-write submission and bounded reply reads. A partially sent action retains execution uncertainty. |
 | Window catalog | Foreign-toplevel events invalidate an IPC snapshot. A Wayland sync and invalidation generation establish when the candidate can publish. Restart creates a fresh identity namespace. |
-| Audio, UPower, MPRIS, tray and D-Bus menus | Each connection owns its subscription, refresh sequence and snapshot. Actions resolve current published targets. UPower publishes unavailable status on a service query error; a later invalidation or refresh schedules another query. |
+| Audio, UPower, MPRIS, tray and D-Bus menus | Each connection owns its subscription, refresh sequence and snapshot. Property decoders read recognized variants directly into the candidate snapshot. Audio, MPRIS, tray and menu actions resolve a published target and produce `hyprworks::ActionResult`; the binding retains the result until delivery or close. |
 | General D-Bus | Typed bodies account for depth, nodes and payload bytes. Calls own their async slots; exports retain the incoming message, declared result signature and deadline. A successful response consumes the request; a rejected candidate leaves it available until expiry. |
-| Commands and notifications | Each server owns its bus name and bounded records. Commands retain calls until response or timeout. Notifications retain active records through replacement, action, close or expiry. Lua reads pin copies across finalizers. |
+| Notifications | The server owns its bus name and active records through replacement, action, close or expiry. Lua reads pin copies across finalizers. |
 | Polkit | The registered authority owns one bounded authentication request. Native code owns the helper, offered identities, retries, prompt IDs and cancellation. A private GLib context contributes descriptors to the invocation. Lua supplies identity selection and prompt UI. |
 | Desktop entries | An inotify scan commits matching GIO application objects and a sorted snapshot together. Scans and launches execute on the invocation thread. |
-| Host utilities | A process owns its process group, pidfd, pipes and bounded output through reaping. File writes commit a temporary sibling by rename and sync the directory. `FileWatch` owns target identity, capacity and directory descriptors. The invocation selects local configuration files and debounces reload. |
+| Process | One owner polls the pidfd and child streams. In PTY mode one master descriptor carries both directions. Queued bytes enable write readiness; pipe EOF drains the queue first. Lua delivers retained output before exit. |
+| Independent jobs | An authored headless invocation owns the child and terminal. It exports application operations on the session bus. Clients connect to the owner's name. |
+| Files | Replacement and exclusive copy both sync a temporary sibling and publish it by rename. A preference transaction locks a separate stable inode before reading and holds it through directory sync. `FileWatch` follows targets across replacement. |
 
 ## GUI transactions
 
@@ -94,9 +97,15 @@ changes cancel obsolete presses. Clipboard and IME completions carry editor
 identity through asynchronous delivery. Text edits validate UTF-8 boundaries
 and the resulting size at mutation.
 
+**Clipboard.** An input seat owns its MIME offer independently of any surface.
+An outgoing transfer pins the selected bytes or file descriptor and has its
+own read offset, so selection replacement and concurrent pastes cannot change
+its source. An incoming file transfer owns a temporary sibling until EOF.
+
 **Presentation.** Layout supplies geometry for painting, hit testing, scrolling
-and IME. A frame callback permits another submission; buffer release permits
-writing that storage. Busy buffers retain damage for later repair.
+and IME. Presentation and capture share the allocation of a fixed-size mapped
+Wayland buffer. A frame callback permits another presentation; buffer release
+permits writing that storage. Busy buffers retain damage for later repair.
 
 **Images and capture.** Authored icon size supplies intrinsic layout dimensions;
 output scale selects raster resolution. Decode jobs release-publish completed

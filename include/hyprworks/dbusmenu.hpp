@@ -1,4 +1,5 @@
 #pragma once
+#include <hyprworks/action.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -41,13 +42,6 @@ struct Status {
     std::string error;
     bool operator==(const Status&) const = default;
 };
-enum class Outcome { acknowledged, rejected, failed, cancelled };
-struct RequestResult {
-    std::uint64_t id = 0;
-    Outcome outcome = Outcome::cancelled;
-    bool may_have_executed = false;
-    std::string error;
-};
 struct Activation { std::int32_t id = 0; std::uint32_t timestamp = 0; };
 struct WaitSet {
     pollfd fd{-1, 0, 0};
@@ -58,7 +52,7 @@ private:
 };
 struct Update {
     bool status_changed = false, snapshot_changed = false;
-    std::optional<RequestResult> result;
+    std::optional<ActionResult> result;
     std::vector<Activation> activations;
 };
 
@@ -69,7 +63,7 @@ public:
     MenuConnection(const MenuConnection&) = delete;
     MenuConnection& operator=(const MenuConnection&) = delete;
     std::expected<void, std::string> start(const Target& target, const std::string& address = {});
-    std::optional<RequestResult> stop() noexcept;
+    std::optional<ActionResult> stop() noexcept;
     std::expected<void, std::string> refresh();
     std::expected<std::uint64_t, std::string> about_to_show(std::int32_t id);
     std::expected<std::uint64_t, std::string> event(std::int32_t id, const std::string& event, std::uint32_t timestamp);

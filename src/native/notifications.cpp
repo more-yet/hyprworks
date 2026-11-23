@@ -42,7 +42,7 @@ void read_hints(sd_bus_message* message, Notification& notification, std::size_t
         require(sd_bus_message_enter_container(message, 'v', signature));
         std::optional<Hint> hint;
         if (std::strcmp(signature, "s") == 0 || std::strcmp(signature, "o") == 0) hint = dbus::text(message, *signature, bytes);
-        else if (std::strcmp(signature, "b") == 0) { int value; require(sd_bus_message_read(message, "b", &value)); hint = value != 0; }
+        else if (std::strcmp(signature, "b") == 0) hint = dbus::boolean(message);
         else if (std::strcmp(signature, "y") == 0) { std::uint8_t value; require(sd_bus_message_read(message, "y", &value)); hint = std::uint64_t(value); }
         else if (std::strcmp(signature, "n") == 0) { std::int16_t value; require(sd_bus_message_read(message, "n", &value)); hint = std::int64_t(value); }
         else if (std::strcmp(signature, "q") == 0) { std::uint16_t value; require(sd_bus_message_read(message, "q", &value)); hint = std::uint64_t(value); }
@@ -50,11 +50,8 @@ void read_hints(sd_bus_message* message, Notification& notification, std::size_t
         else if (std::strcmp(signature, "u") == 0) { std::uint32_t value; require(sd_bus_message_read(message, "u", &value)); hint = std::uint64_t(value); }
         else if (std::strcmp(signature, "x") == 0) { std::int64_t value; require(sd_bus_message_read(message, "x", &value)); hint = value; }
         else if (std::strcmp(signature, "t") == 0) { std::uint64_t value; require(sd_bus_message_read(message, "t", &value)); hint = value; }
-        else if (std::strcmp(signature, "d") == 0) {
-            double value; require(sd_bus_message_read(message, "d", &value));
-            if (!std::isfinite(value)) throw std::runtime_error("nonfinite notification hint");
-            hint = value;
-        } else if (std::strcmp(signature, "as") == 0) {
+        else if (std::strcmp(signature, "d") == 0) hint = dbus::finite_number(message);
+        else if (std::strcmp(signature, "as") == 0) {
             hint = dbus::strings(message, bytes);
         } else if (std::strcmp(signature, "(iiibiiay)") == 0 && (key == "image-data" || key == "image_data" || key == "icon_data")) {
             Image image;
@@ -112,7 +109,6 @@ struct NotificationServer::State {
     }
 
     void close(std::size_t index, CloseReason reason) {
-        ready();
         const auto id = notifications[index].id;
         events.push_back({EventKind::closed, id, reason, {}, false});
         notifications.erase(notifications.begin() + static_cast<std::ptrdiff_t>(index));
@@ -178,10 +174,10 @@ struct NotificationServer::State {
             const auto duration = timeout < 0 ? state.options.default_timeout : std::chrono::milliseconds(timeout);
             if (duration && duration->count() > 0) notification.expires_at = Clock::now() + *duration;
             auto found = std::ranges::find(state.notifications, replaces, &Notification::id);
-            const bool replacement = replaces && found != state.notifications.end();
+            const bool replacement = found != state.notifications.end();
             if (!replacement && state.notifications.size() == 128) throw std::length_error("notification limit of 128 reached");
             std::size_t total = payload_size(notification);
-            for (const auto& existing : state.notifications) if (!replacement || existing.id != replaces) total += payload_size(existing);
+            for (const auto& existing : state.notifications) if (existing.id != replaces) total += payload_size(existing);
             if (total > 32 * 1024 * 1024) throw std::length_error("notification payload budget of 32 MiB exceeded");
             if (replacement) notification.id = replaces;
             else {
@@ -203,6 +199,7 @@ struct NotificationServer::State {
             require(sd_bus_message_read(message, "u", &id));
             const auto found = std::ranges::find(state.notifications, id, &Notification::id);
             if (found == state.notifications.end()) throw std::runtime_error("unknown notification");
+            state.ready();
             state.close(static_cast<std::size_t>(found - state.notifications.begin()), CloseReason::requested);
             return sd_bus_reply_method_return(message, "");
         } catch (const std::exception& exception) { return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "%s", exception.what()); }
@@ -228,6 +225,7 @@ std::expected<void, std::string> NotificationServer::start(const Options& option
         if (std::ranges::find(options.capabilities, "icon-static") != options.capabilities.end() && std::ranges::find(options.capabilities, "icon-multi") != options.capabilities.end())
             throw std::runtime_error("icon-static and icon-multi are mutually exclusive");
         state.options = options;
+        state.notifications.reserve(128);
         dbus::open(state.bus, address);
         static const sd_bus_vtable vtable[] = {
             SD_BUS_VTABLE_START(0),
@@ -257,6 +255,7 @@ std::expected<void, std::string> NotificationServer::close(std::uint32_t id, Clo
         const auto found = std::ranges::find(state.notifications, id, &Notification::id);
         if (found == state.notifications.end() || static_cast<unsigned>(reason) < 1 || static_cast<unsigned>(reason) > 4)
             throw std::runtime_error("unknown notification or close reason");
+        state.ready();
         state.close(static_cast<std::size_t>(found - state.notifications.begin()), reason);
         ++state.generation; return {};
     } catch (const std::exception& error) { return std::unexpected(error.what()); }
@@ -265,13 +264,14 @@ std::expected<void, std::string> NotificationServer::close(std::uint32_t id, Clo
 std::expected<void, std::string> NotificationServer::invoke(std::uint32_t id, const std::string& action, const std::string& activation_token) {
     try {
         auto& state = *state_;
-        state.ready(2);
         const auto found = std::ranges::find(state.notifications, id, &Notification::id);
         if (found == state.notifications.end() || std::ranges::find(found->actions, action, &Action::key) == found->actions.end())
             throw std::runtime_error("unknown notification action");
         if (activation_token.size() > 16384 || activation_token.contains('\0')) throw std::runtime_error("invalid activation token");
         const auto resident_hint = found->hints.find("resident");
-        const bool resident = resident_hint != found->hints.end() && std::get_if<bool>(&resident_hint->second) && std::get<bool>(resident_hint->second);
+        const bool* hint = resident_hint == found->hints.end() ? nullptr : std::get_if<bool>(&resident_hint->second);
+        const bool resident = hint && *hint;
+        state.ready(resident ? 1 : 2);
         if (!activation_token.empty()) check(sd_bus_emit_signal(state.bus, path, interface, "ActivationToken", "us", id, activation_token.c_str()));
         check(sd_bus_emit_signal(state.bus, path, interface, "ActionInvoked", "us", id, action.c_str()));
         state.events.push_back({EventKind::action, id, CloseReason::undefined, action, false});

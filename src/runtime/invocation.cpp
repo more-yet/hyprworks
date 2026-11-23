@@ -46,9 +46,6 @@ void active_connections(InvocationState& state, Visit visit) {
 #ifdef HYPRWORKS_HAS_DESKTOP
     if (auto& b = state.desktop; b && !b->closed) visit(*b, b->entries);
 #endif
-#ifdef HYPRWORKS_HAS_COMMANDS
-    if (auto& b = state.commands; b && !b->closed) visit(*b, b->server);
-#endif
 #ifdef HYPRWORKS_HAS_POLKIT
     if (auto& b = state.polkit; b && !b->closed) visit(*b, b->agent);
 #endif
@@ -134,9 +131,6 @@ int open_module(lua_State* lua) {
 #ifdef HYPRWORKS_HAS_TRAY
     register_tray(lua);
 #endif
-#ifdef HYPRWORKS_HAS_COMMANDS
-    register_commands(lua);
-#endif
 #ifdef HYPRWORKS_HAS_DESKTOP
     register_desktop(lua);
 #endif
@@ -187,11 +181,14 @@ int execute_entry(lua_State* lua, const std::string& path, const std::string& mo
     lua_getfield(lua, -2, "path");
     lua_concat(lua, 2);
     lua_setfield(lua, -2, "path");
-    lua_getfield(lua, -1, "searchers");
-    lua_rawgeti(lua, -1, 2);
-    lua_pushcclosure(lua, guarded<search_configuration_module>, 1);
-    lua_rawseti(lua, -2, 2);
-    lua_pop(lua, 2);
+    if (invocation(lua).reload_watch.running()) {
+        lua_getfield(lua, -1, "searchers");
+        lua_rawgeti(lua, -1, 2);
+        lua_pushcclosure(lua, guarded<search_configuration_module>, 1);
+        lua_rawseti(lua, -2, 2);
+        lua_pop(lua, 1);
+    }
+    lua_pop(lua, 1);
     lua_createtable(lua, static_cast<int>(arguments.size()), 1);
     lua_pushlstring(lua, path.data(), path.size());
     lua_rawseti(lua, -2, 0);
@@ -293,9 +290,6 @@ void Invocation::close() noexcept {
     state.buses.clear();
 #endif
     state.timers.clear(); state.processes.clear(); state.watches.clear();
-#ifdef HYPRWORKS_HAS_COMMANDS
-    state.commands.reset();
-#endif
 #ifdef HYPRWORKS_HAS_DESKTOP
     state.desktop.reset();
 #endif
@@ -320,7 +314,7 @@ void Invocation::close() noexcept {
     state.loaded = false;
 }
 
-std::expected<void, std::string> Invocation::load(const std::string& entry_file, std::span<const std::string> arguments) {
+std::expected<void, std::string> Invocation::load(const std::string& entry_file, std::span<const std::string> arguments, bool watch) {
     auto& state = *state_;
     if (state.loaded || state.closing)
         return std::unexpected("an invocation can load only one entry script");
@@ -330,7 +324,9 @@ std::expected<void, std::string> Invocation::load(const std::string& entry_file,
         const auto path = std::filesystem::absolute(entry_file).lexically_normal();
         const auto filename = path.string();
         state.configuration_directory = std::filesystem::weakly_canonical(path.parent_path()).string();
-        if (auto watched = state.reload_watch.start(filename); !watched) throw std::runtime_error(watched.error());
+        if (watch) {
+            if (auto watched = state.reload_watch.start(filename); !watched) throw std::runtime_error(watched.error());
+        }
         auto source = host::read_file(filename, max_script_bytes);
         if (!source) throw std::runtime_error(filename + ": " + source.error());
         if (source->starts_with("\xef\xbb\xbf")) source->erase(0, 3);
@@ -419,7 +415,7 @@ void Invocation::prepare_wait() {
     }
     for (const auto& process : state.processes) if (process) {
         if (process->process.running()) append_wait(*process, process->process);
-        if (process->pending) wait.due(native::TimePoint::min());
+        if (process->pending || process->drained || process->output_pending()) wait.due(native::TimePoint::min());
     }
     for (const auto& watch : state.watches) if (watch) {
         if (watch->watch.running()) watch->offset = wait.append(watch->watch.prepare_wait());
@@ -473,8 +469,11 @@ void Invocation::dispatch() {
     });
     for (auto& timer : state.timers) if (timer) timer->pending += timer->timer.dispatch(now);
     for (auto& process : state.processes)
-        if (process && process->process.running() && consume_wait(*process))
+        if (process && process->process.running() && consume_wait(*process)) {
+            const auto queued = process->process.queued();
             process->pending |= process->process.dispatch(process->wait);
+            process->drained |= queued && !process->process.queued();
+        }
     for (auto& watch : state.watches) {
         if (watch && watch->watch.running() && ready.fds[watch->offset].revents) {
             const auto update = watch->watch.dispatch();
@@ -509,11 +508,11 @@ void Invocation::dispatch() {
 #endif
 #ifdef HYPRWORKS_HAS_AUDIO
     if (status >= 0 && state.audio)
-        status = dispatch_audio(state.lua, *state.audio);
+        status = deliver_observer(state.lua, *state.audio, push_action_result);
 #endif
 #ifdef HYPRWORKS_HAS_MPRIS
     if (status >= 0 && state.media)
-        status = dispatch_media(state.lua, *state.media);
+        status = deliver_observer(state.lua, *state.media, push_action_result);
 #endif
 #ifdef HYPRWORKS_HAS_NOTIFICATIONS
     if (status >= 0 && state.notifications)
@@ -521,7 +520,7 @@ void Invocation::dispatch() {
 #endif
 #ifdef HYPRWORKS_HAS_TRAY
     if (status >= 0 && state.tray)
-        status = dispatch_tray(state.lua, *state.tray);
+        status = deliver_observer(state.lua, *state.tray, push_action_result);
     for (auto menu : std::span(state.menus)) if (menu && status >= 0) status = dispatch_menu(state.lua, *menu);
 #endif
 #ifdef HYPRWORKS_HAS_SHORTCUTS
@@ -531,10 +530,6 @@ void Invocation::dispatch() {
 #ifdef HYPRWORKS_HAS_DESKTOP
     if (status >= 0 && state.desktop)
         status = deliver_observer(state.lua, *state.desktop);
-#endif
-#ifdef HYPRWORKS_HAS_COMMANDS
-    if (status >= 0 && state.commands)
-        status = dispatch_commands(state.lua, *state.commands);
 #endif
 #ifdef HYPRWORKS_HAS_POLKIT
     if (status >= 0 && state.polkit)

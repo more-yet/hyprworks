@@ -6,9 +6,6 @@
 #ifdef HYPRWORKS_HAS_DBUS
 #include <hyprworks/dbus.hpp>
 #endif
-#ifdef HYPRWORKS_HAS_COMMANDS
-#include <hyprworks/commands.hpp>
-#endif
 #ifdef HYPRWORKS_HAS_DESKTOP
 #include <hyprworks/desktop.hpp>
 #endif
@@ -69,29 +66,29 @@ auto& vacant_slot(std::vector<std::shared_ptr<T>>& active) {
 
 template<class T>
 int release_userdata(lua_State* lua) {
-    // Resurrected userdata no longer exposes methods for the released owner.
+    // A finalizer can resurrect the userdata after its owner is released.
     lua_pushnil(lua); lua_setmetatable(lua, 1);
     std::destroy_at(static_cast<std::shared_ptr<T>*>(lua_touserdata(lua, 1)));
     return 0;
 }
 
 template<class T>
-int open_active(lua_State* lua, std::shared_ptr<T>& slot, const std::shared_ptr<T>& binding, const char* metatable) {
+int open_active(lua_State* lua, std::shared_ptr<T>& slot, const std::shared_ptr<T>& binding, const char* metatable,
+                int* initial_callback = nullptr) {
     if (!lua_checkstack(lua, 4)) throw std::runtime_error("cannot grow Lua stack");
     slot = binding;
-    constexpr bool has_callback = requires { binding->callback; };
-    if constexpr (has_callback) lua_pushvalue(lua, 2);
+    if (initial_callback) lua_pushvalue(lua, 2);
     const auto result = protected_call(lua, [&](lua_State* lua) {
         auto* handle = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<T>), 0)) std::shared_ptr<T>();
         luaL_setmetatable(lua, metatable);
-        if constexpr (has_callback) { lua_pushvalue(lua, 2); binding->callback = luaL_ref(lua, LUA_REGISTRYINDEX); }
+        if (initial_callback) { lua_pushvalue(lua, 2); *initial_callback = luaL_ref(lua, LUA_REGISTRYINDEX); }
         lua_pushvalue(lua, -1); binding->handle = luaL_ref(lua, LUA_REGISTRYINDEX);
         *handle = binding;
         return 1;
-    }, 1, 0, has_callback ? 1 : 0);
+    }, 1, 0, initial_callback ? 1 : 0);
     if (result < 0) {
         unref(lua, binding->handle);
-        if constexpr (has_callback) unref(lua, binding->callback);
+        if (initial_callback) unref(lua, *initial_callback);
         slot.reset();
     }
     return result;
@@ -134,7 +131,12 @@ struct ProcessBinding {
     host::Process process;
     host::ProcessWait wait;
     std::size_t offset = 0;
-    int handle = LUA_NOREF, callback = LUA_NOREF;
+    int handle = LUA_NOREF, on_exit = LUA_NOREF, on_output = LUA_NOREF, on_drain = LUA_NOREF;
+    std::array<std::size_t, 2> delivered{};
+    bool drained = false;
+    bool output_pending() const {
+        return on_output >= 0 && (delivered[0] < process.output(false).size() || delivered[1] < process.output(true).size());
+    }
     std::uint64_t generation = 0;
     bool pending = false, closed = false;
 };
@@ -148,22 +150,6 @@ struct WatchBinding {
     std::uint64_t generation = 0;
     bool closed = false;
 };
-
-#ifdef HYPRWORKS_HAS_COMMANDS
-struct CommandBinding {
-    commands::CommandServer server;
-    commands::WaitSet wait;
-    std::size_t offset = 0;
-    bool pending() const { return status_pending || !requests.empty(); }
-    void retain(commands::Update update) { status_pending |= update.status_changed; requests = std::move(update.requests); }
-    std::string name;
-    std::vector<std::string> commands;
-    std::vector<commands::Request> requests;
-    int handle = LUA_NOREF, on_status = LUA_NOREF, on_request = LUA_NOREF;
-    std::uint64_t generation = 0;
-    bool closed = false, status_pending = false;
-};
-#endif
 
 #ifdef HYPRWORKS_HAS_DESKTOP
 struct DesktopBinding {
@@ -226,7 +212,7 @@ struct TrayBinding {
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_change = LUA_NOREF, on_result = LUA_NOREF;
     bool closed = false, own_watcher = false, status_pending = false, change_pending = false;
     std::uint64_t generation = 0;
-    std::optional<tray::RequestResult> result;
+    std::optional<ActionResult> result;
 };
 struct MenuBinding {
     static constexpr std::size_t limit = 32;
@@ -243,7 +229,7 @@ struct MenuBinding {
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_change = LUA_NOREF, on_result = LUA_NOREF, on_activation = LUA_NOREF;
     bool closed = false, status_pending = false, change_pending = false;
     std::uint64_t generation = 0;
-    std::optional<dbusmenu::RequestResult> result;
+    std::optional<ActionResult> result;
     std::vector<dbusmenu::Activation> activations;
 };
 #endif
@@ -276,7 +262,7 @@ struct MediaBinding {
     int handle = LUA_NOREF, on_change = LUA_NOREF, on_status = LUA_NOREF, on_result = LUA_NOREF;
     bool closed = false, change_pending = false, status_pending = false;
     std::uint64_t generation = 0;
-    std::optional<mpris::RequestResult> result;
+    std::optional<ActionResult> result;
 };
 #endif
 
@@ -293,7 +279,7 @@ struct AudioBinding {
     int handle = LUA_NOREF, on_change = LUA_NOREF, on_status = LUA_NOREF, on_result = LUA_NOREF;
     bool closed = false, change_pending = false, status_pending = false;
     std::uint64_t generation = 0;
-    std::optional<audio::RequestResult> result;
+    std::optional<ActionResult> result;
 };
 #endif
 
@@ -338,7 +324,6 @@ struct InvocationState {
     int clock_fd = -1, on_clock_change = LUA_NOREF;
     std::size_t clock_offset = 0, timezone_offset = 0, reload_offset = 0;
     bool clock_pending = false;
-    std::uint64_t clock_generation = 0;
     host::FileWatch timezone_watch;
     SignalSource* signals = nullptr;
     bool loaded = false;
@@ -366,9 +351,6 @@ struct InvocationState {
 #endif
     host::FileWatch reload_watch;
     std::optional<host::Clock::time_point> reload_at;
-#ifdef HYPRWORKS_HAS_COMMANDS
-    std::optional<CommandBinding> commands;
-#endif
 #ifdef HYPRWORKS_HAS_DESKTOP
     std::optional<DesktopBinding> desktop;
 #endif
@@ -411,16 +393,16 @@ int dispatch_callback(lua_State* lua, Binding& binding, const int& callback,
         state.requests.load(std::memory_order_relaxed)) return 0;
     const int reference = callback;
     lua_pushcfunction(lua, traceback);
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
     const int result = protected_call(lua, [&](lua_State* lua) {
-        lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
         lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
         const int count = arguments(lua);
         // Argument allocation can run finalizers that replace or close this binding.
-        if (binding.closed || binding.generation != generation || callback != reference ||
-            state.requests.load(std::memory_order_relaxed)) return 0;
+        if (binding.closed || binding.generation != generation || state.requests.load(std::memory_order_relaxed) ||
+            !callback_matches(lua, callback, reference, count + 1)) return 0;
         lua_call(lua, count + 1, 0);
         return 0;
-    }, 0, 1);
+    }, 0, 1, 1);
     if (result >= 0) lua_settop(lua, 0);
     return result;
 }
@@ -481,12 +463,10 @@ void register_upower(lua_State* lua);
 
 #ifdef HYPRWORKS_HAS_AUDIO
 void register_audio(lua_State* lua);
-int dispatch_audio(lua_State* lua, AudioBinding& binding);
 #endif
 
 #ifdef HYPRWORKS_HAS_MPRIS
 void register_mpris(lua_State* lua);
-int dispatch_media(lua_State* lua, MediaBinding& binding);
 #endif
 
 #ifdef HYPRWORKS_HAS_NOTIFICATIONS
@@ -496,13 +476,7 @@ int dispatch_notifications(lua_State* lua, NotificationBinding& binding);
 
 #ifdef HYPRWORKS_HAS_TRAY
 void register_tray(lua_State* lua);
-int dispatch_tray(lua_State* lua, TrayBinding& binding);
 int dispatch_menu(lua_State* lua, MenuBinding& binding);
-#endif
-
-#ifdef HYPRWORKS_HAS_COMMANDS
-void register_commands(lua_State* lua);
-int dispatch_commands(lua_State* lua, CommandBinding& binding);
 #endif
 
 #ifdef HYPRWORKS_HAS_DESKTOP

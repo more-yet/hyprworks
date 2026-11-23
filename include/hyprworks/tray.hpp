@@ -1,4 +1,5 @@
 #pragma once
+#include <hyprworks/action.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -46,13 +47,6 @@ struct Status {
     bool operator==(const Status&) const = default;
 };
 enum class Action { activate, secondary_activate, context_menu };
-enum class Outcome { acknowledged, rejected, failed, cancelled };
-struct RequestResult {
-    std::uint64_t id = 0;
-    Outcome outcome = Outcome::cancelled;
-    bool may_have_executed = false;
-    std::string error;
-};
 struct WaitSet {
     pollfd fd{-1, 0, 0};
     std::optional<Clock::time_point> deadline;
@@ -62,7 +56,7 @@ private:
 };
 struct Update {
     bool status_changed = false, snapshot_changed = false;
-    std::optional<RequestResult> result;
+    std::optional<ActionResult> result;
 };
 class TrayConnection {
 public:
@@ -71,7 +65,7 @@ public:
     TrayConnection(const TrayConnection&) = delete;
     TrayConnection& operator=(const TrayConnection&) = delete;
     std::expected<void, std::string> start(bool own_watcher = false, const std::string& address = {});
-    std::optional<RequestResult> stop() noexcept;
+    std::optional<ActionResult> stop() noexcept;
     std::expected<void, std::string> refresh();
     std::expected<std::uint64_t, std::string> action(const ItemKey& item, Action action, std::int32_t x, std::int32_t y);
     std::expected<std::uint64_t, std::string> scroll(const ItemKey& item, std::int32_t delta, bool horizontal);

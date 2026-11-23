@@ -98,15 +98,6 @@ int audio_on_result(lua_State* lua) {
     return 0;
 }
 
-void push_audio_result(lua_State* lua, const audio::RequestResult& result) {
-    static const char* outcomes[] = {"acknowledged", "rejected", "failed", "cancelled"};
-    lua_createtable(lua, 0, 4);
-    identifier(lua, result.id); lua_setfield(lua, -2, "id");
-    lua_pushstring(lua, outcomes[static_cast<unsigned>(result.outcome)]); lua_setfield(lua, -2, "outcome");
-    lua_pushboolean(lua, result.may_have_executed); lua_setfield(lua, -2, "may_have_executed");
-    if (!result.error.empty()) string_field(lua, "error", result.error);
-}
-
 int audio_restart(lua_State* lua) {
     auto& binding = audio_handle(lua, true);
     return operation_result(lua, restart_observer(binding));
@@ -171,15 +162,11 @@ int audio_close(lua_State* lua) {
     unref(lua, binding.on_status);
     unref(lua, binding.on_result);
     return protected_call(lua, [&](lua_State* lua) {
-        if (result) push_audio_result(lua, *result); else lua_pushnil(lua);
+        if (result) push_action_result(lua, *result); else lua_pushnil(lua);
         return 1;
     }, 1);
 }
 
-}
-
-int dispatch_audio(lua_State* lua, AudioBinding& binding) {
-    return deliver_observer(lua, binding, push_audio_result);
 }
 
 void register_audio(lua_State* lua) {

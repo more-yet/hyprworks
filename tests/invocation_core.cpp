@@ -40,6 +40,7 @@ int main() {
             callback_timer = hw.timer(0, function() error("obsolete callback delivered") end)
             local garbage = setmetatable({}, {__gc = function()
                 finalized = finalized + 1
+                callback_timer:on_tick(nil)
                 callback_timer:on_tick(function(timer, ticks)
                     assert(timer == callback_timer and ticks == 1)
                     delivered = delivered + 1
@@ -204,7 +205,9 @@ int main() {
     {
         hyprworks::host::Process process;
         const std::string arguments[]{"/bin/sh", "-c", "printf ready"};
-        assert(process.start(arguments, {.directory = {}, .timeout = std::chrono::seconds(3), .output_limit = 1024}));
+        hyprworks::host::ProcessOptions options;
+        options.timeout = std::chrono::seconds(3); options.output_limit = 1024;
+        assert(process.start(arguments, options));
         const auto deadline = hyprworks::host::Clock::now() + std::chrono::seconds(3);
         while (process.running()) {
             assert(hyprworks::host::Clock::now() < deadline);

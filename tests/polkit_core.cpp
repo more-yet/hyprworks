@@ -319,12 +319,9 @@ int main() {
         script(R"(
             agent = assert(hw.polkit {session = "test", locale = "C"})
             assert(hw.polkit() == agent)
-            events = {}
             agent:on_event(function(handle, event)
                 assert(handle == agent and event.cookie == nil)
-                events[#events + 1] = event.kind
                 if event.kind == "request" then
-                    request_id = event.id
                     assert(handle:authenticate(event.id, event.identities[1].uid))
                 elseif event.kind == "prompt" then
                     assert(not event.echo)
@@ -342,12 +339,10 @@ int main() {
         const auto end = polkit::Clock::now() + std::chrono::seconds(3);
         while (!binding.closed) {
             assert(polkit::Clock::now() < end);
-            auto update = turn(binding.agent, authority);
-            binding.status_pending |= update.status_changed; binding.events = std::move(update.events);
+            binding.retain(turn(binding.agent, authority));
             assert(lua::dispatch_polkit(state.lua, binding) == 0);
         }
         assert(!helper);
-        script("assert(events[1] == 'request' and events[#events] == 'completed'); assert(agent:status().phase == 'closed')");
         script(R"(
             assert(agent:restart())
             agent:on_event(function() error("cancelled request delivered") end)

@@ -45,11 +45,13 @@ void start_signals() {
 
 int main(int argc, char** argv) {
     bool gui = HYPRWORKS_DEFAULT_GUI;
+    bool watch = true;
     const char* entry_name = "main.lua";
     int entry = 1;
     while (entry < argc) {
         const std::string_view option(argv[entry]);
         if (option == "--headless") gui = false;
+        else if (option == "--no-watch") watch = false;
         else if (option == "--entry") {
             if (++entry == argc || !*argv[entry] || std::string_view(argv[entry]).contains('/') ||
                 std::string_view(argv[entry]) == "." || std::string_view(argv[entry]) == "..") {
@@ -65,7 +67,8 @@ int main(int argc, char** argv) {
                       << "Load main.lua from $HYPRWORKS_CONFIG_DIR (required absolute directory).\n"
                       << "Reload automatically when the entry file or a required local Lua module changes.\n\n"
                       << "      --entry FILE   Select a filename in the configuration directory (main.lua)\n"
-                      << "      --headless     Run the headless event loop\n"
+                       << "      --headless     Run the headless event loop\n"
+                       << "      --no-watch     Keep this invocation across configuration file changes\n"
                       << "  -v, --version      Print the version\n"
                       << "  -h, --help         Show this help\n";
             return 0;
@@ -87,7 +90,7 @@ int main(int argc, char** argv) {
         start_signals();
         for (;;) {
             hyprworks::lua::Invocation invocation(gui ? hyprworks::lua::EventLoop::gui : hyprworks::lua::EventLoop::headless, &signals);
-            if (auto loaded = invocation.load(filename, arguments); !loaded) {
+            if (auto loaded = invocation.load(filename, arguments, watch); !loaded) {
                 std::cerr << loaded.error() << '\n';
                 return 1;
             }

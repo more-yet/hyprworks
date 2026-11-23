@@ -445,6 +445,29 @@ Box paint_buffer(Surface& surface, Buffer& buffer) {
     return {static_cast<double>(left), static_cast<double>(top), static_cast<double>(right - left), static_cast<double>(bottom - top)};
 }
 
+wl_buffer* create_shm_buffer(wl_shm* shm, int width, int height, std::uint32_t format, void*& mapping) {
+    const auto bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4;
+    assert(!mapping && width > 0 && height > 0 && bytes <= INT32_MAX);
+    const int fd = memfd_create("hyprworks-buffer", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) throw std::runtime_error("cannot create shared memory buffer");
+    if (ftruncate(fd, static_cast<off_t>(bytes)) < 0 ||
+        fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) < 0) {
+        close(fd); throw std::runtime_error("cannot set shared memory buffer size");
+    }
+    void* pixels = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (pixels == MAP_FAILED) { close(fd); throw std::runtime_error("cannot map shared memory buffer"); }
+    auto* pool = wl_shm_create_pool(shm, fd, static_cast<int>(bytes));
+    close(fd);
+    wl_buffer* buffer = nullptr;
+    if (pool) {
+        buffer = wl_shm_pool_create_buffer(pool, 0, width, height, width * 4, format);
+        wl_shm_pool_destroy(pool);
+    }
+    if (!buffer) { munmap(pixels, bytes); throw std::runtime_error("cannot create Wayland buffer"); }
+    mapping = pixels;
+    return buffer;
+}
+
 void render(Surface& surface) {
     if (!surface.configured || surface.closed || surface.close_pending || !surface.dirty || surface.frame) return;
     auto& gui = *surface.gui;
@@ -474,19 +497,8 @@ void render(Surface& surface) {
         replacement->gui = &gui; replacement->surface = surface.id;
         replacement->width = width; replacement->height = height;
         replacement->damage = {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)};
-        const int fd = memfd_create("hyprworks-buffer", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        if (fd < 0) throw std::runtime_error("cannot create presentation buffer");
-        if (ftruncate(fd, static_cast<off_t>(bytes)) < 0) { close(fd); throw std::runtime_error("cannot size presentation buffer"); }
-        fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL);
-        replacement->mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (replacement->mapping == MAP_FAILED) { close(fd); throw std::runtime_error("cannot map presentation buffer"); }
+        replacement->native = create_shm_buffer(gui.shm, width, height, WL_SHM_FORMAT_ARGB8888, replacement->mapping);
         replacement->bytes = bytes; gui.buffer_bytes += bytes;
-        auto* pool = wl_shm_create_pool(gui.shm, fd, static_cast<int>(bytes));
-        close(fd);
-        if (!pool) throw std::runtime_error("cannot create Wayland buffer pool");
-        replacement->native = wl_shm_pool_create_buffer(pool, 0, width, height, width * 4, WL_SHM_FORMAT_ARGB8888);
-        wl_shm_pool_destroy(pool);
-        if (!replacement->native) throw std::runtime_error("cannot create Wayland buffer");
         wl_buffer_add_listener(replacement->native, &buffer_listener, replacement.get());
         replacement->cairo = cairo_image_surface_create_for_data(static_cast<unsigned char*>(replacement->mapping), CAIRO_FORMAT_ARGB32, width, height, width * 4);
         if (cairo_surface_status(replacement->cairo) != CAIRO_STATUS_SUCCESS) throw std::runtime_error("cannot create Cairo buffer");
@@ -514,7 +526,7 @@ void render(Surface& surface) {
 Buffer::~Buffer() {
     if (native) wl_buffer_destroy(native);
     if (cairo) cairo_surface_destroy(cairo);
-    if (mapping && mapping != MAP_FAILED) munmap(mapping, bytes);
+    if (bytes) munmap(mapping, bytes);
     gui->buffer_bytes -= bytes;
 }
 

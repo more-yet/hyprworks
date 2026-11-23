@@ -4,13 +4,10 @@
 #include "../native/hyprland/workspace_protocol.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <cstring>
 #include <cmath>
 #include <json-c/json.h>
 #include <sys/mman.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 namespace hyprworks::lua {
@@ -50,7 +47,7 @@ void fail(WindowCatalog& catalog, std::string message) {
 
 void release_buffer(Capture& capture) {
     if (capture.buffer) wl_buffer_destroy(std::exchange(capture.buffer, nullptr));
-    if (capture.pixels) munmap(std::exchange(capture.pixels, nullptr), capture.bytes);
+    if (capture.bytes) munmap(std::exchange(capture.pixels, nullptr), capture.bytes);
     capture.gui->capture_bytes -= capture.bytes;
     capture.bytes = 0;
 }
@@ -375,9 +372,9 @@ json_object* member(json_object* object, const char* key, json_type type) {
 
 std::string text(json_object* object, const char* key) {
     auto* value = member(object, key, json_type_string);
-    std::string result(json_object_get_string(value), static_cast<std::size_t>(json_object_get_string_len(value)));
+    const std::string_view result(json_object_get_string(value), static_cast<std::size_t>(json_object_get_string_len(value)));
     if (result.size() > 16384 || result.contains('\0')) throw std::runtime_error("invalid window text");
-    return result;
+    return std::string(result);
 }
 
 std::unique_ptr<json_object, decltype(&json_object_put)> parse(std::string_view input, json_type type) {
@@ -526,7 +523,9 @@ int capture_gc(lua_State* lua) {
 }
 
 int image_gc(lua_State* lua) {
-    static_cast<std::shared_ptr<Image>*>(luaL_checkudata(lua, 1, captured_image_type))->~shared_ptr();
+    auto* source = static_cast<std::shared_ptr<Image>*>(luaL_checkudata(lua, 1, captured_image_type));
+    lua_pushnil(lua); lua_setmetatable(lua, 1);
+    std::destroy_at(source);
     return 0;
 }
 
@@ -673,19 +672,9 @@ void advance_capture(Capture& capture) {
                 capture_error(capture, "capture memory limit reached (128 MiB)");
                 return;
             }
-            const int fd = memfd_create("hyprworks-capture", MFD_CLOEXEC);
-            if (fd < 0) throw std::runtime_error("cannot create capture buffer");
-            if (ftruncate(fd, static_cast<off_t>(bytes)) < 0) { close(fd); throw std::runtime_error("cannot size capture buffer"); }
-            void* pixels = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            if (pixels == MAP_FAILED) { close(fd); throw std::runtime_error("cannot map capture buffer"); }
-            capture.pixels = pixels; capture.bytes = bytes; capture.gui->capture_bytes += bytes;
-            auto* pool = wl_shm_create_pool(capture.gui->shm, fd, static_cast<int>(bytes));
-            close(fd);
-            if (!pool) throw std::runtime_error("cannot create capture pool");
-            capture.buffer = wl_shm_pool_create_buffer(pool, 0, static_cast<int>(capture.width), static_cast<int>(capture.height),
-                static_cast<int>(capture.width * 4), capture.format);
-            wl_shm_pool_destroy(pool);
-            if (!capture.buffer) throw std::runtime_error("cannot create capture wl_buffer");
+            capture.buffer = create_shm_buffer(capture.gui->shm, static_cast<int>(capture.width), static_cast<int>(capture.height),
+                capture.format, capture.pixels);
+            capture.bytes = bytes; capture.gui->capture_bytes += bytes;
             capture.buffer_width = capture.width; capture.buffer_height = capture.height; capture.buffer_format = capture.format;
         }
         capture.frame = ext_image_copy_capture_session_v1_create_frame(capture.session);

@@ -24,27 +24,22 @@ void metadata(sd_bus_message* message, Metadata& metadata, std::size_t& bytes) {
     unsigned count = 0;
     while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
         if (++count > 128) throw std::runtime_error("MPRIS metadata exceeds 128 entries");
-        const auto key = dbus::text(message, 's', bytes);
-        std::string* text = key == "mpris:trackid" ? &metadata.track_id : key == "xesam:title" ? &metadata.title :
-            key == "xesam:album" ? &metadata.album : key == "mpris:artUrl" ? &metadata.artwork_url : key == "xesam:url" ? &metadata.url : nullptr;
-        auto* list = key == "xesam:artist" ? &metadata.artists : key == "xesam:albumArtist" ? &metadata.album_artists : key == "xesam:genre" ? &metadata.genres : nullptr;
-        if (text) {
-            const char type = key == "mpris:trackid" ? 'o' : 's';
-            require(sd_bus_message_enter_container(message, 'v', type == 'o' ? "o" : "s"));
-            *text = dbus::text(message, type, bytes);
-            check(sd_bus_message_exit_container(message));
-        } else if (list) {
-            require(sd_bus_message_enter_container(message, 'v', "as"));
-            *list = dbus::strings(message, bytes);
-            check(sd_bus_message_exit_container(message));
-        } else if (key == "mpris:length") {
-            require(sd_bus_message_enter_container(message, 'v', "x"));
+        const auto key = dbus::enter_property(message);
+        if (key == "mpris:trackid") metadata.track_id = dbus::text(message, 'o', bytes);
+        else if (key == "xesam:title") metadata.title = dbus::text(message, 's', bytes);
+        else if (key == "xesam:album") metadata.album = dbus::text(message, 's', bytes);
+        else if (key == "mpris:artUrl") metadata.artwork_url = dbus::text(message, 's', bytes);
+        else if (key == "xesam:url") metadata.url = dbus::text(message, 's', bytes);
+        else if (key == "xesam:artist") metadata.artists = dbus::strings(message, bytes);
+        else if (key == "xesam:albumArtist") metadata.album_artists = dbus::strings(message, bytes);
+        else if (key == "xesam:genre") metadata.genres = dbus::strings(message, bytes);
+        else if (key == "mpris:length") {
             std::int64_t value;
             require(sd_bus_message_read(message, "x", &value));
             if (value < 0) throw std::runtime_error("negative MPRIS track length");
             metadata.length = value;
-            check(sd_bus_message_exit_container(message));
-        } else require(sd_bus_message_skip(message, "v"));
+        } else require(sd_bus_message_skip(message, nullptr));
+        check(sd_bus_message_exit_container(message));
         check(sd_bus_message_exit_container(message));
     }
     check(sd_bus_message_exit_container(message));
@@ -55,50 +50,36 @@ void read_properties(sd_bus_message* message, Player& player, bool root, std::si
     unsigned count = 0;
     while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
         if (++count > 128) throw std::runtime_error("MPRIS properties exceed 128 entries");
-        const auto key = dbus::text(message, 's', bytes);
-        std::string* text = nullptr;
-        bool* boolean = nullptr;
-        double* number = nullptr;
-        std::vector<std::string>* list = nullptr;
+        const auto key = dbus::enter_property(message);
         if (root) {
-            if (key == "Identity") text = &player.identity;
-            else if (key == "DesktopEntry") text = &player.desktop_entry;
-            else if (key == "CanRaise") boolean = &player.can_raise;
-            else if (key == "CanQuit") boolean = &player.can_quit;
-            else if (key == "SupportedUriSchemes") list = &player.uri_schemes;
-            else if (key == "SupportedMimeTypes") list = &player.mime_types;
-        } else {
-            if (key == "PlaybackStatus") text = &player.playback_status;
-            else if (key == "LoopStatus") text = &player.loop_status.emplace();
-            else if (key == "Shuffle") boolean = &player.shuffle.emplace();
-            else if (key == "Volume") number = &player.volume.emplace();
-            else if (key == "Rate") number = &player.rate;
-            else if (key == "MinimumRate") number = &player.minimum_rate;
-            else if (key == "MaximumRate") number = &player.maximum_rate;
-            else if (key == "CanControl") boolean = &player.can_control;
-            else if (key == "CanPlay") boolean = &player.can_play;
-            else if (key == "CanPause") boolean = &player.can_pause;
-            else if (key == "CanSeek") boolean = &player.can_seek;
-            else if (key == "CanGoNext") boolean = &player.can_go_next;
-            else if (key == "CanGoPrevious") boolean = &player.can_go_previous;
-        }
-        if (text || boolean || number || list || (!root && (key == "Position" || key == "Metadata"))) {
-            require(sd_bus_message_enter_container(message, 'v', text ? "s" : boolean ? "b" : number ? "d" : list ? "as" : key == "Position" ? "x" : "a{sv}"));
-            if (text) *text = dbus::text(message, 's', bytes);
-            else if (boolean) { int value; require(sd_bus_message_read(message, "b", &value)); *boolean = value != 0; }
-            else if (number) {
-                require(sd_bus_message_read(message, "d", number));
-                if (!std::isfinite(*number)) throw std::runtime_error("nonfinite MPRIS number");
-            } else if (list) *list = dbus::strings(message, bytes);
-            else if (key == "Metadata") metadata(message, player.metadata, bytes);
-            else {
-                std::int64_t value;
-                require(sd_bus_message_read(message, "x", &value));
-                if (value < 0) throw std::runtime_error("negative MPRIS position");
-                player.position = value;
-            }
-            check(sd_bus_message_exit_container(message));
-        } else require(sd_bus_message_skip(message, "v"));
+            if (key == "Identity") player.identity = dbus::text(message, 's', bytes);
+            else if (key == "DesktopEntry") player.desktop_entry = dbus::text(message, 's', bytes);
+            else if (key == "CanRaise") player.can_raise = dbus::boolean(message);
+            else if (key == "CanQuit") player.can_quit = dbus::boolean(message);
+            else if (key == "SupportedUriSchemes") player.uri_schemes = dbus::strings(message, bytes);
+            else if (key == "SupportedMimeTypes") player.mime_types = dbus::strings(message, bytes);
+            else require(sd_bus_message_skip(message, nullptr));
+        } else if (key == "PlaybackStatus") player.playback_status = dbus::text(message, 's', bytes);
+        else if (key == "LoopStatus") player.loop_status = dbus::text(message, 's', bytes);
+        else if (key == "Shuffle") player.shuffle = dbus::boolean(message);
+        else if (key == "Volume") player.volume = dbus::finite_number(message);
+        else if (key == "Rate") player.rate = dbus::finite_number(message);
+        else if (key == "MinimumRate") player.minimum_rate = dbus::finite_number(message);
+        else if (key == "MaximumRate") player.maximum_rate = dbus::finite_number(message);
+        else if (key == "CanControl") player.can_control = dbus::boolean(message);
+        else if (key == "CanPlay") player.can_play = dbus::boolean(message);
+        else if (key == "CanPause") player.can_pause = dbus::boolean(message);
+        else if (key == "CanSeek") player.can_seek = dbus::boolean(message);
+        else if (key == "CanGoNext") player.can_go_next = dbus::boolean(message);
+        else if (key == "CanGoPrevious") player.can_go_previous = dbus::boolean(message);
+        else if (key == "Metadata") metadata(message, player.metadata, bytes);
+        else if (key == "Position") {
+            std::int64_t position;
+            require(sd_bus_message_read(message, "x", &position));
+            if (position < 0) throw std::runtime_error("negative MPRIS position");
+            player.position = position;
+        } else require(sd_bus_message_skip(message, nullptr));
+        check(sd_bus_message_exit_container(message));
         check(sd_bus_message_exit_container(message));
     }
     check(sd_bus_message_exit_container(message));
@@ -125,7 +106,7 @@ struct MediaConnection::State {
     Status status;
     std::shared_ptr<const Snapshot> snapshot;
     Snapshot pending;
-    std::optional<RequestResult> result;
+    std::optional<ActionResult> result;
     PlayerKey command_player;
     std::uint64_t generation = 0, last_request = 0;
     std::size_t player = 0, bytes = 0;
@@ -256,7 +237,7 @@ struct MediaConnection::State {
                 state.snapshot = std::move(next);
             }
             if (state.command && state.command_player.name == name && state.command_player.owner != new_owner) {
-                state.result = RequestResult{state.last_request, Outcome::failed, true, "MPRIS player owner changed"};
+                state.result = ActionResult{state.last_request, ActionOutcome::failed, true, "MPRIS player owner changed"};
                 state.command = sd_bus_slot_unref(state.command);
             }
             state.status.phase = Phase::synchronizing;
@@ -286,11 +267,7 @@ struct MediaConnection::State {
         auto& state = *static_cast<State*>(data);
         state.command = sd_bus_slot_unref(state.command);
         try {
-            const auto* error = sd_bus_message_get_error(message);
-            const bool uncertain = error && (sd_bus_error_has_name(error, SD_BUS_ERROR_NO_REPLY) || sd_bus_error_has_name(error, SD_BUS_ERROR_DISCONNECTED) ||
-                                             sd_bus_error_has_name(error, SD_BUS_ERROR_TIMEOUT));
-            state.result = RequestResult{state.last_request, !error ? Outcome::acknowledged : uncertain ? Outcome::failed : Outcome::rejected,
-                !error || uncertain, error ? (error->message ? error->message : error->name) : ""};
+            state.result = dbus::action_reply(state.last_request, message);
             state.invalidate();
         } catch (...) { state.callback_error = std::current_exception(); }
         return 0;
@@ -340,10 +317,10 @@ std::expected<void, std::string> MediaConnection::start(const std::string& addre
     }
 }
 
-std::optional<RequestResult> MediaConnection::stop() noexcept {
+std::optional<ActionResult> MediaConnection::stop() noexcept {
     auto& state = *state_;
     auto result = std::exchange(state.result, {});
-    if (state.command && !result) result = RequestResult{state.last_request, Outcome::cancelled, true, {}};
+    if (state.command && !result) result = ActionResult{state.last_request, ActionOutcome::cancelled, true, {}};
     state.disconnect(); state.status = {}; ++state.generation;
     return result;
 }
@@ -478,7 +455,7 @@ Update MediaConnection::dispatch(const WaitSet& ready) {
             state.send();
         }
     } catch (const std::exception& error) {
-        if (state.command && !state.result) state.result = RequestResult{state.last_request, Outcome::failed, true, error.what()};
+        if (state.command && !state.result) state.result = ActionResult{state.last_request, ActionOutcome::failed, true, error.what()};
         state.disconnect(); state.status = {Phase::failed, error.what()};
     }
     return {before != state.status, revision != (state.snapshot ? state.snapshot->revision : 0), std::exchange(state.result, {})};

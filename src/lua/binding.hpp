@@ -1,5 +1,6 @@
 #pragma once
 
+#include <hyprworks/action.hpp>
 #include <lua.hpp>
 #include <charconv>
 #include <cstdint>
@@ -44,6 +45,15 @@ inline void identifier(lua_State* lua, std::uint64_t id) {
     lua_pushlstring(lua, buffer, static_cast<std::size_t>(result.ptr - buffer));
 }
 
+inline void push_action_result(lua_State* lua, const ActionResult& result) {
+    static const char* outcomes[] = {"acknowledged", "rejected", "failed", "cancelled"};
+    lua_createtable(lua, 0, 4);
+    identifier(lua, result.id); lua_setfield(lua, -2, "id");
+    lua_pushstring(lua, outcomes[static_cast<unsigned>(result.outcome)]); lua_setfield(lua, -2, "outcome");
+    lua_pushboolean(lua, result.may_have_executed); lua_setfield(lua, -2, "may_have_executed");
+    if (!result.error.empty()) string_field(lua, "error", result.error);
+}
+
 inline void unref(lua_State* lua, int& reference) noexcept {
     if (reference != LUA_NOREF)
         luaL_unref(lua, LUA_REGISTRYINDEX, std::exchange(reference, LUA_NOREF));
@@ -59,6 +69,15 @@ inline bool replace_callback(lua_State* lua, int argument, int& reference, const
     }
     luaL_unref(lua, LUA_REGISTRYINDEX, std::exchange(reference, replacement));
     return replacement >= 0;
+}
+
+inline bool callback_matches(lua_State* lua, int current, int original, int arguments) {
+    if (current != original) return false;
+    // A finalizer can unregister a function and reuse its registry slot.
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, current);
+    const bool same = lua_rawequal(lua, -1, -2 - arguments);
+    lua_pop(lua, 1);
+    return same;
 }
 
 inline void field(lua_State* lua, int table, const char* name) {
@@ -238,6 +257,14 @@ inline int traceback(lua_State* lua) {
     const char* message = luaL_tolstring(lua, 1, nullptr);
     luaL_traceback(lua, lua, message, 1);
     return 1;
+}
+
+inline int call_no_args(lua_State* lua, int reference) {
+    lua_pushcfunction(lua, traceback);
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
+    if (lua_pcall(lua, 0, 0, -2) != LUA_OK) return -1;
+    lua_pop(lua, 1);
+    return 0;
 }
 
 inline int operation_result(lua_State* lua, const std::expected<void, std::string>& result) {

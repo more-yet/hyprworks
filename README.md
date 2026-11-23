@@ -100,12 +100,12 @@ Inputs expose `selection_color`, `caret_color`, `caret_width` and
 `placeholder_color`; focus outlines use `focus_color` and `focus_width`.
 Password inputs require a one-character UTF-8 `mask`. Text clips at its bounds;
 `wrap = true` enables wrapping, and `ellipsize = true` enables end ellipsis for
-unwrapped text. Icon sources require `theme` and integer `pixels`: the icon's
+unwrapped text. Image source tables select `path`, then `icon`, then `data`;
+each source reads its own options. Icon sources require `theme` and integer `pixels`: the icon's
 intrinsic logical size. The runtime selects a raster size for the output scale.
 SVG sources use intrinsic dimensions or an explicit `pixels` raster width.
 For SVGs with percentage dimensions, `pixels` is required; a `viewBox` supplies
 the aspect ratio, otherwise the authored size defines a square viewport.
-Authentication prompts are authored Lua applications using `hw.polkit()`.
 
 Sliders and scroll containers require a boolean `horizontal`. A slider owns
 normalized range state and positions its direct child marked `thumb = true`.
@@ -136,11 +136,8 @@ Scroll offsets remain owned by the scroll container; its `on_change` reports
 coalesced changes. `element:state()` exposes `scroll_limit`, `pressed` and
 `focused` as well as text, value, offset and geometry.
 
-Drag capture retains its seat, input source and normalized grab position through
-child replacement. `{preserve_state = true}` can retain a named slider and target
-through reordered trees. Removal, disabling, axis changes, target replacement,
-thumb removal, consumed input and focus loss cancel affected capture.
-Lua can use surface input and focus callbacks to author visual feedback.
+Drag capture belongs to the originating seat. A preserved slider keeps its grab
+position while its target, axis and thumb remain compatible across tree edits.
 
 Elements accept accessibility metadata:
 
@@ -152,8 +149,7 @@ Elements accept accessibility metadata:
 `accessibility` supports `name`, `description`, `hidden` and `role`. Roles are
 `auto`, `group`, `label`, `image`, `button`, `checkbox`, `slider`, `textbox`,
 `heading`, `link`, `list`, `list_item`, `menu` and `menu_item`. `auto` derives the
-role from the element kind when explicitly selected. Names and descriptions are authored;
-absent metadata is omitted from the returned table.
+role from the element kind. Names and descriptions come from the authored metadata.
 `element:accessibility()` returns effective metadata, ancestor-inherited
 hidden state, enabled/focus state, and a toggle's checked or slider's value state.
 Metadata updates use the same validated transactions and content budgets as
@@ -176,28 +172,106 @@ retain their current state. An input callback returns a boolean or `nil`.
 Option and element tables use their stored fields. Element updates apply the
 properties used by that kind; structural properties belong to tree descriptions.
 
-Caller-owned policies are explicit: `hw.quit(code)`, `hw.read_file(path, limit)`,
-process `{timeout, output_limit}`, D-Bus `{bus}` and call/export `{timeout}`,
-tray action coordinates, scroll direction, menu IDs and timestamps. Native
-resource budgets and protocol deadlines bound admitted work.
-
 `hw.notifications {name = ..., vendor = ..., version = ...}` supplies the
 server identity. Optional `capabilities` are strings; optional `default_timeout`
 is an integer number of milliseconds used when a sender delegates expiry.
-Its absence leaves delegated notifications without a deadline; zero explicitly
-requests persistence. Positive sender timeouts remain authoritative.
+Omit it or set it to zero to keep delegated notifications until dismissal.
+Positive sender timeouts take precedence.
 `notifications:close(id, reason)` requires the protocol close reason.
 
-The [live fixtures](tests/) demonstrate surface lifecycle, window capture and
-asynchronous D-Bus request ownership.
+Applications expose external commands as methods on their own D-Bus interface.
+Use `bus:export` to declare the signatures and `bus:reply` or `bus:error` to
+answer a request by ID. The [D-Bus fixture](tests/dbus.lua) exercises replies
+and expiry; the other [live fixtures](tests/) cover surface lifecycle and window capture.
+
+### Interactive children
+
+`hw.process(argv, options)` starts a child with nonblocking parent-side pipes.
+`timeout` (1 ms–24 h) and `output_limit` (0–16 MiB **per captured stream**) are
+required. Exceeding the output limit ends the job with a truncated result.
+`directory` selects the working directory; `env = {KEY = "value"}` overrides
+the child's inherited environment, including `PATH`.
+
+```lua
+local p = assert(hw.process({"cat"}, {timeout = 5000, output_limit = 65536}))
+p:on_output(function(_, stream, bytes) print(stream, #bytes) end)
+assert(p:write("one\0two") == 7)
+assert(p:close_input()) -- send pipe EOF after queued bytes have been written
+```
+
+- `write(bytes)` returns the number **queued**, possibly zero. Retry the
+  unaccepted suffix in `on_drain(function(p, discarded) ... end)`. `input_limit`
+  defaults to 64 KiB and can be set to 1 byte–1 MiB. `discarded` is zero on a
+  successful drain, or the unsent byte count if the child closed its input.
+- `on_output(p, "stdout"|"stderr", bytes)` delivers binary chunks, including
+  prompts without a newline, before `on_exit`. `read_output(stream, offset, limit)`
+  reads retained bytes without consuming them (zero-based offset, up to 64 KiB).
+- `stdin_file` redirects input from a path; `stdout_file` and `stderr_file`
+  send output directly to **new**, mode-0600 files. Paths are relative to the
+  child's working directory. Redirected output is neither captured nor subject
+  to the capture limit. As with shell redirections, a spawn failure can leave
+  a created output file.
+- Set `pty = {rows = 24, columns = 80, raw = false, echo = true}` to start a
+  new session with a controlling terminal for all three streams. Output arrives
+  on `stdout`; file redirections apply in pipe mode.
+  `pty = {}` uses those defaults; raw mode defaults to echo off. `resize(rows,
+  columns)` updates the terminal; `signal(number)` targets its foreground
+  process group (the child's group in pipe mode). For canonical terminal EOF,
+  send the configured EOF character (normally `"\4"`). `hangup()` closes the
+  master immediately and continues watching
+  the child until exit or timeout. Timeout, `close()` and invocation shutdown
+  reap the owned child.
+
+For work that outlives a window or a GUI process, run the owning entry as an
+independent user service: `hyprworks --headless --no-watch --entry updates.lua`.
+The entry owns the child, its lock and its session-bus name. It defines what a
+returning client can read or submit. `--no-watch` keeps the invocation running
+across edits to the configuration files.
+
+### Clipboard and files
+
+Save `event.seat` from a surface input or input-driven element callback. Use
+that ID even if the copy or paste happens later. The seat needs an input serial
+for a write; the compositor decides whether to grant the selection.
+
+```lua
+assert(hw.clipboard_write(seat, {{mime = "image/png", image = capture_event.source}}))
+-- Other representations: {mime = "...", file = path} or {mime = "...", data = bytes}.
+local types = assert(hw.clipboard_types(seat))
+assert(hw.clipboard_read(seat, types[1], {file = destination, limit = 32 * 1024 * 1024},
+    function(count, err) assert(count, err) end))
+```
+
+One write publishes up to 16 MIME representations. Captured frames encode as
+PNG; inline data is binary (16 MiB total). File offers pin an open regular
+file up to 256 MiB: unlinking or renaming it is safe; leave its contents
+unchanged. The seat serves the selection and in-flight transfers after the
+preview closes, for the lifetime of the Wayland invocation.
+Omit `file` on a read to receive a byte string (up to 16 MiB); file reads
+stream to a new destination (up to 256 MiB), published only at complete EOF.
+Errors are delivered as `callback(nil, reason)`.
+
+`hw.temp_file(parent)` and `hw.temp_dir(parent)` securely create a private file
+or directory and return its path; the caller removes it. `hw.mkdir(path)`
+creates one directory. `hw.create_file(path, bytes)` and `hw.copy_file(from,
+to, byte_limit)` publish a new file without overwriting a destination.
+`hw.write_file(path, bytes)` atomically replaces it.
+
+For existing preferences use `hw.update_file(path, limit, edit)`. It takes
+an exclusive, nonblocking lock on `path .. ".lock"` **before reading**, passes
+the current bytes to `edit`, and keeps the lock through comparison and atomic
+replacement. Return new bytes to commit, or `nil` to skip. The result is
+`true` for a change, `false` for no change, or `nil, error` on operational
+failure. An error raised by `edit` releases the lock without committing.
+For a longer session, `local lock <close> = assert(hw.lock_file(lock_path))`
+holds the lock until scope exit or `lock:close()`. All participants must use
+the same lock path; leave the lock file in place between acquisitions.
 
 ### Polkit authentication
 
-`hw.polkit()` opens one native authentication agent for the login session.
-Hyprworks owns system-bus registration, authority verification, authentication
-helpers, retries and cancellation. Lua supplies the prompt UI and user choices.
-Build with `HYPRWORKS_BUILD_POLKIT=ON` (the standalone default) to use
-libpolkit-agent. Run one agent per login session.
+`hw.polkit()` opens the login session's authentication agent. Hyprworks verifies
+the authority and owns the helper and retries; Lua supplies the prompt and the
+user's choice of identity. Build with `HYPRWORKS_BUILD_POLKIT=ON`.
 
 ```lua
 local agent = assert(hw.polkit()) -- optional {session = "1", locale = "en_US.UTF-8"}
@@ -222,37 +296,17 @@ agent:on_event(function(handle, event)
 end)
 ```
 
-The `show_*`/`hide_*` functions above are your UI. Mask input when `echo` is
-false and clear the editor after submission or dismissal.
+Request and prompt IDs are opaque decimal strings. Choose one of the offered
+`{uid, name}` identities. Each response belongs to one prompt and accepts up
+to 4095 bytes of single-line text (NUL, CR and LF are invalid). Mask input
+when `echo` is false and clear the editor after submission or dismissal.
+`completed` reports authentication; Polkit returns the authorization decision
+to the requesting application.
 
-- `status()` returns `phase` (`connecting`, `ready`, `failed`, `stopped` or
-  `closed`) and an optional `error`. `on_status` schedules initial delivery.
-- `on_event(function(agent, event) ... end)` replaces the event callback;
-  `nil` removes it. Each event has `kind` and an opaque decimal-string `id`.
-- `request` adds `action`, `message`, `icon`, a string-valued `details` table,
-  and `identities = {{uid = ..., name = ...}, ...}`. Choose an offered identity
-  with `authenticate(id, uid)` once; native code runs up to three attempts.
-- `prompt` adds a distinct opaque `prompt` ID, `text` and `echo`. Submit with
-  `respond(id, prompt, response)`. Reused or superseded IDs return `nil, error`.
-  Responses accept at most 4095 bytes and exclude NUL, CR and LF.
-- `info` and `error` carry `text`. `completed` carries `authorized` and
-  `cancelled`. `authorized` describes the authentication result; the requesting
-  application receives its authorization decision separately from Polkit.
-- `cancel(id)` dismisses the current request. `close()` cancels native work,
-  unregisters by disconnecting, and removes callbacks. `restart()` re-registers
-  using the original options and invalidates earlier requests; callbacks survive
-  a restart unless explicitly closed. `hw.polkit()` returns the shared handle.
-
-Session discovery uses the process's login session, then the user's display
-session. Registration conflicts and authority loss appear as failed status.
-Registration has a five-second deadline; each request has a five-minute
-deadline, including identity selection. One request is admitted at a time;
-concurrent requests are rejected. Admission accepts up to 32 identities,
-64 detail entries and 64 KiB of metadata, with 16 KiB per string. Native event
-delivery is bounded to 32 queued events. A request without an event callback is
-cancelled. Cookies and helper handles stay native; responses pass directly to
-the authentication helper.
-Closing, reload and shutdown release helpers before Lua storage.
+The agent admits one request at a time, with five seconds for registration
+and five minutes per request including identity selection and retries.
+`cancel(id)` dismisses it. `close()` releases the registration and callbacks;
+`restart()` registers with the original options.
 
 ### Workspace captures
 

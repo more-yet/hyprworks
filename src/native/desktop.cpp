@@ -252,23 +252,24 @@ Update DesktopEntries::dispatch(const WaitSet& ready) {
 std::expected<void, std::string> DesktopEntries::launch(const std::string& id, std::span<const std::string> uris, const std::string& action) {
     auto& state = *state_;
     if (state.status.phase != Phase::ready) return std::unexpected("desktop entries are not ready");
-    if (uris.size() > 256) return std::unexpected("desktop launch exceeds 256 URIs");
-    std::size_t bytes = 0;
-    for (const auto& uri : uris)
-        if (uri.size() > 65536 || uri.contains('\0') || (bytes += uri.size()) > 1024 * 1024)
-            return std::unexpected("invalid desktop launch URI or URI budget exceeded");
     const auto found = std::ranges::lower_bound(state.snapshot->entries, id, {}, &Entry::id);
     if (found == state.snapshot->entries.end() || found->id != id) return std::unexpected("unknown desktop entry");
     auto* info = state.apps[static_cast<std::size_t>(found - state.snapshot->entries.begin())].get();
-    if (!action.empty()) {
-        if (!uris.empty()) return std::unexpected("desktop actions do not accept URIs");
-        if (std::ranges::find(found->actions, action, &Action::id) == found->actions.end()) return std::unexpected("unknown desktop action");
+    std::unique_ptr<GList, decltype(&g_list_free)> arguments(nullptr, g_list_free);
+    if (action.empty()) {
+        if (uris.size() > 256) return std::unexpected("desktop launch exceeds 256 URIs");
+        std::size_t bytes = 0;
+        for (auto it = uris.rbegin(); it != uris.rend(); ++it) {
+            const auto& uri = *it;
+            if (uri.size() > 65536 || uri.contains('\0') || (bytes += uri.size()) > 1024 * 1024)
+                return std::unexpected("invalid desktop launch URI or URI budget exceeded");
+            arguments.reset(g_list_prepend(arguments.release(), const_cast<char*>(uri.c_str())));
+        }
+    } else if (std::ranges::find(found->actions, action, &Action::id) == found->actions.end()) {
+        return std::unexpected("unknown desktop action");
     }
     const std::unique_ptr<GMainContext, decltype(&g_main_context_unref)> context(g_main_context_new(), g_main_context_unref);
     ContextScope scope(context.get());
-    GList* list = nullptr;
-    for (const auto& uri : uris) list = g_list_prepend(list, const_cast<char*>(uri.c_str()));
-    const std::unique_ptr<GList, decltype(&g_list_free)> arguments(g_list_reverse(list), g_list_free);
     struct Completion { bool done = false, success = false; GError* error = nullptr; } completion;
     const std::unique_ptr<GCancellable, decltype(&g_object_unref)> cancel(g_cancellable_new(), g_object_unref);
     const auto destroy_source = [](GSource* source) { g_source_destroy(source); g_source_unref(source); };

@@ -17,50 +17,36 @@ void read_properties(sd_bus_message* message, Snapshot& snapshot, Item* item, st
     unsigned count = 0;
     while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
         if (++count > 128) throw std::runtime_error("menu properties exceed 128 entries");
-        const auto key = dbus::text(message, 's', bytes);
-        std::string* text = nullptr;
-        bool* boolean = nullptr;
-        const char* signature = nullptr;
-        if (item) {
-            if (key == "label") text = &item->label;
-            else if (key == "type") text = &item->type;
-            else if (key == "icon-name") text = &item->icon_name;
-            else if (key == "toggle-type") text = &item->toggle_type;
-            else if (key == "children-display") text = &item->children_display;
-            else if (key == "disposition") text = &item->disposition;
-            else if (key == "enabled") boolean = &item->enabled;
-            else if (key == "visible") boolean = &item->visible;
-            else if (key == "toggle-state") signature = "i";
-            else if (key == "icon-data") signature = "ay";
-            else if (key == "shortcut") signature = "aas";
-        } else {
-            if (key == "TextDirection") text = &snapshot.text_direction;
-            else if (key == "Status") text = &snapshot.status;
-            else if (key == "Version") signature = "u";
-            else if (key == "IconThemePath") signature = "as";
-        }
-        if (text || boolean || signature) {
-            require(sd_bus_message_enter_container(message, 'v', text ? "s" : boolean ? "b" : signature));
-            if (text) *text = dbus::text(message, 's', bytes);
-            else if (boolean) { int value; require(sd_bus_message_read(message, "b", &value)); *boolean = value != 0; }
+        const auto key = dbus::enter_property(message);
+        if (!item) {
+            if (key == "TextDirection") snapshot.text_direction = dbus::text(message, 's', bytes);
+            else if (key == "Status") snapshot.status = dbus::text(message, 's', bytes);
             else if (key == "Version") require(sd_bus_message_read(message, "u", &snapshot.version));
             else if (key == "IconThemePath") snapshot.icon_theme_paths = dbus::strings(message, bytes);
-            else if (key == "toggle-state") require(sd_bus_message_read(message, "i", &item->toggle_state));
-            else if (key == "icon-data") {
-                const void* data; std::size_t size;
-                require(sd_bus_message_read_array(message, 'y', &data, &size));
-                if (size > 1024 * 1024 || (binary += size) > 8 * 1024 * 1024) throw std::runtime_error("menu image budget exceeded");
-                if (size) item->icon_data.assign(static_cast<const std::uint8_t*>(data), static_cast<const std::uint8_t*>(data) + size);
-            } else {
-                require(sd_bus_message_enter_container(message, 'a', "as"));
-                while (!check(sd_bus_message_at_end(message, false))) {
-                    if (item->shortcuts.size() == 16) throw std::runtime_error("menu item exceeds 16 shortcuts");
-                    item->shortcuts.push_back(dbus::strings(message, bytes));
-                }
-                check(sd_bus_message_exit_container(message));
+            else require(sd_bus_message_skip(message, nullptr));
+        } else if (key == "label") item->label = dbus::text(message, 's', bytes);
+        else if (key == "type") item->type = dbus::text(message, 's', bytes);
+        else if (key == "icon-name") item->icon_name = dbus::text(message, 's', bytes);
+        else if (key == "toggle-type") item->toggle_type = dbus::text(message, 's', bytes);
+        else if (key == "children-display") item->children_display = dbus::text(message, 's', bytes);
+        else if (key == "disposition") item->disposition = dbus::text(message, 's', bytes);
+        else if (key == "enabled") item->enabled = dbus::boolean(message);
+        else if (key == "visible") item->visible = dbus::boolean(message);
+        else if (key == "toggle-state") require(sd_bus_message_read(message, "i", &item->toggle_state));
+        else if (key == "icon-data") {
+            const void* data; std::size_t size;
+            require(sd_bus_message_read_array(message, 'y', &data, &size));
+            if (size > 1024 * 1024 || (binary += size) > 8 * 1024 * 1024) throw std::runtime_error("menu image budget exceeded");
+            if (size) item->icon_data.assign(static_cast<const std::uint8_t*>(data), static_cast<const std::uint8_t*>(data) + size);
+        } else if (key == "shortcut") {
+            require(sd_bus_message_enter_container(message, 'a', "as"));
+            while (!check(sd_bus_message_at_end(message, false))) {
+                if (item->shortcuts.size() == 16) throw std::runtime_error("menu item exceeds 16 shortcuts");
+                item->shortcuts.push_back(dbus::strings(message, bytes));
             }
             check(sd_bus_message_exit_container(message));
-        } else require(sd_bus_message_skip(message, "v"));
+        } else require(sd_bus_message_skip(message, nullptr));
+        check(sd_bus_message_exit_container(message));
         check(sd_bus_message_exit_container(message));
     }
     check(sd_bus_message_exit_container(message));
@@ -93,7 +79,7 @@ struct MenuConnection::State {
     Status status;
     std::shared_ptr<const Snapshot> snapshot;
     Snapshot pending;
-    std::optional<RequestResult> result;
+    std::optional<ActionResult> result;
     std::vector<Activation> activations;
     std::uint64_t generation = 0, last_request = 0;
     std::size_t bytes = 0, binary = 0;
@@ -157,7 +143,7 @@ struct MenuConnection::State {
             require(sd_bus_message_read(message, "sss", &name, &old_owner, &new_owner));
             if (state.target.owner != name || *new_owner) return 0;
             state.status = {Phase::unavailable, "menu owner disappeared"};
-            if (state.command) state.result = RequestResult{state.last_request, Outcome::failed, true, state.status.error};
+            if (state.command) state.result = ActionResult{state.last_request, ActionOutcome::failed, true, state.status.error};
         } catch (...) { state.callback_error = std::current_exception(); }
         return 0;
     }
@@ -185,11 +171,8 @@ struct MenuConnection::State {
         auto& state = *static_cast<State*>(data);
         state.command = sd_bus_slot_unref(state.command);
         try {
-            const auto* error = sd_bus_message_get_error(message);
-            const bool uncertain = error && (sd_bus_error_has_name(error, SD_BUS_ERROR_NO_REPLY) || sd_bus_error_has_name(error, SD_BUS_ERROR_DISCONNECTED) || sd_bus_error_has_name(error, SD_BUS_ERROR_TIMEOUT));
-            state.result = RequestResult{state.last_request, !error ? Outcome::acknowledged : uncertain ? Outcome::failed : Outcome::rejected,
-                !error || uncertain, error ? (error->message ? error->message : error->name) : ""};
-            if (!error && state.showing) {
+            state.result = dbus::action_reply(state.last_request, message);
+            if (state.showing && state.result->outcome == ActionOutcome::acknowledged) {
                 int changed; require(sd_bus_message_read(message, "b", &changed));
                 if (changed) state.invalidate();
             }
@@ -218,10 +201,10 @@ std::expected<void, std::string> MenuConnection::start(const Target& target, con
         return {};
     } catch (const std::exception& error) { state.disconnect(); state.status = {Phase::failed, error.what()}; return std::unexpected(state.status.error); }
 }
-std::optional<RequestResult> MenuConnection::stop() noexcept {
+std::optional<ActionResult> MenuConnection::stop() noexcept {
     auto& state = *state_;
     auto result = std::exchange(state.result, {});
-    if (state.command && !result) result = RequestResult{state.last_request, Outcome::cancelled, true, {}};
+    if (state.command && !result) result = ActionResult{state.last_request, ActionOutcome::cancelled, true, {}};
     state.disconnect(); state.status = {}; state.activations.clear(); ++state.generation;
     return result;
 }
@@ -286,7 +269,7 @@ Update MenuConnection::dispatch(const WaitSet& ready) {
             }
         }
     } catch (const std::exception& error) {
-        if (state.command && !state.result) state.result = RequestResult{state.last_request, Outcome::failed, true, error.what()};
+        if (state.command && !state.result) state.result = ActionResult{state.last_request, ActionOutcome::failed, true, error.what()};
         state.disconnect(); state.status = {Phase::failed, error.what()};
     }
     return {before != state.status, revision != (state.snapshot ? state.snapshot->revision : 0), std::exchange(state.result, {}), std::exchange(state.activations, {})};

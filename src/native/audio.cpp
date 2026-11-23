@@ -160,7 +160,7 @@ struct AudioConnection::State {
     bool query_done = false, subscribed = false;
     std::size_t bytes = 0;
     std::uint64_t generation = 0, last_request = 0;
-    std::optional<RequestResult> result;
+    std::optional<ActionResult> result;
     std::optional<Clock::time_point> deadline, refresh_at, command_deadline;
     std::exception_ptr callback_error;
 
@@ -298,7 +298,7 @@ struct AudioConnection::State {
     static void command_reply(pa_context* context, int success, void* data) noexcept {
         auto& state = *static_cast<State*>(data);
         try {
-            state.result = RequestResult{state.last_request, success ? Outcome::acknowledged : Outcome::rejected,
+            state.result = ActionResult{state.last_request, success ? ActionOutcome::acknowledged : ActionOutcome::rejected,
                                          success != 0, success ? "" : pa_strerror(pa_context_errno(context))};
             state.invalidate();
         } catch (...) { state.callback_error = std::current_exception(); }
@@ -338,10 +338,10 @@ std::expected<void, std::string> AudioConnection::start(const std::string& serve
     }
 }
 
-std::optional<RequestResult> AudioConnection::stop() noexcept {
+std::optional<ActionResult> AudioConnection::stop() noexcept {
     auto& state = *state_;
     auto result = std::exchange(state.result, {});
-    if (state.command && !result) result = RequestResult{state.last_request, Outcome::cancelled, true, {}};
+    if (state.command && !result) result = ActionResult{state.last_request, ActionOutcome::cancelled, true, {}};
     ++state.generation;
     state.disconnect();
     state.status = {};
@@ -448,7 +448,7 @@ Update AudioConnection::dispatch(const WaitSet& ready) {
             state.send_query();
         }
     } catch (const std::exception& error) {
-        if (state.command && !state.result) state.result = RequestResult{state.last_request, Outcome::failed, true, error.what()};
+        if (state.command && !state.result) state.result = ActionResult{state.last_request, ActionOutcome::failed, true, error.what()};
         state.disconnect();
         state.status = {Phase::failed, error.what()};
     }
