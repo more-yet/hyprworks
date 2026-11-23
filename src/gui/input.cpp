@@ -476,8 +476,8 @@ bool replace_text(Surface& surface, Element& element, int begin, int end, std::s
     element.text.replace(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin), inserted);
     surface.content_bytes = surface.content_bytes - previous + size;
     element.cursor = element.anchor = begin + static_cast<int>(inserted.size());
-    element.preedit.clear(); ++element.edit_revision; element.text_dirty = true;
-    invalidate_element(surface, static_cast<int>(&element - surface.elements.data()), true);
+    element.preedit.clear(); ++element.edit_revision;
+    invalidate_element(surface, static_cast<int>(&element - surface.elements.data()), shaping_changed);
     return true;
 }
 
@@ -682,8 +682,8 @@ void transfer_io(Transfer& transfer, short events) {
 static void position_input_cursor(Surface& surface, Element& element, double x, double y, bool select) {
     const int target = static_cast<int>(&element - surface.elements.data());
     if (!element.preedit.empty()) {
-        element.preedit.clear(); element.text_dirty = true;
-        invalidate_element(surface, target, true); layout(surface);
+        element.preedit.clear();
+        invalidate_element(surface, target, shaping_changed); layout(surface);
     }
     int index = 0, trailing = 0;
     const auto units = [](double value) {
@@ -711,10 +711,10 @@ static bool change_range(Surface& surface, int index, double value) {
         if (!target.enabled || target.scroll_limit == 0) return false;
         if (!target.scroll_origin) target.scroll_origin = target.scroll;
         target.scroll = value * target.scroll_limit;
-        invalidate_element(surface, element.target_index, true);
+        invalidate_element(surface, element.target_index, placement_changed);
     }
     element.value = value;
-    invalidate_element(surface, index, true);
+    invalidate_element(surface, index, placement_changed);
     return true;
 }
 
@@ -728,8 +728,8 @@ int process_input(Surface& s, Input& event) {
             auto& element = s.elements[static_cast<std::size_t>(s.focused)];
             if (element.preedit.empty() || element.preedit_seat == event.seat) {
                 const bool composing = !element.preedit.empty();
-                element.preedit.clear(); ++element.edit_revision; element.text_dirty |= composing;
-                invalidate_element(s, s.focused, composing);
+                element.preedit.clear(); ++element.edit_revision;
+                invalidate_element(s, s.focused, composing ? shaping_changed : paint_changed);
             }
         }
         return -1;
@@ -771,7 +771,7 @@ int process_input(Surface& s, Input& event) {
             if (!element.scroll_origin) element.scroll_origin = element.scroll;
             remaining -= next - element.scroll;
             element.scroll = next;
-            invalidate_element(s, i, true);
+            invalidate_element(s, i, placement_changed);
         }
         layout(s);
         return -1;
@@ -845,7 +845,7 @@ int process_input(Surface& s, Input& event) {
     if (event.type == Input::Type::ime_leave) {
         if (event.revision == s.revision && event.element == s.focused &&
             !element.preedit.empty() && element.preedit_seat == event.seat) {
-            element.preedit.clear(); element.text_dirty = true; invalidate_element(s, s.focused, true);
+            element.preedit.clear(); invalidate_element(s, s.focused, shaping_changed);
         }
         return -1;
     }
@@ -881,7 +881,7 @@ int process_input(Surface& s, Input& event) {
         element.preedit = event.preedit_set ? event.preedit : "";
         element.preedit_seat = event.seat;
         element.preedit_cursor = event.preedit_cursor; element.preedit_end = event.preedit_end;
-        element.text_dirty = true; invalidate_element(s, s.focused, true);
+        invalidate_element(s, s.focused, shaping_changed);
         if (changed && seat) seat->ime_applied_edit = element.edit_revision;
         return changed ? s.focused : -1;
     }
@@ -917,9 +917,9 @@ int process_input(Surface& s, Input& event) {
     auto* seat = find_seat(gui, event.seat);
     if (event.ctrl && (event.key == XKB_KEY_a || event.key == XKB_KEY_A)) {
         const bool composing = !element.preedit.empty();
-        element.preedit.clear(); element.text_dirty |= composing;
+        element.preedit.clear();
         element.anchor = 0; element.cursor = static_cast<int>(element.text.size()); ++element.edit_revision;
-        invalidate_element(s, s.focused, composing); return -1;
+        invalidate_element(s, s.focused, composing ? shaping_changed : paint_changed); return -1;
     }
     if (event.ctrl && seat) {
         if (event.key == XKB_KEY_c || event.key == XKB_KEY_C || event.key == XKB_KEY_x || event.key == XKB_KEY_X) {

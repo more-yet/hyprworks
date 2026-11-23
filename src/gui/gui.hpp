@@ -302,7 +302,8 @@ void protocol(Gui& gui, Function&& function) noexcept {
 
 void dirty(Surface& surface);
 void damage(Surface& surface, Box box);
-void invalidate_element(Surface& surface, int index, bool geometry = false);
+enum Damage { unchanged, paint_changed, placement_changed, geometry_changed, shaping_changed };
+void invalidate_element(Surface& surface, int index, Damage change = paint_changed);
 
 inline bool focusable(const Element& element) {
     return element.enabled && (element.kind == Kind::button || element.kind == Kind::toggle ||

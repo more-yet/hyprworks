@@ -38,8 +38,7 @@ void focus(Surface& surface, int index) {
         auto& previous = surface.elements[static_cast<std::size_t>(surface.focused)];
         const bool composing = !previous.preedit.empty();
         previous.preedit.clear(); ++previous.edit_revision;
-        previous.text_dirty |= composing;
-        invalidate_element(surface, surface.focused, composing);
+        invalidate_element(surface, surface.focused, composing ? shaping_changed : paint_changed);
     }
     surface.focused = index;
     if (index >= 0) ++surface.elements[static_cast<std::size_t>(index)].edit_revision;
@@ -139,8 +138,7 @@ void cancel_surface_input(Surface& surface, bool descendants) {
     for (auto& element : surface.elements) if (element.kind == Kind::input) {
         const bool composing = !element.preedit.empty();
         element.preedit.clear(); ++element.edit_revision;
-        element.text_dirty |= composing;
-        invalidate_element(surface, static_cast<int>(&element - surface.elements.data()), composing);
+        invalidate_element(surface, static_cast<int>(&element - surface.elements.data()), composing ? shaping_changed : paint_changed);
     }
     for (auto& seat : surface.gui->seats) if (seat->keyboard_surface == surface.id) {
         seat->repeat_at.reset();
@@ -316,7 +314,6 @@ const wp_fractional_scale_v1_listener scale_listener{
         surface.configure_pending = true; dirty(surface);
     }
 };
-enum Damage { unchanged, paint_changed, geometry_changed, shaping_changed };
 bool container(Kind kind) {
     return kind == Kind::row || kind == Kind::column || kind == Kind::scroll || kind == Kind::box ||
         kind == Kind::button || kind == Kind::toggle || kind == Kind::slider;
@@ -407,13 +404,13 @@ void read_properties(lua_State* lua, int table, ElementPatch& patch, Gui& gui, K
     lua_pop(lua, 1);
     number("width", &Element::width, 0, 16384, geometry_changed);
     number("height", &Element::height, 0, 16384, geometry_changed);
-    number("x", &Element::x, -16384, 16384, geometry_changed);
-    number("y", &Element::y, -16384, 16384, geometry_changed);
+    number("x", &Element::x, -16384, 16384, placement_changed);
+    number("y", &Element::y, -16384, 16384, placement_changed);
     static const char* horizontal_alignments[] = {"stretch", "left", "center", "right", nullptr};
     static const char* vertical_alignments[] = {"stretch", "top", "center", "bottom", nullptr};
     static const char* text_alignments[] = {"left", "center", "right", nullptr};
     alignment("halign", &Element::halign, horizontal_alignments, geometry_changed);
-    alignment("valign", &Element::valign, vertical_alignments, geometry_changed);
+    alignment("valign", &Element::valign, vertical_alignments, placement_changed);
     number("grow", &Element::grow, 0, 1024, geometry_changed);
     number("padding", &Element::padding, 0, 1024, geometry_changed);
     if (kind == Kind::row || kind == Kind::column || kind == Kind::scroll)
@@ -455,7 +452,7 @@ void read_properties(lua_State* lua, int table, ElementPatch& patch, Gui& gui, K
         color("placeholder_color", &Element::placeholder_color);
     }
     if ((kind == Kind::slider || kind == Kind::toggle) &&
-        number("value", &Element::value, 0, 1, kind == Kind::slider ? geometry_changed : paint_changed))
+        number("value", &Element::value, 0, 1, kind == Kind::slider ? placement_changed : paint_changed))
         patch.specified |= value_specified;
     if (kind == Kind::slider) {
         number("step", &Element::step, 0, 1, unchanged);
@@ -465,7 +462,7 @@ void read_properties(lua_State* lua, int table, ElementPatch& patch, Gui& gui, K
         const bool supplied = flag(table, "horizontal", &Element::horizontal, geometry_changed);
         if (creating && !supplied) luaL_error(lua, "horizontal is required");
     }
-    if (kind == Kind::scroll && number("scroll", &Element::scroll, 0, 33554432, geometry_changed)) patch.specified |= scroll_specified;
+    if (kind == Kind::scroll && number("scroll", &Element::scroll, 0, 33554432, placement_changed)) patch.specified |= scroll_specified;
     if (control || kind == Kind::image || kind == Kind::scroll)
         callback_field(lua, table, kind == Kind::button ? "on_activate" : kind == Kind::image ? "on_loaded" : "on_change", patch.callback);
     if (kind == Kind::image) {
@@ -543,7 +540,6 @@ Damage apply_properties(Element& element, ElementPatch& patch, std::size_t& byte
     if (patch.specified & scroll_specified) element.scroll_origin.reset();
     if (patch.callback >= 0) { unref(patch.lua, element.callback); element.callback = std::exchange(patch.callback, LUA_NOREF); }
     if (patch.image) { element.image = std::move(patch.image); element.image_notified = false; damage = std::max(damage, geometry_changed); }
-    element.text_dirty |= damage == shaping_changed;
     return damage;
 }
 
@@ -894,7 +890,7 @@ int set_element(lua_State* lua) {
         const auto& pressed = live.elements[static_cast<std::size_t>(live.pressed)];
         if (live.pressed == identity.element || pressed.target_index == identity.element) live.pressed = -1;
     }
-    if (damage != unchanged) invalidate_element(live, identity.element, damage >= geometry_changed);
+    invalidate_element(live, identity.element, damage);
     if (element.image && !element.image->submitted) wake(gui.owner);
     lua_pushboolean(lua, true); return 1;
 }

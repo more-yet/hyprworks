@@ -299,14 +299,17 @@ void damage(Surface& surface, Box box) {
     }
 }
 
-void invalidate_element(Surface& surface, int index, bool geometry) {
-    if (index < 0) return;
-    damage(surface, surface.elements[static_cast<std::size_t>(index)].clip);
-    if (!geometry) return;
+void invalidate_element(Surface& surface, int index, Damage change) {
+    if (index < 0 || change == unchanged) return;
+    auto& target = surface.elements[static_cast<std::size_t>(index)];
+    if (change == shaping_changed) target.text_dirty = true;
+    damage(surface, target.clip);
+    if (change == paint_changed) return;
     surface.dirty = surface.layout_dirty = true;
     for (int i = index; i >= 0; i = surface.elements[static_cast<std::size_t>(i)].parent) {
         auto& element = surface.elements[static_cast<std::size_t>(i)];
-        element.measure_dirty = true;
+        if (change == placement_changed) element.arrange_dirty = true;
+        else element.measure_dirty = true;
     }
 }
 
@@ -317,8 +320,7 @@ void dirty(Surface& surface) {
     damage(surface, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)});
 }
 
-void layout(Surface& surface) {
-    if (!surface.layout_dirty || surface.elements.empty()) return;
+static void measure_tree(Surface& surface) {
     auto& elements = surface.elements;
     for (int index = static_cast<int>(elements.size()) - 1; index >= 0; --index) {
         auto& element = elements[static_cast<std::size_t>(index)];
@@ -351,6 +353,12 @@ void layout(Surface& surface) {
         element.intrinsic_h = element.height >= 0 ? element.height : height + element.padding * 2;
     }
     measure(surface, 0, surface.width);
+}
+
+void layout(Surface& surface) {
+    auto& elements = surface.elements;
+    if (!surface.layout_dirty || elements.empty()) return;
+    if (elements.front().measure_dirty) measure_tree(surface);
     arrange(surface, 0, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)},
         {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)});
     for (const int index : surface.range_elements) {
@@ -396,7 +404,7 @@ void reveal_focus(Surface& surface, bool native) {
                 if (element.horizontal) target.x -= next - element.scroll;
                 else target.y -= next - element.scroll;
                 element.scroll = next;
-                invalidate_element(surface, index, true);
+                invalidate_element(surface, index, placement_changed);
                 changed = true;
             }
         }

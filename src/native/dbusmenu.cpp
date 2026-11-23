@@ -53,7 +53,7 @@ void read_item(sd_bus_message* message, Snapshot& snapshot, std::int32_t parent,
     item.parent = parent;
     require(sd_bus_message_read(message, "i", &item.id));
     const auto id = item.id;
-    if ((depth == 0 && id != 0) || (depth && id <= 0) || std::ranges::find(snapshot.items, id, &Item::id) != snapshot.items.end())
+    if ((depth == 0 && id != 0) || (depth && id <= 0))
         throw std::runtime_error("invalid or duplicate menu item ID");
     read_properties(message, snapshot, &item, bytes, binary);
     snapshot.items.push_back(std::move(item));
@@ -107,6 +107,11 @@ struct MenuConnection::State {
                 if (error) throw std::runtime_error(error->message ? error->message : error->name);
                 require(sd_bus_message_read(message, "u", &state.pending.remote_revision));
                 read_item(message, state.pending, -1, 0, state.bytes, state.binary);
+                std::vector<std::int32_t> ids;
+                ids.reserve(state.pending.items.size());
+                for (const auto& item : state.pending.items) ids.push_back(item.id);
+                std::ranges::sort(ids);
+                if (std::ranges::adjacent_find(ids) != ids.end()) throw std::runtime_error("invalid or duplicate menu item ID");
                 publish_snapshot(state.snapshot, state.pending);
                 state.deadline.reset(); state.status = {Phase::ready, {}};
             } else {

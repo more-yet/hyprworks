@@ -118,7 +118,7 @@ struct Process::State {
 
     void end_input() noexcept {
         pending.stdin_discarded += queue.size() - sent;
-        close_fd(input); queue.clear(); sent = 0; eof = true;
+        close_fd(input); std::string{}.swap(queue); sent = 0; eof = true;
     }
 
     void finish(ProcessOutcome outcome) noexcept {
@@ -432,9 +432,22 @@ std::expected<std::string, std::string> read_file(const std::string& path, std::
         struct stat status{}; check(fstat(fd, &status), "stat file");
         if (!S_ISREG(status.st_mode)) throw std::runtime_error("file is not regular");
         std::string result;
-        if (status.st_size > 0) result.reserve(std::min(static_cast<std::uintmax_t>(status.st_size), static_cast<std::uintmax_t>(limit)));
+        const auto expected = status.st_size > 0 ? static_cast<std::size_t>(
+            std::min<std::uintmax_t>(static_cast<std::uintmax_t>(status.st_size), limit)) : 0;
+        char buffer[16384];
+        if (expected > sizeof(buffer)) {
+            int error = 0;
+            result.resize_and_overwrite(expected, [&](char* data, std::size_t) noexcept {
+                ssize_t count;
+                do { count = ::read(fd, data, expected); } while (count < 0 && errno == EINTR);
+                if (count < 0) error = errno;
+                return static_cast<std::size_t>(std::max<ssize_t>(0, count));
+            });
+            if (error) throw std::system_error(error, std::generic_category(), "read file");
+            if (result.empty()) { close_fd(fd); return result; }
+        }
+        // Regular files can grow, and procfs files can report zero size.
         for (;;) {
-            char buffer[16384];
             const auto size = ::read(fd, buffer, sizeof(buffer));
             if (size < 0 && errno == EINTR) continue;
             check(static_cast<int>(size), "read file");

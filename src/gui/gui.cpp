@@ -427,7 +427,7 @@ int dispatch_gui(Gui& gui) {
             }
             if (!element.image->submitted) gui.images.submit(element.image);
             if (element.image_notified || !element.image->ready.load(std::memory_order_acquire)) continue;
-            element.image_notified = true; invalidate_element(*surface, index, true);
+            element.image_notified = true; invalidate_element(*surface, index, geometry_changed);
             if (notify_element(*surface, index, "loaded", element.image) < 0) return -1;
         }
     }
