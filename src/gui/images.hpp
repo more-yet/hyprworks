@@ -1,11 +1,11 @@
 #pragma once
 
-#include "icons.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <cairo.h>
@@ -37,8 +37,6 @@ struct ImageWork {
     std::atomic<std::size_t> bytes{0};
     std::thread thread;
     bool stopping = false;
-    int wake_fd = -1;
-    std::optional<IconTheme> icons;
     void start(int wake);
     void stop();
     bool submit(const std::shared_ptr<Image>& image);

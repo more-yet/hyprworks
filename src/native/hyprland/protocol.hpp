@@ -15,8 +15,10 @@ inline constexpr std::size_t max_event_bytes = 4096;
 inline constexpr std::size_t io_budget = 64 * 1024;
 
 std::expected<bool, Error> connect_socket(int& fd, const std::string& path);
+std::expected<void, Error> finish_connect(int fd);
+Error io_error(std::string operation, int code);
 std::expected<SocketPhase, Error> advance_request(int fd, short events, SocketPhase phase, std::string_view request,
-    std::string& reply, std::size_t limit, bool& wrote);
+    std::string& reply, std::size_t limit, bool* may_have_executed = nullptr);
 
 std::expected<Snapshot, Error> parse_snapshot(std::string_view reply);
 std::expected<std::string, Error> encode_switch(const Workspace& workspace);

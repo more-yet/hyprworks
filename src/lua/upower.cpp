@@ -69,17 +69,10 @@ int power_snapshot(lua_State* lua) {
 
 int power_status(lua_State* lua) {
     const auto& binding = power_handle(lua, true);
-    const auto status = binding.connection.status();
-    const bool closed = binding.closed, has_snapshot = bool(binding.connection.snapshot());
-    return protected_call(lua, [&](lua_State* lua) {
-        static const char* phases[] = {"stopped", "connecting", "synchronizing", "ready", "unavailable", "failed"};
-        lua_createtable(lua, 0, 3);
-        lua_pushstring(lua, closed ? "closed" : phases[static_cast<unsigned>(status.phase)]);
-        lua_setfield(lua, -2, "phase");
-        lua_pushboolean(lua, has_snapshot); lua_setfield(lua, -2, "has_snapshot");
-        if (!status.error.empty()) string_field(lua, "error", status.error);
-        return 1;
-    }, 1);
+    const auto& status = binding.connection.status();
+    static const char* phases[] = {"stopped", "connecting", "synchronizing", "ready", "unavailable", "failed"};
+    return connection_status(lua, binding.closed ? "closed" : phases[static_cast<unsigned>(status.phase)],
+        status.error, bool(binding.connection.snapshot()));
 }
 
 int power_on_status(lua_State* lua) {

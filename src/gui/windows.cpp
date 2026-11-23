@@ -1,7 +1,7 @@
 #include "../runtime/invocation.hpp"
 #include "gui.hpp"
 #include "windows.hpp"
-#include "../native/hyprland/workspace_protocol.hpp"
+#include "../native/hyprland/protocol.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -56,8 +56,8 @@ void stop_capture(Capture& capture) {
     if (capture.frame) ext_image_copy_capture_frame_v1_destroy(std::exchange(capture.frame, nullptr));
     if (capture.session) ext_image_copy_capture_session_v1_destroy(std::exchange(capture.session, nullptr));
     release_buffer(capture);
-    capture.image.reset(); capture.next_frame.reset(); capture.deadline.reset();
-    capture.ready = capture.pending = false;
+    capture.next_frame.reset(); capture.deadline.reset();
+    capture.ready = false; capture.error = nullptr;
 }
 
 void close_capture(Capture& capture) {
@@ -68,10 +68,10 @@ void close_capture(Capture& capture) {
 }
 
 void capture_error(Capture& capture, const char* message, bool unavailable) {
-    if (capture.closed || capture.error) return;
+    if (!capture.session) return;
     stop_capture(capture);
     capture.workspace = nullptr;
-    capture.error = message; capture.unavailable = unavailable; capture.pending = true;
+    capture.error = message; capture.unavailable = unavailable;
 }
 
 const ext_foreign_toplevel_handle_v1_listener target_listener{
@@ -612,23 +612,23 @@ int capture_workspace(lua_State* lua) {
     });
 }
 
-void advance_capture(Capture& capture) {
-    if (capture.closed || capture.error || !capture.session) return;
+std::shared_ptr<Image> advance_capture(Capture& capture) {
+    if (!capture.session) return {};
     const auto now = Clock::now();
     if (capture.deadline && now >= *capture.deadline) {
         capture_error(capture, "initial capture frame timed out", true);
-        return;
+        return {};
     }
     try {
         if (std::exchange(capture.ready, false)) {
             if (!capture.constraints || capture.width != capture.buffer_width || capture.height != capture.buffer_height ||
                 capture.format != capture.buffer_format) {
                 capture.next_frame = now;
-                return;
+                return {};
             }
             if (capture.transform != WL_OUTPUT_TRANSFORM_NORMAL) {
                 capture_error(capture, "unsupported capture transform");
-                return;
+                return {};
             }
             auto image = std::make_shared<Image>(capture.gui->images);
             const double scale = std::min({1.0, static_cast<double>(capture.max_width) / capture.buffer_width,
@@ -650,27 +650,28 @@ void advance_capture(Capture& capture) {
             cairo_paint(paint.get());
             if (cairo_status(paint.get()) != CAIRO_STATUS_SUCCESS) throw std::runtime_error("cannot scale captured frame");
             image->submitted = true; image->ready.store(true, std::memory_order_release);
-            capture.image = std::move(image); capture.pending = true; capture.deadline.reset();
+            capture.deadline.reset();
             capture.next_frame = now + capture.interval;
+            return image;
         }
-        if (!capture.constraints || capture.frame || capture.pending || !capture.next_frame || now < *capture.next_frame) return;
+        if (!capture.constraints || capture.frame || !capture.next_frame || now < *capture.next_frame) return {};
         const bool replace = !capture.buffer || capture.buffer_width != capture.width || capture.buffer_height != capture.height ||
             capture.buffer_format != capture.format;
         if (replace) {
             if (!capture.width || !capture.height || capture.width > 8192 || capture.height > 8192 ||
                 static_cast<std::uint64_t>(capture.width) * capture.height * 4 > 64 * 1024 * 1024) {
                 capture_error(capture, "capture buffer exceeds 64 MiB");
-                return;
+                return {};
             }
             if (capture.format == UINT32_MAX) {
                 capture_error(capture, "capture requires ARGB8888 or XRGB8888 shared memory", true);
-                return;
+                return {};
             }
             release_buffer(capture);
             const auto bytes = static_cast<std::size_t>(capture.width) * capture.height * 4;
             if (bytes > capture_limit - capture.gui->capture_bytes) {
                 capture_error(capture, "capture memory limit reached (128 MiB)");
-                return;
+                return {};
             }
             capture.buffer = create_shm_buffer(capture.gui->shm, static_cast<int>(capture.width), static_cast<int>(capture.height),
                 capture.format, capture.pixels);
@@ -687,6 +688,7 @@ void advance_capture(Capture& capture) {
         ext_image_copy_capture_frame_v1_capture(capture.frame);
         capture.next_frame.reset();
     } catch (const std::exception&) { capture_error(capture, "cannot allocate or scale captured frame"); }
+    return {};
 }
 
 }
@@ -778,7 +780,7 @@ void prepare_windows(WindowCatalog& catalog, WaitSet& wait) {
 
 void prepare_captures(Gui& gui, WaitSet& wait) {
     for (auto& capture : gui.captures) if (capture && !capture->closed) {
-        if (capture->ready || capture->pending) wait.due(Clock::time_point::min());
+        if (capture->ready || capture->error) wait.due(Clock::time_point::min());
         if (capture->constraints) wait.due(capture->next_frame);
         wait.due(capture->deadline);
     }
@@ -818,8 +820,7 @@ void read_windows(WindowCatalog& catalog, const WaitSet& wait) {
     if (catalog.wait_offset >= wait.fds.size() || wait.fds[catalog.wait_offset].fd != catalog.fd) return;
     const auto events = wait.fds[catalog.wait_offset].revents;
     if (!events) return;
-    bool wrote = false;
-    const auto next = native::protocol::advance_request(catalog.fd, events, catalog.query, request, catalog.reply, max_reply, wrote);
+    const auto next = native::protocol::advance_request(catalog.fd, events, catalog.query, request, catalog.reply, max_reply);
     if (!next) { fail(catalog, next.error().message); return; }
     catalog.query = *next;
     if (catalog.query == WindowCatalog::Query::complete) {
@@ -832,17 +833,17 @@ int dispatch_captures(Gui& gui) {
     auto* lua = gui.owner.lua;
     for (auto capture : gui.captures) {
         if (!capture || capture->closed || gui.owner.requests.load(std::memory_order_relaxed)) continue;
-        advance_capture(*capture);
-        if (!std::exchange(capture->pending, false) || capture->callback < 0) continue;
-        const auto image = std::move(capture->image);
+        const auto image = advance_capture(*capture);
+        const char* error = std::exchange(capture->error, nullptr);
+        if (!image && !error) continue;
         const int reference = capture->callback;
         lua_pushcfunction(lua, traceback);
         if (protected_call(lua, [&](lua_State* lua) {
             lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
             lua_rawgeti(lua, LUA_REGISTRYINDEX, capture->handle);
             lua_createtable(lua, 0, 6);
-            string_field(lua, "kind", capture->error ? (capture->unavailable ? "unavailable" : "error") : "frame");
-            if (capture->error) string_field(lua, "error", capture->error);
+            string_field(lua, "kind", error ? (capture->unavailable ? "unavailable" : "error") : "frame");
+            if (error) string_field(lua, "error", error);
             else {
                 auto* source = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<Image>), 0)) std::shared_ptr<Image>();
                 luaL_setmetatable(lua, captured_image_type); *source = image;

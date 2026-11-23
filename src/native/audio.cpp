@@ -1,4 +1,5 @@
 #include <hyprworks/audio.hpp>
+#include "snapshot.hpp"
 #include <pulse/pulseaudio.h>
 #include <algorithm>
 #include <array>
@@ -272,13 +273,7 @@ struct AudioConnection::State {
             const auto duplicates = std::ranges::unique(*devices, {}, &Device::name);
             devices->erase(duplicates.begin(), duplicates.end());
         }
-        pending.revision = snapshot ? snapshot->revision : 0;
-        if (!snapshot || pending != *snapshot) {
-            if (pending.revision == UINT64_MAX) throw std::runtime_error("audio snapshot revision exhausted");
-            ++pending.revision;
-            snapshot = std::make_shared<const Snapshot>(std::move(pending));
-        }
-        pending = {};
+        publish_snapshot(snapshot, pending);
         status = {Phase::ready, {}};
         deadline.reset();
     }

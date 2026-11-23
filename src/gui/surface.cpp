@@ -90,37 +90,35 @@ void clear_elements(lua_State* lua, std::vector<Element>& elements) {
 
 }
 
-void destroy_surface(Surface& surface) {
-    auto& gui = *surface.gui;
-    if (surface.grab) hyprland_focus_grab_v1_destroy(std::exchange(surface.grab, nullptr));
-    for (auto& child : gui.surfaces)
-        if (child && child->parent == surface.id) destroy_surface(*child);
-    if (surface.native && surface.parent) {
-        auto& root = root_surface(surface);
+Surface::Surface(Gui& owner) : gui(&owner), id(++owner.next_surface) {}
+
+Surface::~Surface() {
+    if (native && parent) {
+        auto& root = root_surface(*this);
         if (root.grab) {
-            hyprland_focus_grab_v1_remove_surface(root.grab, surface.native);
+            hyprland_focus_grab_v1_remove_surface(root.grab, native);
             hyprland_focus_grab_v1_commit(root.grab);
         }
     }
-    surface.parent = 0;
-    surface.closed = true;
-    surface.mapped = false;
-    surface.popup_reposition_pending = false;
-    if (surface.frame) wl_callback_destroy(std::exchange(surface.frame, nullptr));
-    if (surface.popup) xdg_popup_destroy(std::exchange(surface.popup, nullptr));
-    if (surface.toplevel) xdg_toplevel_destroy(std::exchange(surface.toplevel, nullptr));
-    if (surface.xdg) xdg_surface_destroy(std::exchange(surface.xdg, nullptr));
-    if (surface.layer) zwlr_layer_surface_v1_destroy(std::exchange(surface.layer, nullptr));
-    if (surface.fractional) wp_fractional_scale_v1_destroy(std::exchange(surface.fractional, nullptr));
-    if (surface.viewport) wp_viewport_destroy(std::exchange(surface.viewport, nullptr));
-    if (surface.native) wl_surface_destroy(std::exchange(surface.native, nullptr));
-    clear_elements(gui.owner.lua, surface.elements);
-    surface.named_elements.clear(); surface.image_elements.clear(); surface.scroll_elements.clear(); surface.range_elements.clear();
-    unref(gui.owner.lua, surface.on_configure);
-    unref(gui.owner.lua, surface.on_close);
-    unref(gui.owner.lua, surface.on_grab_cleared);
-    unref(gui.owner.lua, surface.on_input);
-    unref(gui.owner.lua, surface.on_focus_change);
+    if (frame) wl_callback_destroy(frame);
+    if (popup) xdg_popup_destroy(popup);
+    if (toplevel) xdg_toplevel_destroy(toplevel);
+    if (xdg) xdg_surface_destroy(xdg);
+    if (layer) zwlr_layer_surface_v1_destroy(layer);
+    if (fractional) wp_fractional_scale_v1_destroy(fractional);
+    if (viewport) wp_viewport_destroy(viewport);
+    if (native) wl_surface_destroy(native);
+    auto* lua = gui->owner.lua;
+    clear_elements(lua, elements);
+    for (auto* reference : {&on_configure, &on_close, &on_grab_cleared, &on_input, &on_focus_change})
+        unref(lua, *reference);
+}
+
+void retire_surface(std::unique_ptr<Surface>& slot) {
+    if (slot->grab) hyprland_focus_grab_v1_destroy(std::exchange(slot->grab, nullptr));
+    for (auto& child : slot->gui->surfaces)
+        if (child && child->parent == slot->id) retire_surface(child);
+    slot.reset();
 }
 
 void close_surface(Surface& surface) {
@@ -218,7 +216,7 @@ void request_surface_close(Surface& surface, const char* reason) {
 
 namespace {
 
-void set_configure(Surface& surface, int width, int height) {
+void set_configure(Surface& surface, std::int64_t width, std::int64_t height) {
     if (surface.closed || surface.close_pending) return;
     if (width < 1 || height < 1 || width > 16384 || height > 16384) {
         surface.gui->error = "configured surface dimensions outside 1..16384";
@@ -229,7 +227,7 @@ void set_configure(Surface& surface, int width, int height) {
     if (resized || (surface.parent &&
         (surface.popup_x != surface.pending_popup_x || surface.popup_y != surface.pending_popup_y)))
         cancel_surface_input(surface, true);
-    surface.width = width; surface.height = height;
+    surface.width = static_cast<int>(width); surface.height = static_cast<int>(height);
     surface.configured = true; surface.configure_pending = true;
     if (surface.popup) {
         surface.popup_x = surface.pending_popup_x;
@@ -282,9 +280,8 @@ const zwlr_layer_surface_v1_listener layer_listener{
     .configure = [](void* data, zwlr_layer_surface_v1* layer, std::uint32_t serial, std::uint32_t width, std::uint32_t height) {
         auto& surface = *static_cast<Surface*>(data);
         zwlr_layer_surface_v1_ack_configure(layer, serial);
-        if (width > 16384 || height > 16384) { surface.gui->error = "layer dimensions exceed 16384"; return; }
-        set_configure(surface, width ? static_cast<int>(width) : surface.pending_width,
-            height ? static_cast<int>(height) : surface.pending_height);
+        set_configure(surface, width ? std::int64_t(width) : surface.pending_width,
+            height ? std::int64_t(height) : surface.pending_height);
     },
     .closed = [](void* data, zwlr_layer_surface_v1*) { request_surface_close(*static_cast<Surface*>(data)); }
 };
@@ -379,7 +376,7 @@ void read_properties(lua_State* lua, int table, ElementPatch& patch, Gui& gui, K
         std::size_t length;
         const char* data = check_string(lua, -1, &length);
         if ((length != 7 && length != 9) || data[0] != '#') luaL_error(lua, "%s must be #RRGGBB or #RRGGBBAA", name);
-        std::uint32_t value;
+        std::uint32_t value = 0;
         const auto parsed = std::from_chars(data + 1, data + length, value, 16);
         if (parsed.ec != std::errc{} || parsed.ptr != data + length) luaL_error(lua, "invalid color");
         patch.colors.push_back({member, length == 7 ? (value << 8) | 255 : value, paint_changed});
@@ -892,16 +889,11 @@ int set_element(lua_State* lua) {
     auto& element = live.elements[static_cast<std::size_t>(identity.element)];
     const bool horizontal = element.horizontal;
     const auto damage = apply_properties(element, patch, live.content_bytes);
-    if (!element.enabled) {
-        if (live.focused == identity.element) focus(live, -1);
-        if (live.pressed == identity.element) live.pressed = -1;
+    if (!element.enabled && live.focused == identity.element) focus(live, -1);
+    if (live.pressed >= 0 && (!element.enabled || horizontal != element.horizontal)) {
+        const auto& pressed = live.elements[static_cast<std::size_t>(live.pressed)];
+        if (live.pressed == identity.element || pressed.target_index == identity.element) live.pressed = -1;
     }
-    if (element.kind == Kind::slider && horizontal != element.horizontal) {
-        if (live.pressed == identity.element) live.pressed = -1;
-    }
-    if (element.kind == Kind::scroll && (!element.enabled || horizontal != element.horizontal) &&
-        live.pressed >= 0 && live.elements[static_cast<std::size_t>(live.pressed)].target_index == identity.element)
-        live.pressed = -1;
     if (damage != unchanged) invalidate_element(live, identity.element, damage >= geometry_changed);
     if (element.image && !element.image->submitted) wake(gui.owner);
     lua_pushboolean(lua, true); return 1;
@@ -976,28 +968,26 @@ const hyprland_focus_grab_v1_listener grab_listener{
     }
 };
 
-template<int Role>
+enum class SurfaceRole { window, layer, popup };
+
+template<SurfaceRole role>
 int create_surface(lua_State* lua) {
     auto& gui = gui_state(lua);
     luaL_checktype(lua, 1, LUA_TTABLE);
-    auto surface = std::make_unique<Surface>(); surface->gui = &gui; surface->id = ++gui.next_surface;
-    struct Cleanup {
-        Surface* surface;
-        ~Cleanup() { if (surface) destroy_surface(*surface); }
-    } cleanup{surface.get()};
+    auto surface = std::make_unique<Surface>(gui);
     std::string title, app_id, output;
     int width = 0, height = 0, x = 0, y = 0;
     int edge = 0, layer = 0, keyboard = 0, exclusive_zone = 0, margin = 0;
     bool exclusive = false, grab = false;
     lua_pushvalue(lua, 1);
     if (protected_call(lua, [&](lua_State* lua) {
-        if constexpr (Role != 1) {
+        if constexpr (role != SurfaceRole::layer) {
             width = static_cast<int>(integer_field(lua, 2, "width", std::nullopt, 1));
             height = static_cast<int>(integer_field(lua, 2, "height", std::nullopt, 1));
         }
-        if constexpr (Role == 0) text_field(lua, 2, "title", title, 256);
-        if constexpr (Role != 2) text_field(lua, 2, "app_id", app_id, 256);
-        if constexpr (Role == 1) text_field(lua, 2, "output", output, 256);
+        if constexpr (role == SurfaceRole::window) text_field(lua, 2, "title", title, 256);
+        if constexpr (role != SurfaceRole::popup) text_field(lua, 2, "app_id", app_id, 256);
+        if constexpr (role == SurfaceRole::layer) text_field(lua, 2, "output", output, 256);
         callback_field(lua, 2, "on_configure", surface->on_configure);
         callback_field(lua, 2, "on_close", surface->on_close);
         callback_field(lua, 2, "on_grab_cleared", surface->on_grab_cleared);
@@ -1006,7 +996,7 @@ int create_surface(lua_State* lua) {
         surface->dismiss_focus_loss = boolean_field(lua, 2, "dismiss_on_focus_loss", false);
         surface->dismiss_escape = boolean_field(lua, 2, "dismiss_on_escape", false);
         surface->dismiss_grab_cleared = boolean_field(lua, 2, "dismiss_on_grab_cleared", false);
-        if constexpr (Role == 1) {
+        if constexpr (role == SurfaceRole::layer) {
             static const char* edges[] = {"top", "bottom", "left", "right", "all", nullptr};
             static const char* layers[] = {"background", "bottom", "top", "overlay", nullptr};
             static const char* keyboards[] = {"none", "exclusive", "on_demand", nullptr};
@@ -1021,7 +1011,7 @@ int create_surface(lua_State* lua) {
             height = static_cast<int>(integer_field(lua, 2, "height", std::nullopt, edge < 2 ? 1 : 0));
             if (edge == 4 && (exclusive || exclusive_zone > 0)) luaL_error(lua, "an all-edge layer cannot reserve space");
         }
-        if constexpr (Role == 2) {
+        if constexpr (role == SurfaceRole::popup) {
             field(lua, 2, "parent"); surface->parent = handle(lua, -1, surface_type).surface; lua_pop(lua, 1);
             x = static_cast<int>(integer_field(lua, 2, "x", 0, -16384));
             y = static_cast<int>(integer_field(lua, 2, "y", 0, -16384));
@@ -1033,8 +1023,8 @@ int create_surface(lua_State* lua) {
     auto slot = std::ranges::find_if(gui.surfaces, [](const auto& item) { return !item; });
     if (slot == gui.surfaces.end()) throw std::runtime_error("surface limit reached (32); closed surfaces retire at the next loop turn");
     Surface* parent = nullptr;
-    if constexpr (Role == 1) if (!gui.layers) throw std::runtime_error("layer-shell v4 is unavailable");
-    if constexpr (Role == 2) {
+    if constexpr (role == SurfaceRole::layer) if (!gui.layers) throw std::runtime_error("layer-shell v4 is unavailable");
+    if constexpr (role == SurfaceRole::popup) {
         parent = find_surface(gui, surface->parent);
         if (!parent || !parent->configured) throw std::runtime_error("popup parent must be configured");
         if (parent->close_pending) throw std::runtime_error("popup parent is closing");
@@ -1055,7 +1045,7 @@ int create_surface(lua_State* lua) {
     if (!output.empty()) {
         for (const auto& item : gui.outputs) if (item->ready && item->state.name == output) {
             native_output = item->native;
-            if constexpr (Role == 1) surface->output = item->id;
+            surface->output = item->id;
         }
         if (!native_output) throw std::runtime_error("output not found: " + output);
     }
@@ -1073,7 +1063,7 @@ int create_surface(lua_State* lua) {
         if (!surface->fractional) throw std::runtime_error("cannot create fractional scale");
         wp_fractional_scale_v1_add_listener(surface->fractional, &scale_listener, surface.get());
     }
-    if constexpr (Role == 1) {
+    if constexpr (role == SurfaceRole::layer) {
         surface->layer = zwlr_layer_shell_v1_get_layer_surface(gui.layers, surface->native, native_output, static_cast<std::uint32_t>(layer), app_id.c_str());
         if (!surface->layer) throw std::runtime_error("cannot create layer surface");
         zwlr_layer_surface_v1_add_listener(surface->layer, &layer_listener, surface.get());
@@ -1087,7 +1077,7 @@ int create_surface(lua_State* lua) {
         surface->xdg = xdg_wm_base_get_xdg_surface(gui.shell, surface->native);
         if (!surface->xdg) throw std::runtime_error("cannot create XDG surface");
         xdg_surface_add_listener(surface->xdg, &xdg_listener, surface.get());
-        if constexpr (Role == 0) {
+        if constexpr (role == SurfaceRole::window) {
             surface->toplevel = xdg_surface_get_toplevel(surface->xdg);
             if (!surface->toplevel) throw std::runtime_error("cannot create toplevel");
             xdg_toplevel_add_listener(surface->toplevel, &toplevel_listener, surface.get());
@@ -1097,9 +1087,9 @@ int create_surface(lua_State* lua) {
         }
     }
     const auto id = surface->id;
-    if constexpr (Role == 2) initialize_popup(*surface);
+    if constexpr (role == SurfaceRole::popup) initialize_popup(*surface);
     else wl_surface_commit(surface->native);
-    *slot = std::move(surface); cleanup.surface = nullptr;
+    *slot = std::move(surface);
     if (protected_call(lua, [&](lua_State* lua) { push_handle(lua, {id, 0, -1}, surface_type); return 1; }, 1) < 0) {
         close_surface(**slot); return -1;
     }
@@ -1333,7 +1323,8 @@ void register_surfaces(lua_State* lua) {
     luaL_setfuncs(lua, elements, 0); lua_pushvalue(lua, -1); lua_setfield(lua, -2, "__index");
     lua_pushliteral(lua, "hyprworks element"); lua_setfield(lua, -2, "__metatable"); lua_pop(lua, 1);
     const luaL_Reg functions[] = {
-        {"layer", operation_call<create_surface<1>>}, {"window", operation_call<create_surface<0>>}, {"popup", operation_call<create_surface<2>>},
+        {"layer", operation_call<create_surface<SurfaceRole::layer>>}, {"window", operation_call<create_surface<SurfaceRole::window>>},
+        {"popup", operation_call<create_surface<SurfaceRole::popup>>},
         {nullptr, nullptr}
     };
     luaL_setfuncs(lua, functions, 0);

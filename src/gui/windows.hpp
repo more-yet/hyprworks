@@ -22,7 +22,6 @@ struct Gui;
 struct WaitSet;
 struct WindowCatalog;
 struct WorkspaceCaptureGroup;
-struct Image;
 inline constexpr char captured_image_type[] = "hyprworks.captured_image";
 struct CaptureTarget {
     WindowCatalog* catalog = nullptr;
@@ -45,10 +44,9 @@ struct Capture {
     int max_width = 0, max_height = 0;
     std::chrono::milliseconds interval{};
     std::optional<std::chrono::steady_clock::time_point> next_frame, deadline;
-    std::shared_ptr<Image> image;
     const char* error = nullptr;
     unsigned constraint_failures = 0;
-    bool closed = false, unavailable = false, constraints = false, ready = false, pending = false;
+    bool closed = false, unavailable = false, constraints = false, ready = false;
 };
 struct WorkspaceCaptureTarget {
     Gui* gui = nullptr;

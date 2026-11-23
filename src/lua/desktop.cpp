@@ -33,14 +33,10 @@ int desktop_open(lua_State* lua) {
 
 int desktop_status(lua_State* lua) {
     const auto& binding = desktop_handle(lua, true);
-    const auto status = binding.entries.status(); const bool closed = binding.closed, snapshot = bool(binding.entries.snapshot());
-    return protected_call(lua, [&](lua_State* lua) {
-        static const char* phases[] = {"stopped", "ready", "failed"}; lua_createtable(lua, 0, 3);
-        lua_pushstring(lua, closed ? "closed" : phases[static_cast<unsigned>(status.phase)]); lua_setfield(lua, -2, "phase");
-        lua_pushboolean(lua, snapshot); lua_setfield(lua, -2, "has_snapshot");
-        if (!status.error.empty()) string_field(lua, "error", status.error);
-        return 1;
-    }, 1);
+    const auto& status = binding.entries.status();
+    static const char* phases[] = {"stopped", "ready", "failed"};
+    return connection_status(lua, binding.closed ? "closed" : phases[static_cast<unsigned>(status.phase)],
+        status.error, bool(binding.entries.snapshot()));
 }
 
 int desktop_snapshot(lua_State* lua) {

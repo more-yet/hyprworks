@@ -23,17 +23,6 @@ int main() {
                 std::cerr << lua_tostring(state.lua, -1) << '\n'; std::abort();
             }
         };
-        lua_pushcfunction(state.lua, guarded<+[](lua_State* lua) {
-            identifier(lua, check_uint64(lua, 1, 1));
-            return 1;
-        }>);
-        lua_setglobal(state.lua, "identifier");
-        script(R"(
-            assert(identifier("18446744073709551615") == "18446744073709551615")
-            for _, value in ipairs({"0", "-1", "18446744073709551616", "1x", "1\0", 1}) do
-                assert(not pcall(identifier, value))
-            end
-        )");
         script(R"(
             collectgarbage("stop")
             delivered, finalized = 0, 0

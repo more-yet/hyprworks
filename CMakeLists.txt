@@ -39,7 +39,7 @@ if(HYPRWORKS_BUILD_POLKIT)
     list(APPEND HYPRWORKS_NATIVE_DEPS polkit-agent-1>=128)
 endif()
 
-add_library(hyprworks src/native/hyprland/workspaces.cpp src/native/hyprland/workspace_protocol.cpp src/native/host.cpp)
+add_library(hyprworks src/native/hyprland/workspaces.cpp src/native/hyprland/protocol.cpp src/native/host.cpp)
 add_library(hyprworks::hyprworks ALIAS hyprworks)
 target_compile_features(hyprworks PUBLIC cxx_std_23)
 set_target_properties(hyprworks PROPERTIES CXX_EXTENSIONS OFF VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})

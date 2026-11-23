@@ -184,8 +184,7 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
         const auto background = element.background;
         const bool border = element.border_width > 0 && (element.border_color & 255);
         const bool outline = static_cast<int>(index) == outlined && element.focus_width > 0 && (element.focus_color & 255);
-        if (!(background & 255) && !border && !outline && !element.layout &&
-            element.kind != Kind::image) continue;
+        if (!(background & 255) && !border && !outline && !element.layout && !element.image) continue;
         cairo_save(cr);
         cairo_rectangle(cr, element.clip.x, element.clip.y, element.clip.w, element.clip.h); cairo_clip(cr);
         if (background & 255) {
@@ -199,7 +198,7 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
                 std::max(0.0, box.h - 2 * inset)}, element.radius);
             cairo_stroke(cr);
         }
-        if (element.kind == Kind::image && element.image && element.image->ready.load(std::memory_order_acquire) && element.image->error.empty()) {
+        if (element.image && element.image->ready.load(std::memory_order_acquire) && element.image->error.empty()) {
             const auto& image = *element.image;
             const double factor = std::min(box.w / image.width, box.h / image.height);
             cairo_save(cr);
@@ -327,17 +326,16 @@ void layout(Surface& surface) {
         double width = 0, height = 0; int count = 0;
         const bool horizontal = element.kind == Kind::row || (element.kind == Kind::scroll && element.horizontal);
         const bool vertical = element.kind == Kind::column || (element.kind == Kind::scroll && !element.horizontal);
-        if (!element.font.empty() && (element.kind == Kind::text || element.kind == Kind::button ||
-            element.kind == Kind::toggle || element.kind == Kind::input)) {
+        if (!element.font.empty()) {
             if (!element.layout || element.text_dirty) {
                 text_layout(*surface.gui, element, -1);
                 pango_layout_get_pixel_size(element.layout, &element.natural_text_width, &element.natural_text_height);
             }
             width = element.natural_text_width; height = element.natural_text_height;
-        } else if (element.kind == Kind::image) {
-            if (element.image && element.image->icon_size) {
+        } else if (element.image) {
+            if (element.image->icon_size) {
                 width = height = element.image->icon_size;
-            } else if (element.image && element.image->ready.load(std::memory_order_acquire) && element.image->error.empty()) {
+            } else if (element.image->ready.load(std::memory_order_acquire) && element.image->error.empty()) {
                 width = element.image->width / surface.scale; height = element.image->height / surface.scale;
             }
         }

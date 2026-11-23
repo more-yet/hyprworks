@@ -33,11 +33,19 @@ inline void require(int result) {
     if (!check(result)) throw std::runtime_error("incomplete D-Bus message");
 }
 
-inline std::string_view enter_property(sd_bus_message* message) {
-    const char* name;
-    require(sd_bus_message_read(message, "s", &name));
-    require(sd_bus_message_enter_container(message, 'v', nullptr));
-    return name;
+inline void read_properties(sd_bus_message* message, auto read_value) {
+    require(sd_bus_message_enter_container(message, 'a', "{sv}"));
+    unsigned count = 0;
+    while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
+        if (++count > 128) throw std::length_error("D-Bus property list exceeds 128 entries");
+        const char* name;
+        require(sd_bus_message_read(message, "s", &name));
+        require(sd_bus_message_enter_container(message, 'v', nullptr));
+        read_value(std::string_view(name));
+        check(sd_bus_message_exit_container(message));
+        check(sd_bus_message_exit_container(message));
+    }
+    check(sd_bus_message_exit_container(message));
 }
 
 inline bool boolean(sd_bus_message* message) {

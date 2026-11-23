@@ -124,15 +124,9 @@ int notification_snapshot(lua_State* lua) {
 
 int notification_status(lua_State* lua) {
     const auto& binding = notification_handle(lua, true);
-    const auto status = binding.server.status();
-    const bool closed = binding.closed;
-    return protected_call(lua, [&](lua_State* lua) {
-        static const char* phases[] = {"stopped", "connecting", "ready", "failed"};
-        lua_createtable(lua, 0, 2);
-        lua_pushstring(lua, closed ? "closed" : phases[static_cast<unsigned>(status.phase)]); lua_setfield(lua, -2, "phase");
-        if (!status.error.empty()) string_field(lua, "error", status.error);
-        return 1;
-    }, 1);
+    const auto& status = binding.server.status();
+    static const char* phases[] = {"stopped", "connecting", "ready", "failed"};
+    return connection_status(lua, binding.closed ? "closed" : phases[static_cast<unsigned>(status.phase)], status.error);
 }
 
 int notification_on_status(lua_State* lua) {
@@ -188,24 +182,14 @@ int notification_close(lua_State* lua) {
 
 }
 
-int dispatch_notifications(lua_State* lua, NotificationBinding& binding) {
-    const bool status = std::exchange(binding.status_pending, false);
-    const auto events = std::exchange(binding.events, {});
-    const auto generation = binding.generation;
-    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    for (const auto& event : events) {
-        if (dispatch_callback(lua, binding, binding.on_event, generation, [&](lua_State* lua) {
-            static const char* kinds[] = {"received", "closed", "action"};
-            lua_createtable(lua, 0, 5);
-            lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
-            lua_pushinteger(lua, event.id); lua_setfield(lua, -2, "id");
-            lua_pushinteger(lua, static_cast<unsigned>(event.reason)); lua_setfield(lua, -2, "reason");
-            lua_pushboolean(lua, event.replaced); lua_setfield(lua, -2, "replaced");
-            if (!event.action.empty()) string_field(lua, "action", event.action);
-            return 1;
-        }) < 0) return -1;
-    }
-    return 0;
+void push_notification_event(lua_State* lua, const notifications::Event& event) {
+    static const char* kinds[] = {"received", "closed", "action"};
+    lua_createtable(lua, 0, 5);
+    lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
+    lua_pushinteger(lua, event.id); lua_setfield(lua, -2, "id");
+    lua_pushinteger(lua, static_cast<unsigned>(event.reason)); lua_setfield(lua, -2, "reason");
+    lua_pushboolean(lua, event.replaced); lua_setfield(lua, -2, "replaced");
+    if (!event.action.empty()) string_field(lua, "action", event.action);
 }
 
 void register_notifications(lua_State* lua) {

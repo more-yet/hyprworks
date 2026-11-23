@@ -241,16 +241,9 @@ int bus_error(lua_State* lua) {
 
 int bus_status(lua_State* lua) {
     const auto& bus = bus_handle(lua, true);
-    const auto status = bus.connection.status();
-    const bool closed = bus.closed;
-    return protected_call(lua, [&](lua_State* lua) {
-        static const char* phases[] = {"stopped", "connecting", "ready", "failed"};
-        lua_createtable(lua, 0, 2);
-        lua_pushstring(lua, closed ? "closed" : phases[static_cast<unsigned>(status.phase)]);
-        lua_setfield(lua, -2, "phase");
-        if (!status.error.empty()) string_field(lua, "error", status.error);
-        return 1;
-    }, 1);
+    const auto& status = bus.connection.status();
+    static const char* phases[] = {"stopped", "connecting", "ready", "failed"};
+    return connection_status(lua, bus.closed ? "closed" : phases[static_cast<unsigned>(status.phase)], status.error);
 }
 
 int bus_on_event(lua_State* lua) {
@@ -267,7 +260,7 @@ int bus_on_status(lua_State* lua) {
 
 int bus_close(lua_State* lua) {
     auto& bus = bus_handle(lua, true);
-    bus.closed = true; ++bus.generation; bus.status_pending = false;
+    ++bus.generation; bus.status_pending = false;
     bus.connection.stop(); bus.events.clear();
     unref(lua, bus.on_event); unref(lua, bus.on_status);
     untrack(lua, invocation(lua).buses, bus);
@@ -276,28 +269,18 @@ int bus_close(lua_State* lua) {
 
 }
 
-int dispatch_dbus(lua_State* lua, InvocationState::BusBinding& bus) {
-    const auto generation = bus.generation;
-    const auto events = std::exchange(bus.events, {});
-    const bool status = std::exchange(bus.status_pending, false);
-    if (status && dispatch_callback(lua, bus, bus.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    for (const auto& event : events) {
-        if (dispatch_callback(lua, bus, bus.on_event, generation, [&](lua_State* lua) {
-            static const char* kinds[] = {"reply", "signal", "method", "expired"};
-            lua_createtable(lua, 0, 9);
-            lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
-            identifier(lua, event.id); lua_setfield(lua, -2, "id");
-            string_field(lua, "sender", event.sender); string_field(lua, "path", event.path);
-            string_field(lua, "interface", event.interface); string_field(lua, "member", event.member);
-            if (!event.error.empty()) { string_field(lua, "error", event.error); string_field(lua, "error_name", event.error_name); }
-            lua_createtable(lua, static_cast<int>(event.arguments.size()), 0);
-            lua_Integer index = 1;
-            for (const auto& value : event.arguments) { push_value(lua, value); lua_rawseti(lua, -2, index++); }
-            lua_setfield(lua, -2, "arguments");
-            return 1;
-        }) < 0) return -1;
-    }
-    return 0;
+void push_bus_event(lua_State* lua, const dbus::Event& event) {
+    static const char* kinds[] = {"reply", "signal", "method", "expired"};
+    lua_createtable(lua, 0, 9);
+    lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
+    identifier(lua, event.id); lua_setfield(lua, -2, "id");
+    string_field(lua, "sender", event.sender); string_field(lua, "path", event.path);
+    string_field(lua, "interface", event.interface); string_field(lua, "member", event.member);
+    if (!event.error.empty()) { string_field(lua, "error", event.error); string_field(lua, "error_name", event.error_name); }
+    lua_createtable(lua, static_cast<int>(event.arguments.size()), 0);
+    lua_Integer index = 1;
+    for (const auto& value : event.arguments) { push_value(lua, value); lua_rawseti(lua, -2, index++); }
+    lua_setfield(lua, -2, "arguments");
 }
 
 void register_dbus(lua_State* lua) {

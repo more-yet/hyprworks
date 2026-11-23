@@ -1,10 +1,9 @@
 #include <hyprworks/hyprland/workspaces.hpp>
-#include "workspace_protocol.hpp"
+#include "protocol.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
-#include <cstring>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -14,26 +13,11 @@
 namespace hyprworks::hyprland {
 namespace {
 
-Error io_error(std::string operation, int code) {
-    const auto category = code == ENOENT || code == ECONNREFUSED ? ErrorCode::unavailable : ErrorCode::io;
-    return {category, std::move(operation), std::strerror(code), code};
-}
-
 std::expected<void, Error> validate_target(const SessionTarget& target) {
     if (target.directory.empty() || target.directory.front() != '/' || target.directory.contains('\0'))
         return std::unexpected(Error{ErrorCode::invalid_target, "session", "session directory must be an absolute path without NUL"});
     if (target.directory.size() + std::string_view("/.socket2.sock").size() >= sizeof(sockaddr_un::sun_path))
         return std::unexpected(Error{ErrorCode::invalid_target, "session", "UNIX socket path is too long"});
-    return {};
-}
-
-std::expected<void, Error> finish_connect(int fd) {
-    int error = 0;
-    socklen_t length = sizeof(error);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0)
-        return std::unexpected(io_error("connect", errno));
-    if (error)
-        return std::unexpected(io_error("connect", error));
     return {};
 }
 
@@ -62,23 +46,6 @@ WorkspaceConnection::Socket::~Socket() { reset(); }
 void WorkspaceConnection::Socket::reset() noexcept {
     if (fd >= 0)
         ::close(std::exchange(fd, -1));
-}
-
-std::expected<bool, Error> protocol::connect_socket(int& fd, const std::string& path) {
-    fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0)
-        return std::unexpected(io_error("socket", errno));
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
-                  static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1)) == 0)
-        return true;
-    const int code = errno;
-    if (code == EINPROGRESS)
-        return false;
-    ::close(std::exchange(fd, -1));
-    return std::unexpected(io_error("connect", code));
 }
 
 WorkspaceConnection::WorkspaceConnection(ConnectionOptions options) : options_(options) {
@@ -240,7 +207,7 @@ void WorkspaceConnection::read_events(short events, TimePoint now, DispatchResul
                     fail_connection(Error{ErrorCode::io, "events", "event stream failed"}, ConnectionPhase::disconnected, result);
                 return;
             }
-            fail_connection(io_error("events", errno), ConnectionPhase::disconnected, result);
+            fail_connection(protocol::io_error("events", errno), ConnectionPhase::disconnected, result);
             return;
         }
         if (count == 0) {
@@ -296,59 +263,10 @@ void WorkspaceConnection::start_command(CommandKind kind, std::string request, T
     }
 }
 
-std::expected<SocketPhase, Error> protocol::advance_request(int fd, short events, SocketPhase phase,
-    std::string_view request, std::string& reply, std::size_t limit, bool& wrote) {
-    if (phase == SocketPhase::connecting) {
-        if (auto connected = finish_connect(fd); !connected) return std::unexpected(connected.error());
-        phase = SocketPhase::sending;
-    }
-    if (phase == SocketPhase::sending) {
-        const auto count = ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
-        if (count < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-                return phase;
-            return std::unexpected(io_error("send", errno));
-        }
-        wrote = count > 0;
-        // Socket1 treats its first read as a request; a short write ends this command.
-        if (static_cast<std::size_t>(count) != request.size())
-            return std::unexpected(Error{ErrorCode::io, "send", "incomplete command write"});
-        return SocketPhase::reading;
-    }
-
-    std::array<char, 4096> buffer;
-    std::size_t consumed = 0;
-    unsigned attempts = 0;
-    while (consumed < protocol::io_budget && attempts++ < 64) {
-        const auto count = ::recv(fd, buffer.data(), std::min(buffer.size(), protocol::io_budget - consumed), 0);
-        if (count < 0) {
-            if (errno == EINTR)
-                continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (events & (POLLERR | POLLHUP))
-                    return std::unexpected(Error{ErrorCode::io, "receive", "command stream failed before EOF"});
-                return phase;
-            }
-            return std::unexpected(io_error("receive", errno));
-        }
-        if (count > 0) {
-            const auto bytes = static_cast<std::size_t>(count);
-            if (bytes > limit - reply.size())
-                return std::unexpected(Error{ErrorCode::limit_exceeded, "receive", "reply exceeds byte limit"});
-            reply.append(buffer.data(), bytes);
-            consumed += bytes;
-            continue;
-        }
-        return SocketPhase::complete;
-    }
-    return phase;
-}
-
 void WorkspaceConnection::advance_command(short events, TimePoint now, DispatchResult& result) {
     const auto limit = command_kind_ == CommandKind::snapshot ? protocol::max_snapshot_bytes : protocol::max_switch_reply_bytes;
-    bool wrote = false;
-    const auto next = protocol::advance_request(command_.fd, events, command_phase_, request_, reply_, limit, wrote);
-    if (command_kind_ == CommandKind::switch_workspace && wrote) pending_switch_->may_have_executed = true;
+    const auto next = protocol::advance_request(command_.fd, events, command_phase_, request_, reply_, limit,
+        command_kind_ == CommandKind::switch_workspace ? &pending_switch_->may_have_executed : nullptr);
     if (!next) { fail_command(next.error(), now, result); return; }
     command_phase_ = *next;
     if (command_phase_ == CommandPhase::complete) {
@@ -408,7 +326,7 @@ DispatchResult WorkspaceConnection::dispatch(const WaitSet& ready, TimePoint now
         }
         if (event_connecting_) {
             if (ready.fds[0].revents) {
-                if (auto connected = finish_connect(events_.fd); !connected) {
+                if (auto connected = protocol::finish_connect(events_.fd); !connected) {
                     fail_connection(connected.error(), ConnectionPhase::failed, result);
                     return;
                 }

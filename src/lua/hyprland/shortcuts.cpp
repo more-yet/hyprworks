@@ -84,14 +84,9 @@ int shortcut_open(lua_State* lua) {
 
 int shortcut_status(lua_State* lua) {
     const auto& binding = shortcut_handle(lua, true);
-    const auto status = binding.connection.status(); const bool closed = binding.closed;
-    return protected_call(lua, [&](lua_State* lua) {
-        static const char* phases[] = {"stopped", "connecting", "ready", "failed"};
-        lua_createtable(lua, 0, 2);
-        lua_pushstring(lua, closed ? "closed" : phases[static_cast<unsigned>(status.phase)]); lua_setfield(lua, -2, "phase");
-        if (!status.error.empty()) string_field(lua, "error", status.error);
-        return 1;
-    }, 1);
+    const auto& status = binding.connection.status();
+    static const char* phases[] = {"stopped", "connecting", "ready", "failed"};
+    return connection_status(lua, binding.closed ? "closed" : phases[static_cast<unsigned>(status.phase)], status.error);
 }
 
 int shortcut_on_status(lua_State* lua) {
@@ -123,21 +118,11 @@ int shortcut_close(lua_State* lua) {
 
 }
 
-int dispatch_shortcuts(lua_State* lua, ShortcutBinding& binding) {
-    const bool status = std::exchange(binding.status_pending, false);
-    const auto events = std::exchange(binding.events, {});
-    const auto generation = binding.generation;
-    if (status && dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
-    for (const auto& event : events) {
-        if (dispatch_callback(lua, binding, binding.on_event, generation, [&](lua_State* lua) {
-            lua_createtable(lua, 0, 4);
-            string_field(lua, "id", event.id); lua_pushboolean(lua, event.pressed); lua_setfield(lua, -2, "pressed");
-            identifier(lua, event.seconds); lua_setfield(lua, -2, "seconds");
-            lua_pushinteger(lua, event.nanoseconds); lua_setfield(lua, -2, "nanoseconds");
-            return 1;
-        }) < 0) return -1;
-    }
-    return 0;
+void push_shortcut_event(lua_State* lua, const shortcuts::Event& event) {
+    lua_createtable(lua, 0, 4);
+    string_field(lua, "id", event.id); lua_pushboolean(lua, event.pressed); lua_setfield(lua, -2, "pressed");
+    identifier(lua, event.seconds); lua_setfield(lua, -2, "seconds");
+    lua_pushinteger(lua, event.nanoseconds); lua_setfield(lua, -2, "nanoseconds");
 }
 
 void register_shortcuts(lua_State* lua) {

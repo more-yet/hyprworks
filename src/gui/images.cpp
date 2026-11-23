@@ -1,4 +1,5 @@
 #include "images.hpp"
+#include "icons.hpp"
 #include <hyprworks/host.hpp>
 #include <librsvg/rsvg.h>
 #include <png.h>
@@ -63,10 +64,10 @@ void premultiply(Image& image, const unsigned char* source) {
     cairo_surface_mark_dirty(image.surface);
 }
 
-void decode(Image& image) {
+void decode(Image& image, std::optional<IconTheme>& icons) {
     std::string resolved;
     if (!image.icon.empty()) {
-        resolved = icon_path(image.work.icons, image.theme, image.icon, image.pixels);
+        resolved = icon_path(icons, image.theme, image.icon, image.pixels);
         if (resolved.empty()) throw std::runtime_error("icon not found: " + image.icon);
     }
     const auto& path = image.icon.empty() ? image.path : resolved;
@@ -165,8 +166,8 @@ bool ImageWork::submit(const std::shared_ptr<Image>& image) {
 }
 
 void ImageWork::start(int wake) {
-    wake_fd = wake;
-    thread = std::thread([this] {
+    thread = std::thread([this, wake] {
+        std::optional<IconTheme> icons;
         for (;;) {
             std::shared_ptr<Image> image;
             {
@@ -176,7 +177,7 @@ void ImageWork::start(int wake) {
                 image = std::move(queue.front()); queue.pop_front();
             }
             if (image.use_count() > 1) {
-                try { decode(*image); }
+                try { decode(*image, icons); }
                 catch (const std::exception& error) { image->error = error.what(); }
                 catch (...) { image->error = "image decoding failed"; }
                 if (!image->error.empty() && image->surface) {
@@ -190,7 +191,7 @@ void ImageWork::start(int wake) {
             }
             image.reset();
             const std::uint64_t value = 1;
-            while (::write(wake_fd, &value, sizeof(value)) < 0 && errno == EINTR) {}
+            while (::write(wake, &value, sizeof(value)) < 0 && errno == EINTR) {}
         }
     });
 }

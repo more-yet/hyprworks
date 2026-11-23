@@ -9,6 +9,14 @@ for i = 1, 12 do
 end
 local destination, path, interface = "org.hyprworks.Test", "/org/hyprworks/Test", "org.hyprworks.Test"
 local pending, methods, expired, finished = {}, 0, false, false
+local function complete()
+    if finished and expired then
+        assert(methods == 3)
+        client:close()
+        server:close()
+        hw.quit(0)
+    end
+end
 assert(server:export {path = path, interface = interface, timeout = 40, methods = {
     {name = "Echo", input = "a{sv}t", output = "a{sv}t"}, {name = "Wait"},
 }})
@@ -22,6 +30,7 @@ server:on_event(function(_, event)
     if event.kind == "method" then
         methods = methods + 1
         if event.member == "Echo" then
+            assert(not pcall(server.reply, server, event.id .. "\0", "a{sv}t", event.arguments))
             assert(not server:reply(event.id, "", {}))
             assert(not server:reply(event.id, "a{sv}t", {{bad = {signature = "y", value = 256}}, "0"}))
             assert(server:reply(event.id, "a{sv}t", event.arguments))
@@ -34,6 +43,7 @@ server:on_event(function(_, event)
     elseif event.kind == "expired" then
         expired = true
         assert(not server:reply(event.id, "", {}))
+        complete()
     elseif event.kind == "reply" then
         assert(not event.error, event.error)
         local cancelled = request("Echo", "a{sv}t", {{payload = {signature = "ay", value = "\0\255"}}, "18446744073709551615"},
@@ -47,6 +57,7 @@ server:on_event(function(_, event)
             request("Wait", "", {}, function(timeout)
                 assert(timeout.error_name == "org.freedesktop.DBus.Error.NoReply")
                 finished = true
+                complete()
             end)
         end)
     end
@@ -64,11 +75,4 @@ client:on_event(function(_, event)
 end)
 assert(server:call {destination = "org.freedesktop.DBus", path = "/org/freedesktop/DBus",
     interface = "org.freedesktop.DBus", member = "RequestName", signature = "su", arguments = {destination, 0}, timeout = 1000})
-hw.timer(1000, function()
-    assert(finished and expired and methods == 3)
-    client:close()
-    server:close()
-    assert(client:status().phase == "closed")
-    print("D-Bus asynchronous reply, cancellation and expiration checks passed")
-    hw.quit(0)
-end)
+hw.timer(3000, function() error("D-Bus reply or expiry timed out") end)

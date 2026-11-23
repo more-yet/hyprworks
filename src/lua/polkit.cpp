@@ -43,15 +43,9 @@ int open(lua_State* lua) {
 
 int status(lua_State* lua) {
     const auto& binding = handle(lua, true);
-    const auto status = binding.agent.status();
-    const bool closed = binding.closed;
-    return protected_call(lua, [&](lua_State* lua) {
-        static const char* phases[] = {"stopped", "connecting", "ready", "failed"};
-        lua_createtable(lua, 0, 2);
-        lua_pushstring(lua, closed ? "closed" : phases[static_cast<unsigned>(status.phase)]); lua_setfield(lua, -2, "phase");
-        if (!status.error.empty()) string_field(lua, "error", status.error);
-        return 1;
-    }, 1);
+    const auto& status = binding.agent.status();
+    static const char* phases[] = {"stopped", "connecting", "ready", "failed"};
+    return connection_status(lua, binding.closed ? "closed" : phases[static_cast<unsigned>(status.phase)], status.error);
 }
 
 int on_status(lua_State* lua) {

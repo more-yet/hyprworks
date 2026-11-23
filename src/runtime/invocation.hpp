@@ -441,6 +441,20 @@ int deliver_observer(lua_State* lua, Binding& binding, Push push_result = nullpt
     return 0;
 }
 
+template<class Binding, class Push>
+int close_action_observer(lua_State* lua, Binding& binding, Push push_result) {
+    auto result = binding.connection.stop();
+    if (binding.result) result = std::exchange(binding.result, {});
+    ++binding.generation;
+    binding.closed = true;
+    binding.status_pending = binding.change_pending = false;
+    unref(lua, binding.on_status); unref(lua, binding.on_change); unref(lua, binding.on_result);
+    return protected_call(lua, [&](lua_State* lua) {
+        if (result) push_result(lua, *result); else lua_pushnil(lua);
+        return 1;
+    }, 1);
+}
+
 void wake(InvocationState& state) noexcept;
 
 void register_workspaces(lua_State* lua);
@@ -454,7 +468,7 @@ int dispatch_polkit(lua_State* lua, PolkitBinding& binding);
 #endif
 #ifdef HYPRWORKS_HAS_DBUS
 void register_dbus(lua_State* lua);
-int dispatch_dbus(lua_State* lua, InvocationState::BusBinding& binding);
+void push_bus_event(lua_State* lua, const dbus::Event& event);
 #endif
 
 #ifdef HYPRWORKS_HAS_UPOWER
@@ -471,7 +485,7 @@ void register_mpris(lua_State* lua);
 
 #ifdef HYPRWORKS_HAS_NOTIFICATIONS
 void register_notifications(lua_State* lua);
-int dispatch_notifications(lua_State* lua, NotificationBinding& binding);
+void push_notification_event(lua_State* lua, const notifications::Event& event);
 #endif
 
 #ifdef HYPRWORKS_HAS_TRAY
@@ -485,7 +499,7 @@ void register_desktop(lua_State* lua);
 
 #ifdef HYPRWORKS_HAS_SHORTCUTS
 void register_shortcuts(lua_State* lua);
-int dispatch_shortcuts(lua_State* lua, ShortcutBinding& binding);
+void push_shortcut_event(lua_State* lua, const shortcuts::Event& event);
 #endif
 
 }

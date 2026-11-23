@@ -121,9 +121,8 @@ void parse_arguments(lua_State* lua, int argument, std::vector<std::string>& arg
     std::size_t bytes = 0;
     for (std::size_t i = 0; i < size; ++i) {
         lua_rawgeti(lua, argument, static_cast<lua_Integer>(i + 1));
-        luaL_checktype(lua, -1, LUA_TSTRING);
         std::size_t length;
-        const char* value = lua_tolstring(lua, -1, &length);
+        const char* value = check_string(lua, -1, &length);
         luaL_argcheck(lua, length <= 65536 && (bytes += length + 1) <= 1024 * 1024, argument, "process argument budget exceeded");
         arguments.emplace_back(value, length);
         lua_pop(lua, 1);
@@ -143,11 +142,7 @@ void parse_process_options(lua_State* lua, int argument, host::ProcessOptions& o
     field(lua, argument, "timeout");
     options.timeout = std::chrono::milliseconds(check_integer(lua, -1));
     lua_pop(lua, 1);
-    field(lua, argument, "output_limit");
-    const auto limit = check_integer(lua, -1);
-    luaL_argcheck(lua, limit >= 0 && limit <= 16 * 1024 * 1024, argument, "output limit must be 0..16 MiB per stream");
-    options.output_limit = static_cast<std::size_t>(limit);
-    lua_pop(lua, 1);
+    options.output_limit = static_cast<std::size_t>(integer_field(lua, argument, "output_limit", std::nullopt, 0, 16 * 1024 * 1024));
     options.input_limit = static_cast<std::size_t>(integer_field(lua, argument, "input_limit", 65536, 1, 1024 * 1024));
     field(lua, argument, "pty");
     if (!lua_isnil(lua, -1)) {

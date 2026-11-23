@@ -285,7 +285,7 @@ void close_gui(Gui& gui) noexcept {
         unref(state.lua, gui.windows->on_change); unref(state.lua, gui.windows->on_status);
     }
     close_captures(gui);
-    for (auto& surface : gui.surfaces) if (surface) destroy_surface(*surface);
+    for (auto& surface : gui.surfaces) if (surface) retire_surface(surface);
     for (auto& transfer : gui.transfers) {
         if (transfer.fd >= 0) close(transfer.fd);
         unref(state.lua, transfer.callback);
@@ -415,7 +415,8 @@ int dispatch_gui(Gui& gui) {
         for (std::size_t i = 0; !surface->closed && surface->revision == revision && i < surface->image_elements.size(); ++i) {
             const int index = surface->image_elements[i];
             auto& element = surface->elements[static_cast<std::size_t>(index)];
-            if (element.image && !element.image->icon.empty()) {
+            if (!element.image) continue;
+            if (!element.image->icon.empty()) {
                 const auto pixels = static_cast<int>(std::clamp(std::ceil(element.image->icon_size * surface->scale), 1.0, 4096.0));
                 if (element.image->pixels != pixels) {
                     auto image = std::make_shared<Image>(gui.images);
@@ -424,8 +425,8 @@ int dispatch_gui(Gui& gui) {
                     element.image = std::move(image); element.image_notified = false;
                 }
             }
-            if (element.image && !element.image->submitted) gui.images.submit(element.image);
-            if (!element.image || element.image_notified || !element.image->ready.load(std::memory_order_acquire)) continue;
+            if (!element.image->submitted) gui.images.submit(element.image);
+            if (element.image_notified || !element.image->ready.load(std::memory_order_acquire)) continue;
             element.image_notified = true; invalidate_element(*surface, index, true);
             if (notify_element(*surface, index, "loaded", element.image) < 0) return -1;
         }
@@ -440,8 +441,7 @@ int dispatch_gui(Gui& gui) {
             notify_surface(*surface, surface->on_focus_change) < 0) return -1;
     }
     for (auto& seat : gui.seats) update_ime(*seat);
-    for (auto& surface : gui.surfaces) if (surface && surface->closed) destroy_surface(*surface);
-    for (auto& surface : gui.surfaces) if (surface && surface->closed) surface.reset();
+    for (auto& surface : gui.surfaces) if (surface && surface->closed) retire_surface(surface);
     std::erase_if(gui.buffers, [&](const auto& buffer) { return !buffer->busy && !find_surface(gui, buffer->surface); });
     for (auto& surface : gui.surfaces)
         if (surface && !state.requests.load(std::memory_order_relaxed)) render(*surface);

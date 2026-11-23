@@ -1,5 +1,6 @@
 #include <hyprworks/mpris.hpp>
 #include "dbus.hpp"
+#include "snapshot.hpp"
 #include <algorithm>
 #include <cmath>
 #include <exception>
@@ -20,11 +21,7 @@ constexpr char prefix[] = "org.mpris.MediaPlayer2.";
 bool player_name(std::string_view name) { return name.starts_with(prefix) && name.size() > sizeof(prefix) - 1; }
 
 void metadata(sd_bus_message* message, Metadata& metadata, std::size_t& bytes) {
-    require(sd_bus_message_enter_container(message, 'a', "{sv}"));
-    unsigned count = 0;
-    while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
-        if (++count > 128) throw std::runtime_error("MPRIS metadata exceeds 128 entries");
-        const auto key = dbus::enter_property(message);
+    dbus::read_properties(message, [&](std::string_view key) {
         if (key == "mpris:trackid") metadata.track_id = dbus::text(message, 'o', bytes);
         else if (key == "xesam:title") metadata.title = dbus::text(message, 's', bytes);
         else if (key == "xesam:album") metadata.album = dbus::text(message, 's', bytes);
@@ -39,18 +36,11 @@ void metadata(sd_bus_message* message, Metadata& metadata, std::size_t& bytes) {
             if (value < 0) throw std::runtime_error("negative MPRIS track length");
             metadata.length = value;
         } else require(sd_bus_message_skip(message, nullptr));
-        check(sd_bus_message_exit_container(message));
-        check(sd_bus_message_exit_container(message));
-    }
-    check(sd_bus_message_exit_container(message));
+    });
 }
 
 void read_properties(sd_bus_message* message, Player& player, bool root, std::size_t& bytes) {
-    require(sd_bus_message_enter_container(message, 'a', "{sv}"));
-    unsigned count = 0;
-    while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
-        if (++count > 128) throw std::runtime_error("MPRIS properties exceed 128 entries");
-        const auto key = dbus::enter_property(message);
+    dbus::read_properties(message, [&](std::string_view key) {
         if (root) {
             if (key == "Identity") player.identity = dbus::text(message, 's', bytes);
             else if (key == "DesktopEntry") player.desktop_entry = dbus::text(message, 's', bytes);
@@ -79,10 +69,7 @@ void read_properties(sd_bus_message* message, Player& player, bool root, std::si
             if (position < 0) throw std::runtime_error("negative MPRIS position");
             player.position = position;
         } else require(sd_bus_message_skip(message, nullptr));
-        check(sd_bus_message_exit_container(message));
-        check(sd_bus_message_exit_container(message));
-    }
-    check(sd_bus_message_exit_container(message));
+    });
     if (!root && (player.rate == 0 || player.minimum_rate > player.maximum_rate || (player.volume && *player.volume < 0)))
         throw std::runtime_error("invalid MPRIS rate or volume");
 }
@@ -130,13 +117,7 @@ struct MediaConnection::State {
     }
 
     void publish() {
-        pending.revision = snapshot ? snapshot->revision : 0;
-        if (!snapshot || pending != *snapshot) {
-            if (pending.revision == UINT64_MAX) throw std::runtime_error("MPRIS revision exhausted");
-            ++pending.revision;
-            snapshot = std::make_shared<const Snapshot>(std::move(pending));
-        }
-        pending = {};
+        publish_snapshot(snapshot, pending);
         status = {Phase::ready, {}};
         deadline.reset();
     }

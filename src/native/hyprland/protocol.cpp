@@ -1,11 +1,17 @@
-#include "workspace_protocol.hpp"
+#include "protocol.hpp"
 
 #include <json-c/json.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cstring>
 #include <memory>
 #include <new>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <utility>
 
 namespace hyprworks::hyprland::protocol {
 namespace {
@@ -96,6 +102,76 @@ Json array(std::string_view input) {
     return root;
 }
 
+}
+
+Error io_error(std::string operation, int code) {
+    const auto category = code == ENOENT || code == ECONNREFUSED ? ErrorCode::unavailable : ErrorCode::io;
+    return {category, std::move(operation), std::strerror(code), code};
+}
+
+std::expected<bool, Error> connect_socket(int& fd, const std::string& path) {
+    fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return std::unexpected(io_error("socket", errno));
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                  static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1)) == 0)
+        return true;
+    const int code = errno;
+    if (code == EINPROGRESS) return false;
+    ::close(std::exchange(fd, -1));
+    return std::unexpected(io_error("connect", code));
+}
+
+std::expected<void, Error> finish_connect(int fd) {
+    int error = 0;
+    socklen_t length = sizeof(error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0) error = errno;
+    if (error) return std::unexpected(io_error("connect", error));
+    return {};
+}
+
+std::expected<SocketPhase, Error> advance_request(int fd, short events, SocketPhase phase,
+    std::string_view request, std::string& reply, std::size_t limit, bool* may_have_executed) {
+    if (phase == SocketPhase::connecting) {
+        if (auto connected = finish_connect(fd); !connected) return std::unexpected(connected.error());
+        phase = SocketPhase::sending;
+    }
+    if (phase == SocketPhase::sending) {
+        const auto count = ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
+        if (count < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return phase;
+            return std::unexpected(io_error("send", errno));
+        }
+        if (may_have_executed && count > 0) *may_have_executed = true;
+        // Socket1 treats its first read as a request; a short write ends this command.
+        if (static_cast<std::size_t>(count) != request.size())
+            return std::unexpected(Error{ErrorCode::io, "send", "incomplete command write"});
+        return SocketPhase::reading;
+    }
+
+    std::array<char, 4096> buffer;
+    std::size_t consumed = 0;
+    for (unsigned attempts = 0; consumed < io_budget && attempts < 64; ++attempts) {
+        const auto count = ::recv(fd, buffer.data(), std::min(buffer.size(), io_budget - consumed), 0);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (events & (POLLERR | POLLHUP))
+                    return std::unexpected(Error{ErrorCode::io, "receive", "command stream failed before EOF"});
+                return phase;
+            }
+            return std::unexpected(io_error("receive", errno));
+        }
+        if (!count) return SocketPhase::complete;
+        const auto bytes = static_cast<std::size_t>(count);
+        if (bytes > limit - reply.size())
+            return std::unexpected(Error{ErrorCode::limit_exceeded, "receive", "reply exceeds byte limit"});
+        reply.append(buffer.data(), bytes);
+        consumed += bytes;
+    }
+    return phase;
 }
 
 std::expected<Snapshot, Error> parse_snapshot(std::string_view reply) {

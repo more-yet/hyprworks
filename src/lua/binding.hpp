@@ -276,6 +276,16 @@ inline int operation_result(lua_State* lua, const std::expected<void, std::strin
     }, 2);
 }
 
+inline int connection_status(lua_State* lua, const char* phase, std::string error, std::optional<bool> has_snapshot = {}) {
+    return protected_call(lua, [&](lua_State* lua) {
+        lua_createtable(lua, 0, 3);
+        lua_pushstring(lua, phase); lua_setfield(lua, -2, "phase");
+        if (has_snapshot) { lua_pushboolean(lua, *has_snapshot); lua_setfield(lua, -2, "has_snapshot"); }
+        if (!error.empty()) string_field(lua, "error", error);
+        return 1;
+    }, 1);
+}
+
 inline int request_result(lua_State* lua, const std::expected<std::uint64_t, std::string>& result) {
     return protected_call(lua, [&](lua_State* lua) {
         if (result) { identifier(lua, *result); return 1; }

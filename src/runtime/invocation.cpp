@@ -57,6 +57,20 @@ auto descriptors(Prepared& wait) {
     else return std::span(wait.fds);
 }
 
+template<class Binding, class Push>
+int deliver_events(lua_State* lua, Binding& binding, Push push_event) {
+    const auto generation = binding.generation;
+    const auto events = std::exchange(binding.events, {});
+    if (std::exchange(binding.status_pending, false) &&
+        dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
+    for (const auto& event : events) {
+        if (dispatch_callback(lua, binding, binding.on_event, generation, [&](lua_State* lua) {
+            push_event(lua, event); return 1;
+        }) < 0) return -1;
+    }
+    return 0;
+}
+
 void watch_configuration_file(InvocationState& state, const std::string& file) {
     const auto path = std::filesystem::absolute(file).lexically_normal();
     const auto resolved = std::filesystem::weakly_canonical(path);
@@ -500,7 +514,7 @@ void Invocation::dispatch() {
 
     int status = dispatch_workspaces(state.lua, state);
 #ifdef HYPRWORKS_HAS_DBUS
-    for (auto bus : std::span(state.buses)) if (bus && status >= 0) status = dispatch_dbus(state.lua, *bus);
+    for (auto bus : std::span(state.buses)) if (bus && status >= 0) status = deliver_events(state.lua, *bus, push_bus_event);
 #endif
 #ifdef HYPRWORKS_HAS_UPOWER
     if (status >= 0 && state.power)
@@ -516,7 +530,7 @@ void Invocation::dispatch() {
 #endif
 #ifdef HYPRWORKS_HAS_NOTIFICATIONS
     if (status >= 0 && state.notifications)
-        status = dispatch_notifications(state.lua, *state.notifications);
+        status = deliver_events(state.lua, *state.notifications, push_notification_event);
 #endif
 #ifdef HYPRWORKS_HAS_TRAY
     if (status >= 0 && state.tray)
@@ -525,7 +539,7 @@ void Invocation::dispatch() {
 #endif
 #ifdef HYPRWORKS_HAS_SHORTCUTS
     if (status >= 0 && state.shortcuts)
-        status = dispatch_shortcuts(state.lua, *state.shortcuts);
+        status = deliver_events(state.lua, *state.shortcuts, push_shortcut_event);
 #endif
 #ifdef HYPRWORKS_HAS_DESKTOP
     if (status >= 0 && state.desktop)

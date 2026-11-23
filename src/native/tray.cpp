@@ -1,5 +1,6 @@
 #include <hyprworks/tray.hpp>
 #include "dbus.hpp"
+#include "snapshot.hpp"
 #include <algorithm>
 #include <exception>
 #include <string_view>
@@ -38,11 +39,7 @@ void read_pixmaps(sd_bus_message* message, std::vector<Pixmap>& pixmaps, std::si
 }
 
 void read_item(sd_bus_message* message, Item& item, std::size_t& bytes, std::size_t& binary) {
-    require(sd_bus_message_enter_container(message, 'a', "{sv}"));
-    unsigned count = 0;
-    while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
-        if (++count > 128) throw std::runtime_error("tray item exceeds 128 properties");
-        const auto key = dbus::enter_property(message);
+    dbus::read_properties(message, [&](std::string_view key) {
         if (key == "Id") item.id = dbus::text(message, 's', bytes);
         else if (key == "Title") item.title = dbus::text(message, 's', bytes);
         else if (key == "Category") item.category = dbus::text(message, 's', bytes);
@@ -65,10 +62,7 @@ void read_item(sd_bus_message* message, Item& item, std::size_t& bytes, std::siz
             item.tooltip_body = dbus::text(message, 's', bytes);
             check(sd_bus_message_exit_container(message));
         } else require(sd_bus_message_skip(message, nullptr));
-        check(sd_bus_message_exit_container(message));
-        check(sd_bus_message_exit_container(message));
-    }
-    check(sd_bus_message_exit_container(message));
+    });
 }
 }
 
@@ -111,12 +105,8 @@ struct TrayConnection::State {
         if (!refresh_at) refresh_at = Clock::now() + std::chrono::milliseconds(16);
     }
     void publish() {
-        pending.revision = snapshot ? snapshot->revision : 0;
-        if (!snapshot || pending != *snapshot) {
-            if (pending.revision == UINT64_MAX) throw std::runtime_error("tray revisions exhausted");
-            ++pending.revision; snapshot = std::make_shared<const Snapshot>(std::move(pending));
-        }
-        pending = {}; deadline.reset(); status = {Phase::ready, {}};
+        publish_snapshot(snapshot, pending);
+        deadline.reset(); status = {Phase::ready, {}};
     }
     void send() {
         const bool owner = step == Step::watcher_owner || step == Step::item_owner;

@@ -10,8 +10,8 @@ namespace {
 constexpr char workspace_metatable[] = "hyprworks.workspaces";
 constexpr char error_metatable[] = "hyprworks.error";
 
-WorkspaceBinding& workspace(lua_State* lua, int index = 1, bool allow_closed = false) {
-    auto& binding = **static_cast<std::shared_ptr<WorkspaceBinding>*>(luaL_checkudata(lua, index, workspace_metatable));
+WorkspaceBinding& workspace(lua_State* lua, bool allow_closed = false) {
+    auto& binding = **static_cast<std::shared_ptr<WorkspaceBinding>*>(luaL_checkudata(lua, 1, workspace_metatable));
     if (invocation(lua).closing)
         luaL_error(lua, "invocation is shutting down");
     if (binding.closed && !allow_closed)
@@ -188,7 +188,7 @@ int workspace_snapshot(lua_State* lua) {
 }
 
 int workspace_status(lua_State* lua) {
-    auto& binding = workspace(lua, 1, true);
+    auto& binding = workspace(lua, true);
     const auto status = binding.connection.status();
     return protected_call(lua, [&, closed = binding.closed, has_snapshot = bool(binding.connection.snapshot())](lua_State* lua) {
         return push_status(lua, status, closed, has_snapshot);
@@ -218,7 +218,7 @@ int workspace_refresh(lua_State* lua) {
 }
 
 int workspace_restart(lua_State* lua) {
-    auto& binding = workspace(lua, 1, true);
+    auto& binding = workspace(lua, true);
     if (resume_handle(lua, invocation(lua).workspaces, binding) < 0) return -1;
     const auto before = binding.connection.status();
     const bool had_snapshot = bool(binding.connection.snapshot());
@@ -226,7 +226,6 @@ int workspace_restart(lua_State* lua) {
         std::expected<void, native::Error>(std::unexpected(native::Error{
             native::ErrorCode::busy, "restart", "a workspace result awaits delivery"})) :
         binding.connection.start(binding.target);
-    binding.closed = false;
     if (result || before != binding.connection.status()) ++binding.generation;
     binding.status_pending |= before != binding.connection.status();
     binding.change_pending |= had_snapshot && !binding.connection.snapshot();
@@ -252,20 +251,9 @@ int on_result(lua_State* lua) {
 }
 
 int workspace_close(lua_State* lua) {
-    auto& binding = workspace(lua, 1, true);
+    auto& binding = workspace(lua, true);
     untrack(lua, invocation(lua).workspaces, binding);
-    ++binding.generation;
-    binding.status_pending = binding.change_pending = false;
-    unref(lua, binding.on_status); unref(lua, binding.on_change); unref(lua, binding.on_result);
-    auto cancelled = binding.connection.stop();
-    if (binding.result) cancelled = std::exchange(binding.result, {});
-    return protected_call(lua, [&](lua_State* lua) {
-        if (cancelled)
-            push_switch_result(lua, *cancelled);
-        else
-            lua_pushnil(lua);
-        return 1;
-    }, 1);
+    return close_action_observer(lua, binding, push_switch_result);
 }
 
 }

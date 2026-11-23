@@ -203,14 +203,13 @@ assert(p:close_input()) -- send pipe EOF after queued bytes have been written
   unaccepted suffix in `on_drain(function(p, discarded) ... end)`. `input_limit`
   defaults to 64 KiB and can be set to 1 byte–1 MiB. `discarded` is zero on a
   successful drain, or the unsent byte count if the child closed its input.
-- `on_output(p, "stdout"|"stderr", bytes)` delivers binary chunks, including
-  prompts without a newline, before `on_exit`. `read_output(stream, offset, limit)`
-  reads retained bytes without consuming them (zero-based offset, up to 64 KiB).
+- `on_output(p, "stdout"|"stderr", bytes)` delivers binary chunks as they arrive,
+  before `on_exit`. `read_output(stream, offset, limit)` returns a slice of the
+  retained stream (zero-based offset, up to 64 KiB).
 - `stdin_file` redirects input from a path; `stdout_file` and `stderr_file`
   send output directly to **new**, mode-0600 files. Paths are relative to the
-  child's working directory. Redirected output is neither captured nor subject
-  to the capture limit. As with shell redirections, a spawn failure can leave
-  a created output file.
+  child's working directory. The capture limit applies to pipe and PTY output.
+  A spawn failure can leave a created output file.
 - Set `pty = {rows = 24, columns = 80, raw = false, echo = true}` to start a
   new session with a controlling terminal for all three streams. Output arrives
   on `stdout`; file redirections apply in pipe mode.
@@ -254,7 +253,7 @@ Errors are delivered as `callback(nil, reason)`.
 `hw.temp_file(parent)` and `hw.temp_dir(parent)` securely create a private file
 or directory and return its path; the caller removes it. `hw.mkdir(path)`
 creates one directory. `hw.create_file(path, bytes)` and `hw.copy_file(from,
-to, byte_limit)` publish a new file without overwriting a destination.
+to, byte_limit)` require a new destination.
 `hw.write_file(path, bytes)` atomically replaces it.
 
 For existing preferences use `hw.update_file(path, limit, edit)`. It takes
@@ -262,7 +261,7 @@ an exclusive, nonblocking lock on `path .. ".lock"` **before reading**, passes
 the current bytes to `edit`, and keeps the lock through comparison and atomic
 replacement. Return new bytes to commit, or `nil` to skip. The result is
 `true` for a change, `false` for no change, or `nil, error` on operational
-failure. An error raised by `edit` releases the lock without committing.
+failure. An error raised by `edit` preserves the original file and releases the lock.
 For a longer session, `local lock <close> = assert(hw.lock_file(lock_path))`
 holds the lock until scope exit or `lock:close()`. All participants must use
 the same lock path; leave the lock file in place between acquisitions.
@@ -330,8 +329,8 @@ The compositor renders active and inactive workspaces. Required `mode = "windows
 includes windows and decorations over transparency; `"everything"`
 also includes the output's wallpaper, panels, pinned windows and layer surfaces.
 This includes preview UI on that output unless the compositor excludes it.
-Matching uses the workspace's current name and output, rejects ambiguous names,
-and then retains the native workspace identity across renames and moves.
+Matching requires a unique workspace name on the selected output. The capture
+keeps the native workspace identity across renames and moves.
 
 Frames use the same immutable image sources and event fields as window captures:
 `source`, `width`, `height`, `source_width`, `source_height`. Terminal events are

@@ -1,5 +1,6 @@
 #include <hyprworks/dbusmenu.hpp>
 #include "dbus.hpp"
+#include "snapshot.hpp"
 #include <algorithm>
 #include <exception>
 #include <string_view>
@@ -13,11 +14,7 @@ constexpr char interface[] = "com.canonical.dbusmenu";
 constexpr char properties[] = "org.freedesktop.DBus.Properties";
 
 void read_properties(sd_bus_message* message, Snapshot& snapshot, Item* item, std::size_t& bytes, std::size_t& binary) {
-    require(sd_bus_message_enter_container(message, 'a', "{sv}"));
-    unsigned count = 0;
-    while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
-        if (++count > 128) throw std::runtime_error("menu properties exceed 128 entries");
-        const auto key = dbus::enter_property(message);
+    dbus::read_properties(message, [&](std::string_view key) {
         if (!item) {
             if (key == "TextDirection") snapshot.text_direction = dbus::text(message, 's', bytes);
             else if (key == "Status") snapshot.status = dbus::text(message, 's', bytes);
@@ -46,10 +43,7 @@ void read_properties(sd_bus_message* message, Snapshot& snapshot, Item* item, st
             }
             check(sd_bus_message_exit_container(message));
         } else require(sd_bus_message_skip(message, nullptr));
-        check(sd_bus_message_exit_container(message));
-        check(sd_bus_message_exit_container(message));
-    }
-    check(sd_bus_message_exit_container(message));
+    });
 }
 
 void read_item(sd_bus_message* message, Snapshot& snapshot, std::int32_t parent, unsigned depth, std::size_t& bytes, std::size_t& binary) {
@@ -113,12 +107,8 @@ struct MenuConnection::State {
                 if (error) throw std::runtime_error(error->message ? error->message : error->name);
                 require(sd_bus_message_read(message, "u", &state.pending.remote_revision));
                 read_item(message, state.pending, -1, 0, state.bytes, state.binary);
-                state.pending.revision = state.snapshot ? state.snapshot->revision : 0;
-                if (!state.snapshot || state.pending != *state.snapshot) {
-                    if (state.pending.revision == UINT64_MAX) throw std::runtime_error("menu revisions exhausted");
-                    ++state.pending.revision; state.snapshot = std::make_shared<const Snapshot>(std::move(state.pending));
-                }
-                state.pending = {}; state.deadline.reset(); state.status = {Phase::ready, {}};
+                publish_snapshot(state.snapshot, state.pending);
+                state.deadline.reset(); state.status = {Phase::ready, {}};
             } else {
                 if (!error) read_properties(message, state.pending, nullptr, state.bytes, state.binary);
                 else if (!sd_bus_error_has_name(error, SD_BUS_ERROR_UNKNOWN_INTERFACE) && !sd_bus_error_has_name(error, SD_BUS_ERROR_UNKNOWN_METHOD))

@@ -127,26 +127,18 @@ int menu_snapshot(lua_State* lua) {
 
 int tray_status(lua_State* lua) {
     const auto& binding = tray_handle(lua, true);
-    const auto status = binding.connection.status(); const bool closed = binding.closed, snapshot = bool(binding.connection.snapshot());
-    return protected_call(lua, [&](lua_State* lua) {
-        static const char* phases[] = {"stopped", "connecting", "synchronizing", "ready", "unavailable", "failed"};
-        lua_createtable(lua, 0, 3); lua_pushstring(lua, closed ? "closed" : phases[static_cast<unsigned>(status.phase)]); lua_setfield(lua, -2, "phase");
-        lua_pushboolean(lua, snapshot); lua_setfield(lua, -2, "has_snapshot");
-        if (!status.error.empty()) string_field(lua, "error", status.error);
-        return 1;
-    }, 1);
+    const auto& status = binding.connection.status();
+    static const char* phases[] = {"stopped", "connecting", "synchronizing", "ready", "unavailable", "failed"};
+    return connection_status(lua, binding.closed ? "closed" : phases[static_cast<unsigned>(status.phase)],
+        status.error, bool(binding.connection.snapshot()));
 }
 
 int menu_status(lua_State* lua) {
     const auto& binding = menu_handle(lua, true);
-    const auto status = binding.connection.status(); const bool closed = binding.closed, snapshot = bool(binding.connection.snapshot());
-    return protected_call(lua, [&](lua_State* lua) {
-        static const char* phases[] = {"stopped", "connecting", "synchronizing", "ready", "unavailable", "failed"};
-        lua_createtable(lua, 0, 3); lua_pushstring(lua, closed ? "closed" : phases[static_cast<unsigned>(status.phase)]); lua_setfield(lua, -2, "phase");
-        lua_pushboolean(lua, snapshot); lua_setfield(lua, -2, "has_snapshot");
-        if (!status.error.empty()) string_field(lua, "error", status.error);
-        return 1;
-    }, 1);
+    const auto& status = binding.connection.status();
+    static const char* phases[] = {"stopped", "connecting", "synchronizing", "ready", "unavailable", "failed"};
+    return connection_status(lua, binding.closed ? "closed" : phases[static_cast<unsigned>(status.phase)],
+        status.error, bool(binding.connection.snapshot()));
 }
 
 int tray_on_status(lua_State* lua) {
@@ -229,20 +221,15 @@ int menu_restart(lua_State* lua) {
 }
 
 int tray_close(lua_State* lua) {
-    auto& binding = tray_handle(lua, true);
-    auto result = binding.connection.stop(); if (binding.result) result = std::exchange(binding.result, {});
-    binding.closed = true; ++binding.generation; binding.status_pending = binding.change_pending = false;
-    for (auto* reference : {&binding.on_status, &binding.on_change, &binding.on_result}) unref(lua, *reference);
-    return protected_call(lua, [&](lua_State* lua) { if (result) push_action_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
+    return close_action_observer(lua, tray_handle(lua, true), push_action_result);
 }
 
 int menu_close(lua_State* lua) {
     auto& binding = menu_handle(lua, true);
-    auto result = binding.connection.stop(); if (binding.result) result = std::exchange(binding.result, {});
-    untrack(lua, invocation(lua).menus, binding); ++binding.generation; binding.status_pending = binding.change_pending = false;
+    untrack(lua, invocation(lua).menus, binding);
     binding.activations.clear();
-    for (auto* reference : {&binding.on_status, &binding.on_change, &binding.on_result, &binding.on_activation}) unref(lua, *reference);
-    return protected_call(lua, [&](lua_State* lua) { if (result) push_action_result(lua, *result); else lua_pushnil(lua); return 1; }, 1);
+    unref(lua, binding.on_activation);
+    return close_action_observer(lua, binding, push_action_result);
 }
 
 int tray_action(lua_State* lua) {

@@ -87,8 +87,13 @@ struct SurfaceFocus {
 /// Owns the element tree and interaction state. Lua handles resolve identity
 /// and revision; closed slots are reclaimed after callback delivery.
 struct Surface {
-    Gui* gui = nullptr;
-    std::uint64_t id = 0, revision = 0, parent = 0;
+    explicit Surface(Gui& owner);
+    ~Surface();
+    Surface(const Surface&) = delete;
+    Surface& operator=(const Surface&) = delete;
+    Gui* const gui;
+    const std::uint64_t id;
+    std::uint64_t revision = 0, parent = 0;
     wl_surface* native = nullptr;
     xdg_surface* xdg = nullptr;
     xdg_toplevel* toplevel = nullptr;
@@ -317,7 +322,7 @@ void request_surface_close(Surface& surface, const char* reason = "compositor");
 void cancel_surface_input(Surface& surface, bool descendants = false);
 SurfaceFocus surface_focus(const Surface& surface);
 int dispatch_close(Surface& surface);
-void destroy_surface(Surface& surface);
+void retire_surface(std::unique_ptr<Surface>& slot);
 void reposition_popup(Surface& surface);
 void initialize_popup(Surface& surface);
 void update_scale(Surface& surface);

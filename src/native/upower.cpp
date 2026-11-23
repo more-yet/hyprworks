@@ -1,5 +1,6 @@
 #include <hyprworks/upower.hpp>
 #include "dbus.hpp"
+#include "snapshot.hpp"
 #include <algorithm>
 #include <cmath>
 #include <exception>
@@ -18,12 +19,7 @@ constexpr char device_interface[] = "org.freedesktop.UPower.Device";
 constexpr char display_path[] = "/org/freedesktop/UPower/devices/DisplayDevice";
 
 void read_properties(sd_bus_message* message, Snapshot& snapshot, Device* device, std::size_t& bytes) {
-    require(sd_bus_message_enter_container(message, 'a', "{sv}"));
-    unsigned count = 0;
-    while (check(sd_bus_message_enter_container(message, 'e', "sv")) > 0) {
-        if (++count > 128)
-            throw std::runtime_error("UPower property limit exceeded");
-        const auto key = dbus::enter_property(message);
+    dbus::read_properties(message, [&](std::string_view key) {
         if (!device) {
             if (key == "OnBattery") snapshot.on_battery = dbus::boolean(message);
             else if (key == "LidIsPresent") snapshot.lid_present = dbus::boolean(message);
@@ -50,10 +46,7 @@ void read_properties(sd_bus_message* message, Snapshot& snapshot, Device* device
         else if (key == "Model") device->model = dbus::text(message, 's', bytes);
         else if (key == "IconName") device->icon_name = dbus::text(message, 's', bytes);
         else require(sd_bus_message_skip(message, nullptr));
-        check(sd_bus_message_exit_container(message));
-        check(sd_bus_message_exit_container(message));
-    }
-    check(sd_bus_message_exit_container(message));
+    });
 }
 
 }
@@ -164,13 +157,7 @@ struct PowerConnection::State {
                     ++state.device;
             }
             if (state.step == Request::device && state.device == state.pending.devices.size()) {
-                state.pending.revision = state.snapshot ? state.snapshot->revision : 0;
-                if (!state.snapshot || state.pending != *state.snapshot) {
-                    if (state.pending.revision == UINT64_MAX)
-                        throw std::runtime_error("UPower snapshot revision exhausted");
-                    ++state.pending.revision;
-                    state.snapshot = std::make_shared<const Snapshot>(std::move(state.pending));
-                }
+                publish_snapshot(state.snapshot, state.pending);
                 state.status = {Phase::ready, {}};
                 state.deadline.reset();
             } else
