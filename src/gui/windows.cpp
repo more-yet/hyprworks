@@ -35,7 +35,7 @@ void close_query(WindowCatalog& catalog) {
 void capture_error(Capture& capture, const char* message, bool unavailable = false);
 
 void fail(WindowCatalog& catalog, std::string message) {
-    for (auto& capture : catalog.gui->captures) if (capture && capture->catalog == &catalog && !capture->closed) {
+    for (auto* capture : catalog.gui->captures) if (capture && capture->catalog == &catalog) {
         capture_error(*capture, "window catalog disconnected", true);
         capture->catalog = nullptr;
     }
@@ -335,14 +335,13 @@ const wl_callback_listener sync_listener{
     .done = [](void* data, wl_callback* callback, std::uint32_t) {
         auto& catalog = *static_cast<WindowCatalog*>(data);
         wl_callback_destroy(callback); catalog.sync = nullptr;
-        if (catalog.subscribed) return;
+        if (catalog.phase != WindowCatalog::Phase::connecting) return;
         if (!catalog.manager || !catalog.capture_list) { catalog.protocol_error = "compositor lacks foreign-toplevel notifications"; return; }
         if (!catalog.registered) {
             catalog.registered = true;
             synchronize(catalog);
             return;
         }
-        catalog.subscribed = true;
         catalog.phase = WindowCatalog::Phase::synchronizing;
         catalog.status_pending = true; catalog.deadline.reset();
         catalog.refresh_at = Clock::now();
@@ -514,8 +513,8 @@ int shutdown(lua_State* lua) {
 }
 
 void close_capture_binding(CaptureBinding& binding) {
-    auto& gui = *binding.capture->gui;
-    close_capture(*binding.capture);
+    auto& gui = *binding.capture.gui;
+    close_capture(binding.capture);
     unref(gui.owner.lua, binding.callback); unref(gui.owner.lua, binding.handle);
     for (auto& slot : gui.capture_bindings)
         if (slot.get() == &binding) { slot.reset(); break; }
@@ -542,19 +541,19 @@ int image_gc(lua_State* lua) {
     return 0;
 }
 
-void admit_capture(const std::shared_ptr<Capture>& capture, ext_image_capture_source_v1* source, bool cursor) {
+void admit_capture(Capture& capture, ext_image_capture_source_v1* source, bool cursor) {
     const std::unique_ptr<ext_image_capture_source_v1, decltype(&ext_image_capture_source_v1_destroy)>
         owned_source(source, ext_image_capture_source_v1_destroy);
     if (!source) throw std::runtime_error("cannot create capture source");
-    auto& gui = *capture->gui;
+    auto& gui = *capture.gui;
     if (!gui.capture_manager) throw std::runtime_error("image capture is unavailable");
-    const auto slot = std::ranges::find_if(gui.captures, [](const auto& item) { return !item || item->closed; });
+    const auto slot = std::ranges::find(gui.captures, nullptr);
     if (slot == gui.captures.end()) throw std::runtime_error("at most eight captures may be active");
-    capture->session = ext_image_copy_capture_manager_v1_create_session(gui.capture_manager, source,
+    capture.session = ext_image_copy_capture_manager_v1_create_session(gui.capture_manager, source,
         cursor ? EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_OPTIONS_PAINT_CURSORS : 0);
-    if (!capture->session) throw std::runtime_error("cannot create capture session");
-    ext_image_copy_capture_session_v1_add_listener(capture->session, &capture_session_listener, capture.get());
-    *slot = capture;
+    if (!capture.session) throw std::runtime_error("cannot create capture session");
+    ext_image_copy_capture_session_v1_add_listener(capture.session, &capture_session_listener, &capture);
+    *slot = &capture;
 }
 
 ext_image_capture_source_v1* window_source(Capture& capture, WindowCatalog& catalog, std::string_view id) {
@@ -574,11 +573,10 @@ int open_capture(lua_State* lua, Gui& gui, int options, int callback, ResolveSou
     const auto max_width = static_cast<int>(integer_field(lua, options, "max_width", std::nullopt, 1, 1024));
     const auto max_height = static_cast<int>(integer_field(lua, options, "max_height", std::nullopt, 1, 1024));
     const auto max_fps = integer_field(lua, options, "max_fps", std::nullopt, 1, 30);
-    auto capture = std::make_shared<Capture>(gui);
-    auto binding = std::make_shared<CaptureBinding>();
-    binding->capture = capture;
-    capture->max_width = max_width; capture->max_height = max_height;
-    capture->interval = std::chrono::milliseconds((1000 + max_fps - 1) / max_fps);
+    auto binding = std::make_shared<CaptureBinding>(gui);
+    auto& capture = binding->capture;
+    capture.max_width = max_width; capture.max_height = max_height;
+    capture.interval = std::chrono::milliseconds((1000 + max_fps - 1) / max_fps);
     lua_pushvalue(lua, callback);
     const int result = protected_call(lua, [&](lua_State* lua) {
         auto* handle = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<CaptureBinding>), 0)) std::shared_ptr<CaptureBinding>();
@@ -590,8 +588,8 @@ int open_capture(lua_State* lua, Gui& gui, int options, int callback, ResolveSou
     }, 1, 0, 1);
     if (result < 0) { close_capture_binding(*binding); return result; }
     try {
-        admit_capture(capture, resolve_source(*capture), false);
-        capture->deadline = Clock::now() + std::chrono::seconds(2);
+        admit_capture(capture, resolve_source(capture), false);
+        capture.deadline = Clock::now() + std::chrono::seconds(2);
         const auto slot = std::ranges::find(gui.capture_bindings, nullptr);
         assert(slot != gui.capture_bindings.end());
         *slot = std::move(binding);
@@ -618,7 +616,6 @@ int capture_workspace(lua_State* lua) {
         if (!size || size > limit) luaL_error(lua, "invalid workspace %s", key);
         return std::string_view(value, size);
     };
-    // The field values stay on the Lua stack through capture admission.
     const auto name = target_field("name", 4096), output = target_field("output", 256);
     static const char* modes[] = {"windows_only", "everything", nullptr};
     const auto mode = static_cast<std::uint32_t>(enum_field(lua, 1, "mode", nullptr, modes));
@@ -643,6 +640,8 @@ int capture_workspace(lua_State* lua) {
 void close_capture(Capture& capture) {
     if (capture.closed) return;
     stop_capture(capture); capture.closed = true;
+    for (auto& slot : capture.gui->captures)
+        if (slot == &capture) { slot = nullptr; break; }
 }
 
 Capture::~Capture() { close_capture(*this); }
@@ -655,24 +654,21 @@ void start_windows(Gui& gui) {
     }
 }
 
-std::shared_ptr<Capture> capture_source(Gui& gui, const std::string& window, std::uint32_t output, bool cursor, int fps) {
-    auto capture = std::make_shared<Capture>(gui);
-    capture->output = output;
-    capture->max_width = capture->max_height = 4096;
-    capture->interval = std::chrono::milliseconds((1000 + fps - 1) / fps);
+void start_capture(Capture& capture, const std::string& window, std::uint32_t output, bool cursor, int fps) {
+    auto& gui = *capture.gui;
+    capture.output = output;
+    capture.max_width = capture.max_height = 4096;
+    capture.interval = std::chrono::milliseconds((1000 + fps - 1) / fps);
     ext_image_capture_source_v1* source = nullptr;
     if (output) {
         const auto target = std::ranges::find_if(gui.outputs, [&](const auto& item) { return item->id == output; });
         if (!gui.output_capture_manager || target == gui.outputs.end()) throw std::runtime_error("output is unavailable");
         source = ext_output_image_capture_source_manager_v1_create_source(gui.output_capture_manager, (*target)->native);
     } else {
-        auto* catalog = gui.windows.get();
-        if (!catalog) throw std::runtime_error("window capture is unavailable");
-        source = window_source(*capture, *catalog, window);
+        source = window_source(capture, *gui.windows, window);
     }
     admit_capture(capture, source, cursor);
-    capture->deadline = Clock::now() + std::chrono::seconds(5);
-    return capture;
+    capture.deadline = Clock::now() + std::chrono::seconds(5);
 }
 
 std::shared_ptr<Image> advance_capture(Capture& capture) {
@@ -814,7 +810,6 @@ void remove_capture_global(Gui& gui, std::uint32_t name) {
 void close_captures(Gui& gui) noexcept {
     for (auto binding : gui.capture_bindings) if (binding) close_capture_binding(*binding);
     for (auto& capture : gui.captures) if (capture) close_capture(*capture);
-    gui.captures.fill(nullptr);
     if (gui.output_capture_manager_name) remove_capture_global(gui, gui.output_capture_manager_name);
     if (gui.capture_manager_name) remove_capture_global(gui, gui.capture_manager_name);
     if (gui.workspace_capture_manager_name) remove_capture_global(gui, gui.workspace_capture_manager_name);
@@ -823,9 +818,9 @@ void close_captures(Gui& gui) noexcept {
 
 void close_windows(WindowCatalog& catalog) noexcept {
     for (auto binding : catalog.gui->capture_bindings)
-        if (binding && binding->capture->catalog == &catalog) close_capture_binding(*binding);
+        if (binding && binding->capture.catalog == &catalog) close_capture_binding(*binding);
     for (auto& capture : catalog.gui->captures)
-        if (capture && capture->catalog == &catalog) { close_capture(*capture); capture.reset(); }
+        if (capture && capture->catalog == &catalog) close_capture(*capture);
     for (auto& target : catalog.targets) ext_foreign_toplevel_handle_v1_destroy(target->native);
     catalog.targets.clear();
     if (catalog.capture_list) ext_foreign_toplevel_list_v1_destroy(std::exchange(catalog.capture_list, nullptr));
@@ -838,7 +833,7 @@ void close_windows(WindowCatalog& catalog) noexcept {
     if (catalog.registry) wl_registry_destroy(std::exchange(catalog.registry, nullptr));
     catalog.manager_name = catalog.capture_list_name = catalog.capture_sources_name = 0;
     catalog.protocol_error = nullptr; catalog.error.clear();
-    catalog.registered = catalog.subscribed = false;
+    catalog.registered = false;
     catalog.change_pending = catalog.status_pending = false;
     catalog.records.reset(); catalog.refresh_at.reset(); catalog.deadline.reset();
     catalog.closed = true; catalog.phase = WindowCatalog::Phase::stopped; ++catalog.generation;
@@ -849,11 +844,11 @@ void prepare_windows(WindowCatalog& catalog, WaitSet& wait) {
     if (catalog.protocol_error || catalog.change_pending || catalog.status_pending ||
         (catalog.query == WindowCatalog::Query::complete && !catalog.sync)) wait.due(Clock::time_point::min());
     wait.due(catalog.deadline);
-    if (catalog.subscribed && catalog.query == WindowCatalog::Query::idle) wait.due(catalog.refresh_at);
+    if (catalog.query == WindowCatalog::Query::idle) wait.due(catalog.refresh_at);
 }
 
 void prepare_captures(Gui& gui, WaitSet& wait) {
-    for (auto& capture : gui.captures) if (capture && !capture->closed) {
+    for (auto* capture : gui.captures) if (capture) {
         if (capture->ready || capture->error) wait.due(Clock::time_point::min());
         if (capture->constraints) wait.due(capture->next_frame);
         wait.due(capture->deadline);
@@ -864,7 +859,7 @@ void read_windows(WindowCatalog& catalog, const WaitSet& wait) {
     if (catalog.protocol_error) { fail(catalog, catalog.protocol_error); return; }
     const auto now = Clock::now();
     if (catalog.deadline && now >= *catalog.deadline) { fail(catalog, "window subscription timed out"); return; }
-    if (!catalog.subscribed) return;
+    if (catalog.phase != WindowCatalog::Phase::synchronizing && catalog.phase != WindowCatalog::Phase::ready) return;
     if (catalog.sync) return;
     if (catalog.query == WindowCatalog::Query::complete) {
         try {
@@ -891,7 +886,7 @@ void read_windows(WindowCatalog& catalog, const WaitSet& wait) {
         catalog.deadline = now + std::chrono::seconds(2);
         return;
     }
-    if (catalog.wait_offset >= wait.fds.size() || wait.fds[catalog.wait_offset].fd != catalog.fd) return;
+    assert(catalog.wait_offset < wait.fds.size() && wait.fds[catalog.wait_offset].fd == catalog.fd);
     const auto events = wait.fds[catalog.wait_offset].revents;
     if (!events) return;
     const auto next = native::protocol::advance_request(catalog.fd, events, catalog.query, request, catalog.reply, max_reply);
@@ -909,8 +904,8 @@ int dispatch_captures(Gui& gui) {
         if (!binding) continue;
         auto& capture = binding->capture;
         if (gui.owner.requests.load(std::memory_order_relaxed)) break;
-        const auto image = advance_capture(*capture);
-        const char* error = std::exchange(capture->error, nullptr);
+        const auto image = advance_capture(capture);
+        const char* error = std::exchange(capture.error, nullptr);
         if (!image && !error) continue;
         const int reference = binding->callback;
         lua_pushcfunction(lua, traceback);
@@ -918,7 +913,7 @@ int dispatch_captures(Gui& gui) {
             lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
             lua_rawgeti(lua, LUA_REGISTRYINDEX, binding->handle);
             lua_createtable(lua, 0, 6);
-            string_field(lua, "kind", error ? (capture->unavailable ? "unavailable" : "error") : "frame");
+            string_field(lua, "kind", error ? (capture.unavailable ? "unavailable" : "error") : "frame");
             if (error) string_field(lua, "error", error);
             else {
                 auto* source = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<Image>), 0)) std::shared_ptr<Image>();
@@ -926,10 +921,10 @@ int dispatch_captures(Gui& gui) {
                 lua_setfield(lua, -2, "source");
                 lua_pushinteger(lua, image->width); lua_setfield(lua, -2, "width");
                 lua_pushinteger(lua, image->height); lua_setfield(lua, -2, "height");
-                lua_pushinteger(lua, capture->buffer_width); lua_setfield(lua, -2, "source_width");
-                lua_pushinteger(lua, capture->buffer_height); lua_setfield(lua, -2, "source_height");
+                lua_pushinteger(lua, capture.buffer_width); lua_setfield(lua, -2, "source_width");
+                lua_pushinteger(lua, capture.buffer_height); lua_setfield(lua, -2, "source_height");
             }
-            if (capture->closed || binding->callback != reference) return 0;
+            if (capture.closed || binding->callback != reference) return 0;
             lua_call(lua, 2, 0); return 0;
         }, 0, 1) < 0) return -1;
         lua_settop(lua, 0);

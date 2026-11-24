@@ -164,8 +164,9 @@ void Portal::connect_pipewire() {
     pw_core_add_listener(core, &core_listener, &core_events, this);
 }
 
-PortalStream::PortalStream(Portal& owner, const PortalSource& source)
-    : owner(owner), type(source.type), x(source.x), y(source.y), width(source.width), height(source.height) {
+PortalStream::PortalStream(Portal& owner, const PortalSource& source, bool cursor)
+    : owner(owner), type(source.type), x(source.x), y(source.y), width(source.width), height(source.height), capture(owner.gui) {
+    start_capture(capture, source.window, source.output, cursor, owner.fps);
     stream = pw_stream_new(owner.core, "Hyprworks ScreenCast",
         pw_properties_new(PW_KEY_MEDIA_CLASS, "Video/Source", PW_KEY_MEDIA_ROLE, "Screen",
             PW_KEY_NODE_NAME, "hyprworks.screencast", PW_KEY_NODE_DESCRIPTION, source.title.c_str(), nullptr));
@@ -197,7 +198,6 @@ void PortalStream::publish(std::shared_ptr<Image> frame) {
 }
 
 PortalStream::~PortalStream() {
-    if (capture) close_capture(*capture);
     spa_hook_remove(&listener); pw_stream_destroy(stream);
     owner.stream_bytes -= reserved;
 }
@@ -236,7 +236,7 @@ Portal::~Portal() {
 }
 
 void Portal::close_session(std::size_t index, std::uint32_t code, std::string_view error) {
-    auto& session = *sessions[index];
+    auto& session = sessions[index];
     if (!error.empty() && attached)
         (void)bus.emit(path, control, "Failed", {number(session.token, "t"), text(std::string(error))}, ui_owner);
     if (session.request) (void)bus.reply(session.request, response(code));
@@ -256,10 +256,10 @@ void Portal::refresh_sources() {
             next.push_back({"output:" + std::to_string(output->id), output->state.description.empty() ? output->state.name : output->state.description,
                 {}, 1, output->id, output->state.x, output->state.y, output->state.width, output->state.height});
     }
-    if (gui.capture_manager && gui.windows && gui.windows->capture_sources) {
+    if (gui.capture_manager && gui.windows->capture_sources) {
         available |= 2;
         if (gui.windows->records) for (const auto& window : *gui.windows->records) {
-            if (!window.mapped || window.app_class == "hyprworks-portal") continue;
+            if (!window.mapped) continue;
             if (std::ranges::none_of(gui.windows->targets, [&](const auto& target) { return target->id == window.capture_id; })) continue;
             next.push_back({"window:" + window.id, window.app_class + " — " + window.title, window.id, 2, 0, 0, 0, window.width, window.height});
         }
@@ -277,9 +277,9 @@ Body Portal::snapshot() const {
     Body requests, offered;
     for (const auto& session : sessions) {
         static const char* phases[] = {"created", "selected", "choosing", "starting", "streaming"};
-        requests.push_back(dictionary({{"id", number(session->token, "t")}, {"app_id", text(session->app)},
-            {"parent_window", text(session->parent)}, {"phase", text(phases[static_cast<unsigned>(session->phase)])},
-            {"types", number(session->types)}, {"multiple", {"b", session->multiple}}}));
+        requests.push_back(dictionary({{"id", number(session.token, "t")}, {"app_id", text(session.app)},
+            {"parent_window", text(session.parent)}, {"phase", text(phases[static_cast<unsigned>(session.phase)])},
+            {"types", number(session.types)}, {"multiple", {"b", session.multiple}}}));
     }
     for (const auto& source : sources)
         offered.push_back(dictionary({{"id", text(source.id)}, {"title", text(source.title)}, {"type", number(source.type)}}));
@@ -294,9 +294,9 @@ void Portal::method(const dbus::Event& event) {
         if (!attached) throw std::runtime_error("UI must attach first");
         if (event.member == "Snapshot") { require(bus.reply(event.id, snapshot())); return; }
         const auto token = integer(args[0]);
-        const auto found = std::ranges::find_if(sessions, [&](const auto& session) { return session->token == token; });
+        const auto found = std::ranges::find(sessions, token, &PortalSession::token);
         if (found == sessions.end()) throw std::runtime_error("portal request is no longer active");
-        auto& session = **found;
+        auto& session = *found;
         if (event.member == "Cancel" || event.member == "Stop") {
             if (event.member == "Cancel" && session.phase == PortalSession::Phase::streaming)
                 throw std::runtime_error("use Stop for a streaming session");
@@ -317,11 +317,8 @@ void Portal::method(const dbus::Event& event) {
         }
         connect_pipewire();
         std::vector<std::unique_ptr<PortalStream>> streams;
-        for (const auto* source : chosen) {
-            auto stream = std::make_unique<PortalStream>(*this, *source);
-            stream->capture = capture_source(gui, source->window, source->output, session.cursor == 2, fps);
-            streams.push_back(std::move(stream));
-        }
+        for (const auto* source : chosen)
+            streams.push_back(std::make_unique<PortalStream>(*this, *source, session.cursor == 2));
         require(bus.reply(event.id, {}));
         session.streams = std::move(streams); session.phase = PortalSession::Phase::starting;
         session.deadline = Clock::now() + std::chrono::seconds(10); changed = true;
@@ -331,7 +328,7 @@ void Portal::method(const dbus::Event& event) {
     if (event.interface == request_interface || event.interface == session_interface) {
         const bool request = event.interface == request_interface;
         const auto found = std::ranges::find_if(sessions, [&](const auto& session) {
-            return (request ? session->request_path : session->path) == event.path;
+            return (request ? session.request_path : session.path) == event.path;
         });
         if (found == sessions.end()) throw std::runtime_error("session is closed");
         require(bus.reply(event.id, {}));
@@ -346,13 +343,13 @@ void Portal::method(const dbus::Event& event) {
         !session_path.starts_with("/org/freedesktop/portal/desktop/session/") ||
         request_path.size() > 1024 || session_path.size() > 1024 || app.size() > 255)
         throw std::runtime_error("invalid portal request identity");
-    const auto found = std::ranges::find_if(sessions, [&](const auto& session) { return session->path == session_path; });
+    const auto found = std::ranges::find(sessions, session_path, &PortalSession::path);
     if (event.member == "CreateSession") {
         if (found != sessions.end() || sessions.size() >= 8 || next_token == UINT64_MAX)
             throw std::runtime_error("session already exists or portal capacity reached");
-        auto session = std::make_unique<PortalSession>();
-        session->path = session_path; session->app = app; session->token = ++next_token;
-        session->deadline = Clock::now() + request_timeout;
+        PortalSession session;
+        session.path = session_path; session.app = app; session.token = ++next_token;
+        session.deadline = Clock::now() + request_timeout;
         require(bus.export_interface(session_path, session_interface, {{"Close", "", ""}}, {{"Closed", ""}},
             {{"version", number(1), true}}, request_timeout));
         sessions.push_back(std::move(session));
@@ -360,8 +357,8 @@ void Portal::method(const dbus::Event& event) {
         if (!replied) { close_session(sessions.size() - 1); require(replied); }
         changed = true; return;
     }
-    if (found == sessions.end() || (*found)->app != app) throw std::runtime_error("unknown portal session");
-    auto& session = **found;
+    if (found == sessions.end() || found->app != app) throw std::runtime_error("unknown portal session");
+    auto& session = *found;
     if (event.member == "SelectSources") {
         if (session.phase != PortalSession::Phase::created) throw std::runtime_error("sources already selected");
         std::uint32_t source_types = 1, cursor_mode = 1;
@@ -393,8 +390,6 @@ void Portal::method(const dbus::Event& event) {
     session.parent = std::move(parent); session.request = event.id; session.request_path = std::move(request_object);
     session.phase = PortalSession::Phase::choosing; session.deadline = Clock::now() + request_timeout;
     changed = true;
-    (void)bus.call({"org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-        "StartServiceByName", {text(ui_name), number(0)}, std::chrono::seconds(5)});
 }
 
 void prepare_portal(Portal& portal, WaitSet& wait) {
@@ -403,8 +398,8 @@ void prepare_portal(Portal& portal, WaitSet& wait) {
     wait.due(portal.bus_wait.deadline);
     if (portal.loop) wait.append({pw_loop_get_fd(portal.loop), POLLIN, 0});
     for (const auto& session : portal.sessions) {
-        wait.due(session->deadline);
-        for (const auto& stream : session->streams) wait.due(stream->next_process);
+        wait.due(session.deadline);
+        for (const auto& stream : session.streams) wait.due(stream->next_process);
     }
     if (portal.changed) wait.due(Clock::time_point::min());
 }
@@ -433,7 +428,7 @@ void read_portal(Portal& portal, const WaitSet& wait) {
         }
         if (event.kind == dbus::EventKind::expired)
             for (std::size_t i = portal.sessions.size(); i-- > 0;)
-                if (portal.sessions[i]->request == event.id) portal.close_session(i);
+                if (portal.sessions[i].request == event.id) portal.close_session(i);
         if (event.kind == dbus::EventKind::method) {
             try { portal.method(event); }
             catch (const std::exception& error) { (void)portal.bus.error(event.id, "org.freedesktop.DBus.Error.Failed", error.what()); }
@@ -443,13 +438,13 @@ void read_portal(Portal& portal, const WaitSet& wait) {
 
 void dispatch_portal(Portal& portal) {
     if (portal.pipewire_failed) throw std::runtime_error("PipeWire connection failed");
-    if (!portal.name_requested && portal.gui.windows &&
+    if (!portal.name_requested &&
         (portal.gui.windows->phase == WindowCatalog::Phase::ready || portal.gui.windows->phase == WindowCatalog::Phase::failed)) {
         require(portal.bus.request_name(backend));
         portal.name_requested = true;
     }
     for (std::size_t i = portal.sessions.size(); i-- > 0;) {
-        auto& session = *portal.sessions[i];
+        auto& session = portal.sessions[i];
         if (session.deadline && Clock::now() >= *session.deadline) {
             portal.close_session(i, 2, "Screen-sharing request timed out"); continue;
         }
@@ -457,10 +452,10 @@ void dispatch_portal(Portal& portal) {
         bool ready = !session.streams.empty();
         for (auto& stream : session.streams) {
             try {
-                if (auto image = advance_capture(*stream->capture)) stream->publish(std::move(image));
+                if (auto image = advance_capture(stream->capture)) stream->publish(std::move(image));
             } catch (const std::exception& error) { failure = error.what(); }
-            if (stream->capture->error) failure = stream->capture->error;
-            else if (stream->capture->closed) failure = "capture closed";
+            if (stream->capture.error) failure = stream->capture.error;
+            else if (stream->capture.closed) failure = "capture closed";
             else if (stream->failed) failure = "PipeWire stream failed";
             if (stream->next_process && Clock::now() >= *stream->next_process) {
                 if (pw_stream_trigger_process(stream->stream) < 0) failure = "PipeWire frame submission failed";

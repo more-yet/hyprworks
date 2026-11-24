@@ -310,8 +310,6 @@ struct PolkitBinding {
 };
 #endif
 
-/// Stable binding storage spans native dispatch, reentrant Lua finalizers and
-/// lua_close. Native resources stop first; binding storage is reclaimed last.
 struct InvocationState {
     InvocationState();
     ~InvocationState();

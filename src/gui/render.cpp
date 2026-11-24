@@ -286,7 +286,6 @@ const wl_callback_listener frame_listener{
 void damage(Surface& surface, Box box) {
     if (box.w <= 0 || box.h <= 0) return;
     surface.dirty = true;
-    // Compositor-owned buffers accumulate repair metadata until release.
     for (auto& buffer : surface.gui->buffers) {
         if (buffer->surface != surface.id) continue;
         auto& pending = buffer->damage;

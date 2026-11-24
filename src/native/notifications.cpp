@@ -30,16 +30,11 @@ std::size_t payload_size(const Notification& notification) {
 }
 
 void read_hints(sd_bus_message* message, Notification& notification, std::size_t& bytes) {
-    require(sd_bus_message_enter_container(message, 'a', "{sv}"));
-    unsigned count = 0;
     std::size_t binary_bytes = 0;
-    while (check(sd_bus_message_enter_container(message, 'e', "sv"))) {
-        if (++count > 128) throw std::length_error("notification exceeds 128 hints");
-        auto key = dbus::text(message, 's', bytes);
-        char type;
-        const char* signature = nullptr;
-        require(sd_bus_message_peek_type(message, &type, &signature));
-        require(sd_bus_message_enter_container(message, 'v', signature));
+    dbus::read_properties(message, [&](std::string_view key) {
+        if (key.size() > 16384 || key.size() > 1024 * 1024 - bytes) throw std::length_error("notification hint names exceed text budget");
+        bytes += key.size();
+        const char* signature = sd_bus_message_get_signature(message, false);
         std::optional<Hint> hint;
         if (std::strcmp(signature, "s") == 0 || std::strcmp(signature, "o") == 0) hint = dbus::text(message, *signature, bytes);
         else if (std::strcmp(signature, "b") == 0) hint = dbus::boolean(message);
@@ -53,7 +48,7 @@ void read_hints(sd_bus_message* message, Notification& notification, std::size_t
         else if (std::strcmp(signature, "d") == 0) hint = dbus::finite_number(message);
         else if (std::strcmp(signature, "as") == 0) {
             hint = dbus::strings(message, bytes);
-        } else if (std::strcmp(signature, "(iiibiiay)") == 0 && (key == "image-data" || key == "image_data" || key == "icon_data")) {
+        } else if (std::strcmp(signature, "(iiibiiay)") == 0 && key == "image-data") {
             Image image;
             int alpha, bits;
             require(sd_bus_message_enter_container(message, 'r', "iiibiiay"));
@@ -76,11 +71,9 @@ void read_hints(sd_bus_message* message, Notification& notification, std::size_t
             std::vector<std::uint8_t> value;
             if (size) value.assign(static_cast<const std::uint8_t*>(data), static_cast<const std::uint8_t*>(data) + size);
             hint = std::move(value);
-        } else require(sd_bus_message_skip(message, signature));
-        check(sd_bus_message_exit_container(message)); check(sd_bus_message_exit_container(message));
-        if (hint) notification.hints.emplace(std::move(key), std::move(*hint));
-    }
-    check(sd_bus_message_exit_container(message));
+        }
+        if (hint) notification.hints.emplace(std::string(key), std::move(*hint));
+    });
 }
 
 }

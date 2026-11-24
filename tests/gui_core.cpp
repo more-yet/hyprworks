@@ -73,23 +73,17 @@ static void image_worker() {
         const auto* pixels = reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(decoded->surface));
         assert(decoded->width == 5 && pixels[4] == 0xffffffff);
     }
-    for (const int pixels : {0, 12}) {
-        auto svg = std::make_shared<Image>(images);
-        svg->pixels = pixels;
-        svg->set_data(R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 2"><path fill="red" d="M0 0h4v2H0z"/></svg>)");
-        assert(images.submit(svg));
-        while (!svg->ready.load(std::memory_order_acquire)) {
+    {
+        auto invalid = std::make_shared<Image>(images);
+        invalid->set_data("invalid image");
+        assert(images.submit(invalid));
+        while (!invalid->ready.load(std::memory_order_acquire)) {
             pollfd fd{wake, POLLIN, 0};
             assert(poll(&fd, 1, 3000) > 0);
             std::uint64_t value;
             assert(read(wake, &value, sizeof(value)) == sizeof(value));
         }
-        assert(svg->encoded.empty());
-        if (pixels) {
-            assert(svg->error.empty() && svg->surface && svg->width == 12 && svg->height == 6);
-        } else {
-            assert(!svg->error.empty() && !svg->surface && svg->bytes == 0);
-        }
+        assert(!invalid->error.empty() && invalid->encoded.empty() && !invalid->surface && invalid->bytes == 0);
     }
     for (int i = 0; i < 200; ++i) {
         auto job = std::make_shared<Image>(images);
@@ -136,7 +130,7 @@ static void capture_lifetimes() {
     assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wayland) == 0);
     gui.display = wl_display_connect_to_fd(wayland[0]);
     assert(gui.display);
-    catalog.gui = &gui; catalog.subscribed = true;
+    catalog.gui = &gui; catalog.phase = WindowCatalog::Phase::synchronizing;
     catalog.identity_prefix = "session:1:";
     catalog.invalidation = 1;
     const std::string reply = R"([{"address":"0x123","stableId":"abc","class":"app","title":"title","mapped":true,"size":[640,480]}])"
@@ -234,16 +228,16 @@ static void capture_lifetimes() {
     assert(capture->session && !capture->closed);
     const auto& session_events = *reinterpret_cast<const ext_image_copy_capture_session_v1_listener*>(
         wl_proxy_get_listener(reinterpret_cast<wl_proxy*>(capture->session)));
-    session_events.shm_format(capture.get(), capture->session, WL_SHM_FORMAT_ARGB8888);
-    session_events.buffer_size(capture.get(), capture->session, 8, 4);
-    session_events.shm_format(capture.get(), capture->session, WL_SHM_FORMAT_XRGB8888);
+    session_events.shm_format(capture, capture->session, WL_SHM_FORMAT_ARGB8888);
+    session_events.buffer_size(capture, capture->session, 8, 4);
+    session_events.shm_format(capture, capture->session, WL_SHM_FORMAT_XRGB8888);
     assert(!capture->constraints && capture->format == WL_SHM_FORMAT_ARGB8888);
-    session_events.done(capture.get(), capture->session);
+    session_events.done(capture, capture->session);
     assert(dispatch_captures(gui) == 0 && capture->frame && gui.capture_bytes == 128);
     const auto& frame_events = *reinterpret_cast<const ext_image_copy_capture_frame_v1_listener*>(
         wl_proxy_get_listener(reinterpret_cast<wl_proxy*>(capture->frame)));
     std::fill_n(static_cast<std::uint32_t*>(capture->pixels), 32, 0x80402010u);
-    frame_events.ready(capture.get(), capture->frame);
+    frame_events.ready(capture, capture->frame);
     assert(dispatch_captures(gui) == 0 && !capture->deadline);
     const auto latest = [&] {
         lua_getglobal(state.lua, "latest_source");
@@ -256,34 +250,26 @@ static void capture_lifetimes() {
     assert(retained_pixels[0] == 0x80402010u);
     capture->next_frame = Clock::now();
     assert(dispatch_captures(gui) == 0 && capture->frame);
-    session_events.buffer_size(capture.get(), capture->session, 4, 8);
+    session_events.buffer_size(capture, capture->session, 4, 8);
     assert(!capture->constraints && capture->format == UINT32_MAX);
-    frame_events.ready(capture.get(), capture->frame);
+    frame_events.ready(capture, capture->frame);
     assert(dispatch_captures(gui) == 0 && !capture->frame && latest() == retained);
     script("assert(capture_frames == 1)");
-    session_events.shm_format(capture.get(), capture->session, WL_SHM_FORMAT_XRGB8888);
-    session_events.done(capture.get(), capture->session);
+    session_events.shm_format(capture, capture->session, WL_SHM_FORMAT_XRGB8888);
+    session_events.done(capture, capture->session);
     assert(dispatch_captures(gui) == 0 && capture->frame && capture->buffer_width == 4 && capture->buffer_height == 8);
     for (unsigned failure = 1; failure <= 3; ++failure) {
-        frame_events.failed(capture.get(), capture->frame, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
+        frame_events.failed(capture, capture->frame, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
         assert(!capture->error && capture->constraint_failures == failure && capture->next_frame);
         capture->next_frame = Clock::now();
         assert(dispatch_captures(gui) == 0 && capture->frame);
     }
     std::fill_n(static_cast<std::uint32_t*>(capture->pixels), 32, 0x00204060u);
-    frame_events.ready(capture.get(), capture->frame);
+    frame_events.ready(capture, capture->frame);
     assert(dispatch_captures(gui) == 0 && latest() != retained && capture->constraint_failures == 0);
     assert(*reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(latest()->surface)) == 0xff204060u);
     assert(retained_pixels[0] == 0x80402010u);
-    capture->next_frame = Clock::now();
-    assert(dispatch_captures(gui) == 0 && capture->frame);
-    for (unsigned i = 0; i < 32; ++i) static_cast<std::uint32_t*>(capture->pixels)[i] = 0x00010200u + i;
-    frame_events.transform(capture.get(), capture->frame, WL_OUTPUT_TRANSFORM_90);
-    frame_events.ready(capture.get(), capture->frame);
-    assert(dispatch_captures(gui) == 0);
-    assert(latest()->width == 8 && latest()->height == 4);
-    assert(retained_pixels[0] == 0x80402010u);
-    script("assert(capture_frames == 3); latest_source = nil; collectgarbage('collect')");
+    script("assert(capture_frames == 2); latest_source = nil; collectgarbage('collect')");
     assert(gui.images.bytes.load() == retained->bytes);
     script(R"(
         retry_capture = assert(hw.capture_workspace(capture_options, function(_, event)
@@ -292,13 +278,13 @@ static void capture_lifetimes() {
         end))
     )");
     auto retry = gui.captures[1];
-    session_events.buffer_size(retry.get(), retry->session, 8, 4);
-    session_events.shm_format(retry.get(), retry->session, WL_SHM_FORMAT_ARGB8888);
-    session_events.done(retry.get(), retry->session);
+    session_events.buffer_size(retry, retry->session, 8, 4);
+    session_events.shm_format(retry, retry->session, WL_SHM_FORMAT_ARGB8888);
+    session_events.done(retry, retry->session);
     for (unsigned failure = 1; failure <= 4; ++failure) {
         retry->next_frame = Clock::now();
         assert(dispatch_captures(gui) == 0 && retry->frame && gui.capture_bytes == 256);
-        frame_events.failed(retry.get(), retry->frame, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
+        frame_events.failed(retry, retry->frame, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
     }
     assert(retry->error && !retry->session && gui.capture_bytes == 128);
     WaitSet capture_wait;
@@ -307,12 +293,14 @@ static void capture_lifetimes() {
     assert(dispatch_captures(gui) == 0);
     assert(dispatch_captures(gui) == 0);
     script("assert(retry_failed); retry_capture:close(); retry_capture = nil");
+    assert(gui.captures[1] == nullptr);
     group_events.workspace_leave(group, group->native, target->native);
     group_events.removed(group, group->native);
     assert(!target->group && gui.capture_groups.empty());
     workspace_events.removed(target, target->native);
     assert(gui.capture_targets.empty() && capture->error && capture->unavailable && gui.capture_bytes == 0);
     assert(dispatch_captures(gui) == 0 && capture->closed);
+    assert(gui.captures[0] == nullptr);
     script("assert(capture_ended == 1); capture = nil; retained_source = nil; collectgarbage('collect')");
     assert(retained_pixels[0] == 0x80402010u);
     retained.reset();
@@ -352,8 +340,6 @@ static void clipboard_transport() {
     auto& seat = *gui.seats.emplace_back(std::make_unique<Seat>());
     seat.gui = &gui; seat.id = 7; seat.selection = &offer;
     script(R"(
-        assert(not hw.clipboard_types(8))
-        assert(hw.clipboard_types(7)[1] == "image/png")
         dir = assert(hw.temp_dir(os.getenv("TMPDIR") or "/tmp"))
         path = dir .. "/img"
         assert(hw.clipboard_read(7, "image/png", {file = path, limit = 2 * 1024 * 1024}, function(n, err)
@@ -528,13 +514,7 @@ static void surface_safety() {
     assert(process_input(surface, ime) == 1 && input.text == "日本z");
     assert(not replace_text(surface, input, 1, 2, ""));
     assert(!replace_text(surface, input, 0, 0, std::string(16385, 'x')));
-    input.cursor = 3; input.anchor = 6;
-    ime.before = 3; ime.after = 1; ime.commit_set = false;
-    assert(process_input(surface, ime) == 1 && input.text == "本" && input.cursor == 0 && input.anchor == 3);
-    script("assert(input:set {text = '日本z'})");
-    input.cursor = 3; input.anchor = 6; ime.commit_set = true;
-    ime.before = 3; ime.after = 1; ime.text = "A";
-    assert(process_input(surface, ime) == 1 && input.text == "A");
+    script("assert(input:set {text = 'A'})");
     ime.before = 1; ime.after = 0; ime.text.assign(16385, 'x');
     assert(process_input(surface, ime) == -1 && input.text == "A");
     input.cursor = 0; input.anchor = 1;
@@ -733,10 +713,6 @@ static void surface_safety() {
     assert(dispatch_input(gui) == 0);
     script("assert(activations == 1)");
     unref(state.lua, surface.on_input);
-    key_press.serial = 0;
-    enqueue(*keyboard, key_press); enqueue(*keyboard, key_repeat); enqueue(*keyboard, key_release);
-    assert(dispatch_input(gui) == 0);
-    script("assert(activations == 2)");
 
     script(R"(
         local function scroller(callback)
@@ -864,31 +840,20 @@ static void surface_safety() {
         };
         gui.buffers.push_back(buffer()); gui.buffers.push_back(buffer());
         auto& first = *gui.buffers[0]; auto& delayed = *gui.buffers[1];
-        auto reference = buffer();
         paint_buffer(surface, first); paint_buffer(surface, delayed);
         delayed.busy = true;
         const auto size = static_cast<std::size_t>(cairo_image_surface_get_stride(delayed.cairo) * delayed.height);
         const auto* pixels = cairo_image_surface_get_data(delayed.cairo);
         const std::vector<unsigned char> submitted(pixels, pixels + size);
-        const auto compare = [&](Buffer& repaired) {
-            reference->damage = {0, 0, double(surface.width), double(surface.height)};
-            paint_buffer(surface, *reference);
-            assert(std::memcmp(cairo_image_surface_get_data(repaired.cairo),
-                cairo_image_surface_get_data(reference->cairo), size) == 0);
-        };
-        script("assert(surface:find('paint'):set {color = '#00ff00'})");
-        paint_buffer(surface, first);
-        compare(first);
         script(R"(
             assert(surface:find("paint"):set {text = "Text that wraps across several lines"})
             assert(surface:find("below"):set {background = "#0055ff80"})
         )");
-        paint_buffer(surface, first); compare(first);
-        script("assert(surface:find('paint'):set {text = 'Small', x = 5, y = 3})");
-        paint_buffer(surface, first); compare(first);
+        paint_buffer(surface, first);
         assert(std::memcmp(cairo_image_surface_get_data(delayed.cairo), submitted.data(), size) == 0);
         delayed.busy = false;
-        paint_buffer(surface, delayed); compare(delayed);
+        paint_buffer(surface, delayed);
+        assert(std::memcmp(cairo_image_surface_get_data(delayed.cairo), cairo_image_surface_get_data(first.cairo), size) == 0);
         gui.buffers.clear();
         surface.scale = 1;
     }

@@ -3,7 +3,6 @@
 #include "dbus_body.hpp"
 #include <algorithm>
 #include <cassert>
-#include <cmath>
 #include <exception>
 #include <limits>
 #include <string_view>
@@ -56,7 +55,7 @@ Value read_value(sd_bus_message* message, BodyBudget& budget, unsigned depth) {
         case 'n': { std::int16_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = std::int64_t(data); break; }
         case 'i': { std::int32_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = std::int64_t(data); break; }
         case 'x': { std::int64_t data; require(sd_bus_message_read_basic(message, type, &data)); value.data = data; break; }
-        case 'd': value.data = finite_number(message); break;
+        case 'd': { double data; require(sd_bus_message_read_basic(message, type, &data)); value.data = data; break; }
         case 'h': {
             budget.descriptor();
             int fd; require(sd_bus_message_read_basic(message, type, &fd));
@@ -95,13 +94,11 @@ Value read_value(sd_bus_message* message, BodyBudget& budget, unsigned depth) {
 
 void write_value(sd_bus_message* message, const Value& value, BodyBudget& budget, unsigned depth) {
     budget.node(depth);
-    // Root and variant signatures are validated; other children match their parent's type.
     const char type = value.signature[0];
     switch (type) {
         case 'h': {
             budget.descriptor();
             const int fd = std::get<FileDescriptor>(value.data).get();
-            if (fd < 0) throw std::runtime_error("closed D-Bus file descriptor");
             check(sd_bus_message_append_basic(message, type, &fd));
             break;
         }
@@ -127,7 +124,6 @@ void write_value(sd_bus_message* message, const Value& value, BodyBudget& budget
         }
         case 'd': {
             const auto data = std::get<double>(value.data);
-            if (!std::isfinite(data)) throw std::runtime_error("nonfinite D-Bus number");
             check(sd_bus_message_append_basic(message, type, &data)); break;
         }
         case 's': case 'o': case 'g': {
@@ -499,10 +495,8 @@ std::expected<std::uint64_t, std::string> Connection::call(const Call& call) {
         outgoing_capacity(state.bus);
         if (state.pending.size() >= 64) throw std::length_error("D-Bus outgoing request limit reached");
         if (call.timeout.count() < 1 || call.timeout > std::chrono::minutes(5)) throw std::runtime_error("D-Bus timeout must be 1..300000 milliseconds");
-        if (!sd_bus_service_name_is_valid(call.destination.c_str()) || call.destination.contains('\0') ||
-            !sd_bus_object_path_is_valid(call.path.c_str()) || call.path.contains('\0') ||
-            !sd_bus_interface_name_is_valid(call.interface.c_str()) || call.interface.contains('\0') ||
-            !sd_bus_member_name_is_valid(call.member.c_str()) || call.member.contains('\0')) throw std::runtime_error("invalid D-Bus method address");
+        if (call.destination.contains('\0') || call.path.contains('\0') ||
+            call.interface.contains('\0') || call.member.contains('\0')) throw std::runtime_error("D-Bus method address contains NUL");
         auto message = dbus::method(state.bus, call.destination.c_str(), call.path.c_str(), call.interface.c_str(), call.member.c_str());
         write_body(message.get(), call.arguments);
         check(sd_bus_message_set_allow_interactive_authorization(message.get(), call.interactive));
@@ -550,8 +544,7 @@ std::expected<void, std::string> Connection::request_name(const std::string& nam
     auto& state = *state_;
     try {
         outgoing_capacity(state.bus);
-        if (name.empty() || name[0] == ':' || name.contains('\0') || !sd_bus_service_name_is_valid(name.c_str()))
-            throw std::runtime_error("invalid D-Bus service name");
+        if (name.contains('\0')) throw std::runtime_error("D-Bus service name contains NUL");
         if (state.names.size() >= 32) throw std::length_error("D-Bus owned name limit reached");
         for (const auto& item : state.names)
             if (item->name == name) throw std::runtime_error("D-Bus name is already tracked");
@@ -591,7 +584,7 @@ std::expected<void, std::string> Connection::export_interface(const std::string&
         if (!state.bus) throw std::runtime_error("D-Bus connection is stopped");
         if (state.exports.size() >= 128 || methods.size() > 32 || signals.size() > 32 || properties.size() > 32 ||
             (methods.empty() && signals.empty() && properties.empty())) throw std::length_error("D-Bus export limit exceeded");
-        if (path.size() > 16384 || !sd_bus_object_path_is_valid(path.c_str()) || path.contains('\0') || !sd_bus_interface_name_is_valid(interface.c_str()) ||
+        if (path.size() > 16384 || path.contains('\0') ||
             interface.contains('\0') || timeout.count() < 1 || timeout > std::chrono::minutes(5)) throw std::runtime_error("invalid D-Bus export");
         for (const auto& object : state.exports)
             if (object->path == path && object->interface == interface) throw std::runtime_error("D-Bus interface already exported");
@@ -600,8 +593,7 @@ std::expected<void, std::string> Connection::export_interface(const std::string&
         object->signals = signals;
         object->properties.reserve(properties.size());
         for (const auto& property : properties) {
-            if (!sd_bus_member_name_is_valid(property.name.c_str()) || property.name.contains('\0'))
-                throw std::runtime_error("invalid D-Bus property name");
+            if (property.name.contains('\0')) throw std::runtime_error("D-Bus property name contains NUL");
             State::Export::Property retained{property.name, property.value.signature, property.constant, {}};
             retained.message = encode_property(state.bus, property.value, retained.budget);
             object->budget.bytes += retained.budget.bytes;
@@ -612,16 +604,13 @@ std::expected<void, std::string> Connection::export_interface(const std::string&
         }
         object->table.push_back(SD_BUS_VTABLE_START(0));
         for (const auto& method : object->methods) {
-            if (!sd_bus_member_name_is_valid(method.name.c_str()) || method.name.contains('\0')) throw std::runtime_error("invalid D-Bus method name");
-            for (std::string_view signature : {std::string_view(method.input), std::string_view(method.output)})
-                while (!signature.empty()) take_type(signature);
+            if (method.name.contains('\0') || method.input.contains('\0') || method.output.contains('\0'))
+                throw std::runtime_error("D-Bus method declaration contains NUL");
             object->table.push_back(SD_BUS_METHOD(method.name.c_str(), method.input.c_str(), method.output.c_str(), State::method, SD_BUS_VTABLE_UNPRIVILEGED));
         }
         for (const auto& signal : object->signals) {
-            if (!sd_bus_member_name_is_valid(signal.name.c_str()) || signal.name.contains('\0'))
-                throw std::runtime_error("invalid D-Bus signal name");
-            std::string_view signature = signal.signature;
-            while (!signature.empty()) take_type(signature);
+            if (signal.name.contains('\0') || signal.signature.contains('\0'))
+                throw std::runtime_error("D-Bus signal declaration contains NUL");
             object->table.push_back(SD_BUS_SIGNAL(signal.name.c_str(), signal.signature.c_str(), 0));
         }
         for (const auto& property : object->properties) {
@@ -659,8 +648,7 @@ std::expected<void, std::string> Connection::emit(const std::string& path, const
         const auto& object = state.export_target(path, interface);
         const auto found = std::ranges::find(object.signals, member, &Signal::name);
         if (found == object.signals.end()) throw std::runtime_error("unknown D-Bus exported signal");
-        if (!destination.empty() && (destination.contains('\0') || !sd_bus_service_name_is_valid(destination.c_str())))
-            throw std::runtime_error("invalid D-Bus signal destination");
+        if (destination.contains('\0')) throw std::runtime_error("D-Bus signal destination contains NUL");
         sd_bus_message* raw = nullptr;
         check(sd_bus_message_new_signal(state.bus, &raw, path.c_str(), interface.c_str(), member.c_str()));
         Message message(raw, sd_bus_message_unref);

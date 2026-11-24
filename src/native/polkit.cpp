@@ -20,8 +20,7 @@ constexpr char cancelled_error[] = "org.freedesktop.PolicyKit1.Error.Cancelled";
 using dbus::check;
 using dbus::require;
 
-// libpolkit writes to the helper synchronously; a disappearing helper must not
-// change the host's SIGPIPE disposition or consume a previously pending signal.
+// Suppress libpolkit's synchronous SIGPIPE without consuming an already-pending signal.
 struct PipeSignals {
     sigset_t mask{}, previous{};
     bool pending = false;

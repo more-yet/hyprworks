@@ -13,11 +13,8 @@ constexpr char shortcut_metatable[] = "hyprworks.hyprland.shortcuts";
 std::expected<void, std::string> start_shortcuts(InvocationState& state) {
     auto& binding = *state.shortcuts;
 #ifdef HYPRWORKS_HAS_GUI
-    if (state.gui) {
-        if (!binding.display.empty())
-            return std::unexpected("GUI shortcuts use the GUI display");
+    if (state.gui)
         return binding.connection.attach(state.gui->display, binding.app_id, binding.shortcuts, [&state]() noexcept { wake(state); });
-    }
 #endif
     return binding.connection.start(binding.app_id, binding.shortcuts, binding.display);
 }
@@ -38,14 +35,11 @@ int shortcut_open(lua_State* lua) {
         std::vector<shortcuts::Shortcut> shortcuts;
         lua_pushvalue(lua, 1);
         if (protected_call(lua, [&](lua_State* lua) {
-            for (const auto& [key, target] : {std::pair{"app_id", &app_id}, {"display", &display}}) {
-                field(lua, 2, key);
-                if (!lua_isnil(lua, -1)) {
-                    std::size_t length; const char* value = check_string(lua, -1, &length);
-                    luaL_argcheck(lua, length <= 4096, 2, "shortcut option exceeds 4096 bytes"); target->assign(value, length);
-                }
-                lua_pop(lua, 1);
-            }
+            text_field(lua, 2, "app_id", app_id, 255);
+#ifdef HYPRWORKS_HAS_GUI
+            if (!state.gui)
+#endif
+                text_field(lua, 2, "display", display, 4096);
             field(lua, 2, "shortcuts"); luaL_checktype(lua, -1, LUA_TTABLE);
             const auto count = lua_rawlen(lua, -1);
             luaL_argcheck(lua, count > 0 && count <= 128, 2, "expected 1..128 shortcuts");
@@ -53,14 +47,9 @@ int shortcut_open(lua_State* lua) {
             for (std::size_t i = 0; i < count; ++i) {
                 lua_rawgeti(lua, -1, static_cast<lua_Integer>(i + 1)); luaL_checktype(lua, -1, LUA_TTABLE);
                 auto& shortcut = shortcuts[i];
-                for (const auto& [key, target] : {std::pair{"id", &shortcut.id}, {"description", &shortcut.description}, {"trigger_description", &shortcut.trigger_description}}) {
-                    field(lua, -1, key);
-                    if (!lua_isnil(lua, -1)) {
-                        std::size_t length; const char* value = check_string(lua, -1, &length);
-                        luaL_argcheck(lua, length <= 4096, 2, "shortcut text exceeds 4096 bytes"); target->assign(value, length);
-                    }
-                    lua_pop(lua, 1);
-                }
+                text_field(lua, -1, "id", shortcut.id, 255);
+                text_field(lua, -1, "description", shortcut.description, 4096);
+                text_field(lua, -1, "trigger_description", shortcut.trigger_description, 4096);
                 lua_pop(lua, 1);
             }
             return 0;

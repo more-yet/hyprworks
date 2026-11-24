@@ -1,4 +1,5 @@
 #include <hyprworks/dbus.hpp>
+#include "../src/native/dbus.hpp"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -55,6 +56,32 @@ static Event take(Peer& peer, EventKind kind, std::uint64_t id = 0) {
 }
 
 int main() {
+    {
+        sd_bus* raw_bus = nullptr;
+        check(sd_bus_open_user(&raw_bus));
+        const std::unique_ptr<sd_bus, decltype(&sd_bus_unref)> bus(raw_bus, sd_bus_unref);
+        sd_bus_message* raw = nullptr;
+        check(sd_bus_message_new_signal(bus.get(), &raw, "/test", "org.hyprworks.Test", "Properties"));
+        Message message(raw, sd_bus_message_unref);
+        check(sd_bus_message_append(raw, "a{sv}", 3,
+            "extension", "a{sv}", 1, "nested", "as", 2, "one", "two",
+            "known", "u", 42u, "tail", "(ii)", 1, 2));
+        check(sd_bus_message_seal(raw, 1, 0));
+        check(sd_bus_message_rewind(raw, true));
+        std::uint32_t value = 0;
+        read_properties(raw, [&](std::string_view name) {
+            if (name == "known") require(sd_bus_message_read(raw, "u", &value));
+        });
+        assert(value == 42 && sd_bus_message_at_end(raw, true) > 0);
+        check(sd_bus_message_rewind(raw, true));
+        bool rejected = false;
+        try {
+            read_properties(raw, [&](std::string_view name) {
+                if (name == "known") (void)boolean(raw);
+            });
+        } catch (const std::exception&) { rejected = true; }
+        assert(rejected);
+    }
     std::array<Peer, 3> peers;
     auto& server = peers[0];
     auto& client = peers[1];
@@ -71,6 +98,7 @@ int main() {
     assert(take(rival, EventKind::name_failed).error_name == "org.freedesktop.DBus.Error.NameExists");
     assert(rival.bus.owned_names().empty());
 
+    assert(!server.bus.export_interface(path, interface, {{"Hold", "(", ""}}, {}, {}, 2s));
     assert(server.bus.export_interface(path, interface,
         {{"Hold", "", ""}, {"Fd", "h", "h"}}, {},
         {{"State", {"s", std::string("idle")}, false},
@@ -173,7 +201,6 @@ int main() {
     assert(take(server, EventKind::expired, gone.id).error_name == "org.freedesktop.DBus.Error.Disconnected");
     assert(!server.bus.reply(gone.id, {}));
     assert(has(server, EventKind::peer_gone));
-    // Received descriptors remain owned after message and connection teardown.
     assert(pread(returned_fd, contents, sizeof(contents), 0) == 6);
     fd_reply.arguments.clear();
     assert(fcntl(returned_fd, F_GETFD) == -1 && errno == EBADF);

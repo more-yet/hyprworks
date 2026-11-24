@@ -11,7 +11,6 @@
 #include <vector>
 
 namespace {
-// Process-lifetime storage keeps signal delivery valid across invocation teardown.
 hyprworks::lua::SignalSource signals;
 int signal_write_fd = -1;
 

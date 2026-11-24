@@ -105,8 +105,6 @@ int media_restart(lua_State* lua) {
     return operation_result(lua, restart_observer(binding));
 }
 
-/// Returned views borrow the two strings left on the Lua stack. Copy the key
-/// before releasing those stack entries.
 std::pair<std::string_view, std::string_view> read_player_key(lua_State* lua) {
     luaL_checktype(lua, 2, LUA_TTABLE);
     field(lua, 2, "name");

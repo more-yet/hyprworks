@@ -13,8 +13,6 @@
 namespace hyprworks::lua {
 
 struct Images;
-/// The decode thread release-publishes ready. Readers acquire it before reading
-/// pixels; the image budget outlives every image charged to it.
 struct Image {
     Images& images;
     std::string path, encoded, icon, theme, error;

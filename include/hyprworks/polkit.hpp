@@ -54,8 +54,6 @@ struct Update {
     std::vector<Event> events;
 };
 
-/// One login-session agent and at most one authentication request, owned and
-/// driven by one thread. Cookies and helper resources remain native.
 class Agent {
 public:
     Agent();

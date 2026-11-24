@@ -61,8 +61,7 @@ struct Update {
     std::optional<ActionResult> result;
 };
 
-/// Drive on one owning thread. Poll the prepared descriptors and dispatch their
-/// readiness before mutating the connection; snapshots retain their publication.
+// Single-threaded; dispatch prepared readiness before mutating the connection.
 class AudioConnection {
 public:
     AudioConnection();

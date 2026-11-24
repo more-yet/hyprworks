@@ -22,7 +22,6 @@ SurfaceFocus surface_focus(const Surface& surface) {
     auto& gui = *surface.gui;
     for (const auto& seat : gui.seats) {
         result.focused |= seat->keyboard_surface == surface.id;
-        // Native keyboard leave ends the ancestry lifetime, including retired popups.
         result.within |= seat->keyboard_surface == surface.id ||
             std::ranges::find(seat->keyboard_tree, surface.id) != seat->keyboard_tree.end();
     }
@@ -72,7 +71,6 @@ Surface& root_surface(Surface& surface) {
     while (root->parent) {
         const auto parent = std::ranges::find_if(surface.gui->surfaces,
             [&](const auto& candidate) { return candidate && candidate->id == root->parent; });
-        // Parents remain allocated until every descendant has been destroyed.
         assert(parent != surface.gui->surfaces.end());
         root = parent->get();
     }
@@ -716,7 +714,6 @@ void replace_elements(Surface& surface, ParsedTree& parsed, int begin, int end, 
     };
     const int next_drag = remap_drag(surface.pressed);
 
-    // Validation and destination allocation precede this ownership transfer.
     if (next_focus < 0) focus(surface, -1);
     else if (!same_editor) {
         for (auto& seat : gui.seats)

@@ -24,7 +24,6 @@ void read_properties(sd_bus_message* message, Snapshot& snapshot, Device* device
             if (key == "OnBattery") snapshot.on_battery = dbus::boolean(message);
             else if (key == "LidIsPresent") snapshot.lid_present = dbus::boolean(message);
             else if (key == "LidIsClosed") snapshot.lid_closed = dbus::boolean(message);
-            else require(sd_bus_message_skip(message, nullptr));
         } else if (key == "Percentage") {
             device->percentage = dbus::finite_number(message);
             if (device->percentage < 0 || device->percentage > 100) throw std::runtime_error("invalid UPower percentage");
@@ -45,7 +44,6 @@ void read_properties(sd_bus_message* message, Snapshot& snapshot, Device* device
         else if (key == "Vendor") device->vendor = dbus::text(message, 's', bytes);
         else if (key == "Model") device->model = dbus::text(message, 's', bytes);
         else if (key == "IconName") device->icon_name = dbus::text(message, 's', bytes);
-        else require(sd_bus_message_skip(message, nullptr));
     });
 }
 

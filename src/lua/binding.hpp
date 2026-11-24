@@ -91,7 +91,6 @@ inline const char* check_string(lua_State* lua, int index, std::size_t* length =
     return lua_tolstring(lua, index, length);
 }
 
-// Native exceptions unwind owning D-Bus parsing locals before guarded raises Lua errors.
 inline std::uint64_t check_uint64(lua_State* lua, int index, std::uint64_t minimum = 0) {
     if (lua_type(lua, index) != LUA_TSTRING) throw std::runtime_error("expected a uint64 decimal string");
     std::size_t size;
@@ -187,8 +186,6 @@ inline void userdata_methods(lua_State* lua, const luaL_Reg* methods) {
 
 inline char interrupted;
 
-/// Translate native failures after C++ locals unwind. Lua calls inside Function
-/// need protected_call whenever their longjmp could bypass an owning local.
 template<int (*Function)(lua_State*)>
 int guarded(lua_State* lua) {
     char message[1024];
@@ -213,8 +210,7 @@ int call_function(lua_State* lua) {
     return (*static_cast<Function*>(lua_touserdata(lua, 1)))(lua);
 }
 
-/// Keep owning locals in the caller and borrow them in Function. A negative
-/// result leaves the Lua error on the stack for guarded to propagate.
+// Lua longjmp skips C++ destructors: keep owning locals in the caller, borrowed by Function.
 template<typename Function>
 int protected_call(lua_State* lua, Function function, int results,
                    int error_handler = 0, int extra_arguments = 0) {
@@ -227,8 +223,6 @@ int protected_call(lua_State* lua, Function function, int results,
     return lua_pcall(lua, 1 + extra_arguments, results, error_handler) == LUA_OK ? results : -1;
 }
 
-/// Binding storage outlives Lua. LUA_REFNIL reserves construction while Lua
-/// allocation can run finalizers that reenter the constructor.
 template<typename Binding>
 int retain_handle(lua_State* lua, Binding& binding, const char* metatable) {
     if (binding.handle >= 0) {

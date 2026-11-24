@@ -1,5 +1,6 @@
 #pragma once
 
+#include "windows.hpp"
 #include <hyprworks/dbus.hpp>
 #include <pipewire/pipewire.h>
 #include <memory>
@@ -13,7 +14,6 @@ namespace hyprworks::lua {
 
 struct Gui;
 struct WaitSet;
-struct Capture;
 struct Image;
 struct Portal;
 
@@ -28,7 +28,7 @@ struct PortalStream {
     Portal& owner;
     std::uint32_t type;
     int x, y, width, height;
-    std::shared_ptr<Capture> capture;
+    Capture capture;
     std::shared_ptr<Image> image;
     pw_stream* stream = nullptr;
     spa_hook listener{};
@@ -37,7 +37,7 @@ struct PortalStream {
     std::size_t reserved = 0;
     std::optional<dbus::Clock::time_point> next_process;
     bool failed = false;
-    PortalStream(Portal& owner, const PortalSource& source);
+    PortalStream(Portal& owner, const PortalSource& source, bool cursor);
     ~PortalStream();
     void publish(std::shared_ptr<Image> image);
 };
@@ -63,7 +63,7 @@ struct Portal {
     int fps = 30;
     bool changed = true, name_requested = false, pipewire_failed = false, attached = false;
     std::vector<PortalSource> sources;
-    std::vector<std::unique_ptr<PortalSession>> sessions;
+    std::vector<PortalSession> sessions;
     pw_loop* loop = nullptr;
     pw_context* context = nullptr;
     pw_core* core = nullptr;

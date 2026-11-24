@@ -14,8 +14,7 @@
 namespace hyprworks::audio {
 namespace {
 
-/// libpulse borrows stable event slots through its C callbacks. Collection
-/// delays slot reuse until the next prepare, preserving in-flight readiness.
+// Delay slot reuse until prepare so libpulse callbacks retain in-flight readiness.
 struct PulseLoop {
     struct Event {
         enum class Kind { unused, io, timer, defer } kind = Kind::unused;
@@ -158,7 +157,7 @@ struct AudioConnection::State {
     std::shared_ptr<const Snapshot> snapshot;
     Snapshot pending;
     enum class Step { subscribe, server, outputs, inputs } step = Step::subscribe;
-    bool query_done = false, subscribed = false;
+    bool query_done = false;
     std::size_t bytes = 0;
     std::uint64_t generation = 0, last_request = 0;
     std::optional<ActionResult> result;
@@ -176,7 +175,7 @@ struct AudioConnection::State {
         loop.collect(true);
         loop.quit = false;
         deadline.reset(); refresh_at.reset(); command_deadline.reset();
-        query_done = subscribed = false;
+        query_done = false; step = Step::subscribe;
         pending = {};
         callback_error = {};
     }
@@ -391,7 +390,7 @@ WaitSet AudioConnection::prepare_wait() {
     if (state.context) {
         wait.deadline = state.deadline;
         state.loop.prepare(wait);
-        for (const auto& time : {state.command_deadline, state.subscribed && !state.query ? state.refresh_at : std::nullopt})
+        for (const auto& time : {state.command_deadline, state.step != State::Step::subscribe && !state.query ? state.refresh_at : std::nullopt})
             if (time && (!wait.deadline || *time < *wait.deadline)) wait.deadline = time;
     }
     return wait;
@@ -425,7 +424,7 @@ Update AudioConnection::dispatch(const WaitSet& ready) {
             state.query_done = false;
             switch (state.step) {
                 case State::Step::subscribe:
-                    state.subscribed = true;
+                    state.step = State::Step::server;
                     state.refresh_at = now;
                     break;
                 case State::Step::server: state.step = State::Step::outputs; state.send_query(); break;
@@ -433,7 +432,7 @@ Update AudioConnection::dispatch(const WaitSet& ready) {
                 case State::Step::inputs: state.publish(); break;
             }
         }
-        if (state.refresh_at && state.subscribed && !state.query && now >= *state.refresh_at) {
+        if (state.refresh_at && state.step != State::Step::subscribe && !state.query && now >= *state.refresh_at) {
             state.refresh_at.reset();
             state.pending = {};
             state.bytes = 0;

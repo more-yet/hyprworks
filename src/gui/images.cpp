@@ -51,7 +51,6 @@ void premultiply(Image& image, const unsigned char* source) {
             const auto argb = _mm_or_si128(_mm_or_si128(_mm_and_si128(rgba, alpha), _mm_and_si128(scaled, green)),
                 _mm_or_si128(_mm_and_si128(_mm_slli_epi32(scaled, 16), red),
                     _mm_srli_epi32(_mm_and_si128(scaled, red), 16)));
-            // The full input block is loaded before the store, including in-place PNG conversion.
             _mm_storeu_si128(reinterpret_cast<__m128i*>(target + i), argb);
         }
     }

@@ -5,6 +5,7 @@
 #endif
 
 #include <algorithm>
+#include <cassert>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -329,7 +330,7 @@ void close_gui(Gui& gui) noexcept {
 Gui::~Gui() { close_gui(*this); }
 
 void prepare_gui(Gui& gui, WaitSet& wait) {
-    if (gui.read_prepared) { wl_display_cancel_read(gui.display); gui.read_prepared = false; }
+    assert(!gui.read_prepared);
     wl_display_dispatch_pending(gui.display);
     check_display(gui);
     gui.wait_offset = wait.append({wl_display_get_fd(gui.display), POLLIN, 0});
@@ -369,10 +370,7 @@ void prepare_gui(Gui& gui, WaitSet& wait) {
 }
 
 void read_gui(Gui& gui, const WaitSet& wait) {
-    if (gui.wait_offset >= wait.fds.size()) {
-        if (gui.read_prepared) { wl_display_cancel_read(gui.display); gui.read_prepared = false; }
-        return;
-    }
+    assert(gui.wait_offset < wait.fds.size() && wait.fds[gui.wait_offset].fd == wl_display_get_fd(gui.display));
     const auto events = wait.fds[gui.wait_offset].revents;
     if (gui.read_prepared) {
         if (events & POLLIN) wl_display_read_events(gui.display);

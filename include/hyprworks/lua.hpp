@@ -11,16 +11,14 @@ namespace hyprworks::lua {
 struct InvocationState;
 enum class EventLoop { headless, gui };
 
-/// The caller owns this source and its nonblocking pipe through invocation
-/// destruction. Producers publish pending bits before writing the wake byte.
+// Outlives Invocation; publish pending bits before waking the nonblocking pipe.
 struct SignalSource {
     enum : unsigned { quit = 1, reload = 2 };
     int fd = -1;
     std::atomic<unsigned> pending{0};
 };
 
-/// One configuration execution, driven on its owning thread. Cross-thread
-/// quit/reload producers must finish before the invocation is destroyed.
+// Single-threaded except quit/reload requests; stop producers before destruction.
 class Invocation {
 public:
     explicit Invocation(EventLoop loop = EventLoop::headless, SignalSource* signals = nullptr);

@@ -43,8 +43,6 @@ struct Box {
 };
 
 enum class Kind { row, column, scroll, box, text, image, button, toggle, slider, input };
-/// Array position is valid within one surface revision. Moving a preserved
-/// element transfers its editing, image and callback ownership at commit.
 struct Element {
     std::string id, text, placeholder, font, mask, scroll_target;
     std::string accessible_role, accessible_name, accessible_description;
@@ -84,8 +82,6 @@ struct SurfaceFocus {
     bool operator==(const SurfaceFocus&) const = default;
 };
 
-/// Owns the element tree and interaction state. Lua handles resolve identity
-/// and revision; closed slots are reclaimed after callback delivery.
 struct Surface {
     explicit Surface(Gui& owner);
     ~Surface();
@@ -268,7 +264,7 @@ struct Gui {
     std::uint32_t capture_manager_name = 0, output_capture_manager_name = 0, workspace_capture_manager_name = 0, capture_workspaces_name = 0;
     std::vector<std::unique_ptr<WorkspaceCaptureTarget>> capture_targets;
     std::vector<std::unique_ptr<WorkspaceCaptureGroup>> capture_groups;
-    std::array<std::shared_ptr<Capture>, 8> captures;
+    std::array<Capture*, 8> captures{};
     std::array<std::shared_ptr<CaptureBinding>, 8> capture_bindings;
     std::size_t capture_bytes = 0;
     bool capture_workspaces_ready = false;

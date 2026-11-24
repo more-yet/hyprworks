@@ -102,7 +102,6 @@ int dispatch_polkit(lua_State* lua, PolkitBinding& binding) {
         };
         if (!current()) continue;
         if (binding.on_event < 0) {
-            // Native cancellation failures are delivered through agent status.
             if (event.kind == polkit::EventKind::request) (void)binding.agent.cancel(event.id);
             continue;
         }

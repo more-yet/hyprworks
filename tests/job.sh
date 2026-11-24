@@ -7,6 +7,5 @@ name=org.hyprworks.TestTerminal
 gdbus wait --session --timeout 3 "$name"
 call() { busctl --user --timeout=3 -- call "$name" /terminal "$name" "$@"; }
 
-# Each call's bus connection closes before the next client starts.
 call Answer s first
 test "$(call Finish s second)" = 's "first:second:30 90"'

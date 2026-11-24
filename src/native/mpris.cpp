@@ -35,7 +35,7 @@ void metadata(sd_bus_message* message, Metadata& metadata, std::size_t& bytes) {
             require(sd_bus_message_read(message, "x", &value));
             if (value < 0) throw std::runtime_error("negative MPRIS track length");
             metadata.length = value;
-        } else require(sd_bus_message_skip(message, nullptr));
+        }
     });
 }
 
@@ -48,7 +48,6 @@ void read_properties(sd_bus_message* message, Player& player, bool root, std::si
             else if (key == "CanQuit") player.can_quit = dbus::boolean(message);
             else if (key == "SupportedUriSchemes") player.uri_schemes = dbus::strings(message, bytes);
             else if (key == "SupportedMimeTypes") player.mime_types = dbus::strings(message, bytes);
-            else require(sd_bus_message_skip(message, nullptr));
         } else if (key == "PlaybackStatus") player.playback_status = dbus::text(message, 's', bytes);
         else if (key == "LoopStatus") player.loop_status = dbus::text(message, 's', bytes);
         else if (key == "Shuffle") player.shuffle = dbus::boolean(message);
@@ -68,7 +67,7 @@ void read_properties(sd_bus_message* message, Player& player, bool root, std::si
             require(sd_bus_message_read(message, "x", &position));
             if (position < 0) throw std::runtime_error("negative MPRIS position");
             player.position = position;
-        } else require(sd_bus_message_skip(message, nullptr));
+        }
     });
     if (!root && (player.rate == 0 || player.minimum_rate > player.maximum_rate || (player.volume && *player.volume < 0)))
         throw std::runtime_error("invalid MPRIS rate or volume");

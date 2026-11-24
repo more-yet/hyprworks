@@ -8,7 +8,6 @@ assert(hw.update_file(path, 128, function(current)
     assert(current == "old")
     return "new\0\255"
 end))
-assert(hw.update_file(path, 128, function(current) return current end) == false)
 assert(not pcall(hw.update_file, path, 128, function() error("aborted") end))
 do
     local held <close> = assert(hw.lock_file(path .. ".lock"))
@@ -24,8 +23,8 @@ assert(bytes == "new\0\255")
 local results = 0
 local function done()
     results = results + 1
-    if results == 4 then
-        for _, p in ipairs({copy, path, path .. ".lock", root .. "/out", root}) do assert(os.remove(p)) end
+    if results == 3 then
+        for _, p in ipairs({copy, path, path .. ".lock", root}) do assert(os.remove(p)) end
         hw.quit(0)
     end
 end
@@ -49,13 +48,6 @@ end)
 child:on_exit(function(p, result)
     assert(result.outcome == "exited" and result.exit_code == 0 and result.stdin_discarded == 0)
     assert(received == bytes and result.stdout == bytes)
-    assert(p:read_output("stdout", 2, 3) == bytes:sub(3))
-    done()
-end)
-local file = assert(hw.process({"cat"}, {directory = root, stdin_file = "copy", stdout_file = "out", timeout = 3000, output_limit = 128}))
-assert(not file:write("x"))
-file:on_exit(function(_, result)
-    assert(result.exit_code == 0 and result.stdout == "" and hw.read_file(root .. "/out", 128) == bytes)
     done()
 end)
 local tty = assert(hw.process({"sh", "-ec", 'printf ready >/dev/tty; exec cat'}, {

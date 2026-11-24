@@ -23,7 +23,6 @@ public:
     std::expected<void, std::string> start(std::chrono::milliseconds delay, bool repeat = false);
     void stop() noexcept;
     std::optional<Clock::time_point> deadline() const noexcept;
-    /// Coalesces missed deadlines into an elapsed-interval count.
     std::uint64_t dispatch(Clock::time_point now = Clock::now()) noexcept;
 private:
     std::optional<Clock::time_point> deadline_;
@@ -58,8 +57,6 @@ private:
     std::uint64_t generation = 0;
 };
 
-/// Exclusively owns child reaping and process-group cancellation. The host
-/// supplies readiness; the result remains borrowed until the next start.
 class Process {
 public:
     Process();
@@ -85,7 +82,6 @@ private:
     std::unique_ptr<State> state_;
 };
 
-/// Transfers application lifetime to a detached process; returns after exec.
 std::expected<void, std::string> launch(std::span<const std::string> arguments, const std::string& directory = {});
 std::expected<std::string, std::string> read_file(const std::string& path, std::size_t limit);
 std::expected<void, std::string> write_file(const std::string& path, std::string_view contents, bool replace);
@@ -104,7 +100,6 @@ private:
 };
 std::expected<void, std::string> copy_file(const std::string& source, const std::string& destination, std::size_t limit);
 
-// The uncommitted sibling belongs to this writer until rename or destruction.
 class FileWriter {
 public:
     explicit FileWriter(const std::string& path);
@@ -129,8 +124,6 @@ public:
     ~FileWatch();
     FileWatch(const FileWatch&) = delete;
     FileWatch& operator=(const FileWatch&) = delete;
-    /// File watches follow the parent directory across atomic replacement.
-    /// An invalidated watch needs its targets registered again on existing directories.
     std::expected<void, std::string> start(const std::string& path, bool directory = false);
     std::expected<void, std::string> add(const std::string& path, bool directory = false);
     void stop() noexcept;

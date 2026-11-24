@@ -410,8 +410,6 @@ void Invocation::prepare_wait() {
     auto& wait = state.wait;
     wait.fds.clear(); wait.deadline.reset();
     wait.fds.push_back({state.wake_fd, POLLIN, 0});
-    if (!running())
-        return;
     if (state.signals) wait.fds.push_back({state.signals->fd, POLLIN, 0});
     const auto append_wait = [&](auto& binding, auto& connection) {
         binding.wait = connection.prepare_wait();
@@ -455,7 +453,7 @@ void Invocation::dispatch() {
         std::uint64_t wake;
         while (::read(state.wake_fd, &wake, sizeof(wake)) < 0 && errno == EINTR) {}
     }
-    if (state.signals && ready.fds.size() > 1 && ready.fds[1].revents) {
+    if (state.signals && ready.fds[1].revents) {
         if (const int error = read_signals(state))
             throw std::system_error(error, std::generic_category(), "read runtime signals");
     }
@@ -474,7 +472,6 @@ void Invocation::dispatch() {
     active_connections(state, [&](auto& binding, auto& connection) {
         const bool due = consume_wait(binding);
 #ifdef HYPRWORKS_HAS_SHORTCUTS
-        // Borrowed Wayland events arrive through read_gui in this turn.
         if constexpr (std::is_same_v<std::decay_t<decltype(binding)>, ShortcutBinding>)
             binding.retain(connection.dispatch(binding.wait));
         else

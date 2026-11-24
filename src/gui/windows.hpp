@@ -48,11 +48,14 @@ struct Capture {
     unsigned constraint_failures = 0;
     bool closed = false, unavailable = false, constraints = false, ready = false;
     explicit Capture(Gui& gui) : gui(&gui) {}
+    Capture(const Capture&) = delete;
+    Capture& operator=(const Capture&) = delete;
     ~Capture();
 };
 struct CaptureBinding {
-    std::shared_ptr<Capture> capture;
+    Capture capture;
     int callback = LUA_NOREF, handle = LUA_NOREF;
+    explicit CaptureBinding(Gui& gui) : capture(gui) {}
 };
 struct WorkspaceCaptureTarget {
     Gui* gui = nullptr;
@@ -73,8 +76,6 @@ struct WindowRecord {
     bool operator==(const WindowRecord&) const = default;
 };
 
-/// Borrows Gui's display. An IPC candidate becomes publishable after a Wayland
-/// sync confirms its invalidation generation; restart replaces target identities.
 struct WindowCatalog {
     Gui* gui = nullptr;
     wl_registry* registry = nullptr;
@@ -94,7 +95,7 @@ struct WindowCatalog {
     Query query = Query::idle;
     int fd = -1, handle = LUA_NOREF, on_change = LUA_NOREF, on_status = LUA_NOREF;
     std::uint64_t generation = 0, revision = 0, invalidation = 0, queried_invalidation = 0;
-    bool closed = false, registered = false, subscribed = false;
+    bool closed = false, registered = false;
     bool change_pending = false, status_pending = false;
     std::optional<std::chrono::steady_clock::time_point> refresh_at, deadline;
     std::size_t wait_offset = 0;
@@ -102,7 +103,7 @@ struct WindowCatalog {
 
 void register_windows(lua_State* lua);
 void start_windows(Gui& gui);
-std::shared_ptr<Capture> capture_source(Gui& gui, const std::string& window, std::uint32_t output, bool cursor, int fps);
+void start_capture(Capture& capture, const std::string& window, std::uint32_t output, bool cursor, int fps);
 std::shared_ptr<struct Image> advance_capture(Capture& capture);
 void close_capture(Capture& capture);
 void close_windows(WindowCatalog& catalog) noexcept;

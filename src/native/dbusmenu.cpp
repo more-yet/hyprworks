@@ -20,7 +20,6 @@ void read_properties(sd_bus_message* message, Snapshot& snapshot, Item* item, st
             else if (key == "Status") snapshot.status = dbus::text(message, 's', bytes);
             else if (key == "Version") require(sd_bus_message_read(message, "u", &snapshot.version));
             else if (key == "IconThemePath") snapshot.icon_theme_paths = dbus::strings(message, bytes);
-            else require(sd_bus_message_skip(message, nullptr));
         } else if (key == "label") item->label = dbus::text(message, 's', bytes);
         else if (key == "type") item->type = dbus::text(message, 's', bytes);
         else if (key == "icon-name") item->icon_name = dbus::text(message, 's', bytes);
@@ -42,7 +41,7 @@ void read_properties(sd_bus_message* message, Snapshot& snapshot, Item* item, st
                 item->shortcuts.push_back(dbus::strings(message, bytes));
             }
             check(sd_bus_message_exit_container(message));
-        } else require(sd_bus_message_skip(message, nullptr));
+        }
     });
 }
 

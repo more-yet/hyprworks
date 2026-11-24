@@ -61,7 +61,7 @@ void read_item(sd_bus_message* message, Item& item, std::size_t& bytes, std::siz
             item.tooltip_title = dbus::text(message, 's', bytes);
             item.tooltip_body = dbus::text(message, 's', bytes);
             check(sd_bus_message_exit_container(message));
-        } else require(sd_bus_message_skip(message, nullptr));
+        }
     });
 }
 }

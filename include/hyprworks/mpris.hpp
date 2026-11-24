@@ -43,7 +43,6 @@ struct Player {
     bool operator==(const Player&) const = default;
 };
 
-/// Extrapolates microseconds from a playing sample, bounded by known track length.
 std::optional<std::int64_t> estimated_position(const Player& player, Clock::time_point now = Clock::now()) noexcept;
 
 struct Snapshot {

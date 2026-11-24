@@ -178,7 +178,7 @@ std::expected<Snapshot, Error> parse_snapshot(std::string_view reply) {
     try {
         constexpr std::string_view delimiter = "\n\n\n";
         const auto split = reply.find(delimiter);
-        if (split == std::string_view::npos || reply.find(delimiter, split + delimiter.size()) != std::string_view::npos)
+        if (split == std::string_view::npos)
             invalid("expected two batch replies separated by three newlines");
         auto workspaces = array(reply.substr(0, split));
         auto outputs = array(reply.substr(split + delimiter.size()));

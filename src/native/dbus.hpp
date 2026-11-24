@@ -42,6 +42,7 @@ inline void read_properties(sd_bus_message* message, auto read_value) {
         require(sd_bus_message_read(message, "s", &name));
         require(sd_bus_message_enter_container(message, 'v', nullptr));
         read_value(std::string_view(name));
+        if (!check(sd_bus_message_at_end(message, false))) require(sd_bus_message_skip(message, nullptr));
         check(sd_bus_message_exit_container(message));
         check(sd_bus_message_exit_container(message));
     }

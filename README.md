@@ -4,10 +4,9 @@ A C++ runtime for building Hyprland desktop shells in Lua.
 
 Lua owns desktop composition, appearance and interaction policy. Hyprworks owns
 native connections, element state, input, rendering and asynchronous work.
-The runtime brings those resources together in one invocation and event loop.
-Shell composition, dialogs, preferences and themes live in your configuration
-directory. [ARCHITECTURE.md](ARCHITECTURE.md) describes native ownership,
-publication, callback admission and cleanup.
+One invocation brings these resources into a shared event loop. Shell entries,
+dialogs, preferences and themes live in your configuration directory.
+[ARCHITECTURE.md](ARCHITECTURE.md) describes ownership and execution.
 
 ## Build and run
 
@@ -33,12 +32,9 @@ Desktop integrations have individual `HYPRWORKS_BUILD_<FEATURE>` options.
 Set `HYPRWORKS_CONFIG_DIR` to the absolute path of your configuration directory.
 `hyprworks` loads `main.lua` from that directory.
 
-The package installs the `60-hyprworks-environment` systemd user-environment
-generator. At user-manager startup or reload, after `environment.d` processing,
-it initializes `HYPRWORKS_CONFIG_DIR` to `$XDG_CONFIG_HOME/hyprworks` when the
-variable is unset and `XDG_CONFIG_HOME` is absolute.
-User services and their child processes inherit the result;
-independently started shells need to supply the variable in their own environment.
+The packaged systemd environment generator defaults `HYPRWORKS_CONFIG_DIR` to
+`$XDG_CONFIG_HOME/hyprworks` when `XDG_CONFIG_HOME` is absolute. User services
+inherit it; independently started shells supply their own environment.
 
 `--entry FILE` selects another filename in that directory, such as
 `polkit-agent.lua`.
@@ -48,11 +44,9 @@ HYPRWORKS_CONFIG_DIR=/path/to/shell hyprworks
 HYPRWORKS_CONFIG_DIR=/path/to/shell hyprworks --entry polkit-agent.lua
 ```
 
-Modules resolve relative to the selected entry file. Changes to the entry file or local
-Lua modules loaded through standard `require`, `hw.reload()` and SIGHUP request
-a fresh invocation. Reload closes the current invocation and loads the
-configuration from disk. Configuration errors release resources, print a
-diagnostic and exit.
+Modules resolve relative to the entry file. Edits to the entry or locally required
+modules, `hw.reload()` and SIGHUP start a fresh invocation. Configuration errors
+release resources, print a diagnostic and exit.
 
 ## Compose a shell
 
@@ -83,19 +77,16 @@ validated replacements; `{preserve_state = true}` retains matching explicit-ID
 and kind focus, selection and scrolling. Explicit property values take
 precedence. Reacquire element handles after structural changes.
 
-Buttons activate on release of Space or Enter; toggles change on release of
-Space. The originating seat, physical key and focused element own the press.
-Focus changes, tree replacement, disabling and consumed key events cancel it.
-`on_input` key events expose `repeated` for author-defined keyboard behavior.
-Nested scroll containers consume movement on their axis and pass the remainder
-to their ancestors. Their `on_change` callbacks report the final clamped offsets.
+Buttons activate on Space or Enter release; toggles change on Space release.
+Focus and tree changes cancel pending presses. `on_input` exposes key repetition.
+Nested scroll containers pass remaining movement to their ancestors and report
+clamped offsets through `on_change`.
 
 ### Authored appearance and range controls
 
 Descriptions supply `kind`; text and inputs supply a Pango `font` with family
-and size. Colors, backgrounds, padding, borders, corner radii, focus outlines,
-selection and caret painting are optional authored properties. Element dimensions
-default to content and parent layout.
+and size. Appearance is authored through colors, spacing, borders, focus, selection
+and caret properties. Element dimensions default to content and parent layout.
 Windows and popups require integer `width` and `height`; layers additionally
 require `edge`, `layer` and `keyboard`. A layer dimension of zero asks the
 compositor to allocate that axis. Titles and application IDs are optional strings.
@@ -104,12 +95,10 @@ Inputs expose `selection_color`, `caret_color`, `caret_width` and
 `placeholder_color`; focus outlines use `focus_color` and `focus_width`.
 Password inputs require a one-character UTF-8 `mask`. Text clips at its bounds;
 `wrap = true` enables wrapping, and `ellipsize = true` enables end ellipsis for
-unwrapped text. Image source tables select `path`, then `icon`, then `data`;
-each source reads its own options. Icon sources require `theme` and integer `pixels`: the icon's
-intrinsic logical size. The runtime selects a raster size for the output scale.
-SVG sources use intrinsic dimensions or an explicit `pixels` raster width.
-For SVGs with percentage dimensions, `pixels` is required; a `viewBox` supplies
-the aspect ratio, otherwise the authored size defines a square viewport.
+unwrapped text. Image sources select `path`, `icon` or `data` in that order.
+Icons require `theme` and logical `pixels`; the runtime handles output scaling.
+SVGs use intrinsic dimensions or explicit `pixels`, with `viewBox` aspect ratio.
+Percentage-sized SVGs require `pixels`.
 
 Sliders and scroll containers require a boolean `horizontal`. A slider owns
 normalized range state and positions its direct child marked `thumb = true`.
@@ -132,32 +121,17 @@ assert(surface:set_content {
 })
 ```
 
-The target must be in a separate tree branch. Relationships are validated and
-resolved at tree commit. With an omitted thumb length, a scrollbar derives its
-length from the viewport/content ratio. An explicit length overrides that
-calculation. Standalone sliders use authored thumb dimensions.
-Scroll offsets remain owned by the scroll container; its `on_change` reports
-coalesced changes. `element:state()` exposes `scroll_limit`, `pressed` and
-`focused` as well as text, value, offset and geometry.
+The target belongs to a separate tree branch. Scrollbar thumb length defaults to
+the viewport/content ratio; explicit dimensions override it. Scroll containers own
+offsets and coalesce `on_change`. `element:state()` exposes range, press, focus,
+text and geometry. Preserved sliders retain drag state while their relationships
+remain compatible.
 
-Drag capture belongs to the originating seat. A preserved slider keeps its grab
-position while its target, axis and thumb remain compatible across tree edits.
-
-Elements accept accessibility metadata:
-
-```lua
-{kind = "button", text = "×", font = "Sans 12", color = "#ffffff",
- accessibility = {role = "auto", name = "Close panel", description = "Close the active panel"}}
-```
-
-`accessibility` supports `name`, `description`, `hidden` and `role`. Roles are
+Elements accept `accessibility = {name, description, hidden, role}`. Roles are
 `auto`, `group`, `label`, `image`, `button`, `checkbox`, `slider`, `textbox`,
 `heading`, `link`, `list`, `list_item`, `menu` and `menu_item`. `auto` derives the
-role from the element kind. Names and descriptions come from the authored metadata.
-`element:accessibility()` returns effective metadata, ancestor-inherited
-hidden state, enabled/focus state, and a toggle's checked or slider's value state.
-Metadata updates use the same validated transactions and content budgets as
-visual properties.
+role from the element kind. `element:accessibility()` returns effective metadata,
+inherited visibility and control state.
 
 ## Native state and operations
 
@@ -167,22 +141,17 @@ lifecycle and `on_result` for action completion. Each setter replaces one
 callback, and `nil` removes it. Status/change subscriptions also schedule an
 initial delivery.
 
-With an `on_result` subscription, action results stay with their connection
-binding until callback admission or `close()`. Closing can take an outstanding
-result once, including from a finalizer that runs while callback arguments are
-being built. Callback delivery checks the live handle, generation and registered
-function after argument allocation.
+Action results stay with their binding until callback admission or `close()`,
+which consumes an outstanding result once.
 
 Use native events to update state and timers for debounce, retry and display
 deadlines. Lua callbacks run serially on the invocation thread. Operational
 failures return `nil, error`; malformed arguments raise Lua errors.
 
-Lua arguments retain their declared types: strings, booleans, integers and
-numbers are checked at ingress, including optional values when present. Integer
-fields require Lua integers. Optional `nil` means absence; in property updates, omitted fields
-retain their current state. An input callback returns a boolean or `nil`.
-Option and element tables use their stored fields. Element updates apply the
-properties used by that kind; structural properties belong to tree descriptions.
+Lua readers check declared types at ingress and use stored table fields. Omitted
+properties retain their current values. Element kinds consume their own properties
+and ignore extra fields; structural properties belong to tree descriptions.
+Input callbacks return a boolean or `nil`.
 
 `hw.notifications {name = ..., vendor = ..., version = ...}` supplies the
 server identity. Optional `capabilities` are strings; optional `default_timeout`
@@ -203,11 +172,10 @@ Register `bus:on_event(function(bus, event) ... end)` before requesting a name.
 - `bus:owned_names()` returns ownership acknowledged through these name operations.
   `bus:release_name(name)` completes asynchronously
   with `name_lost`; an operation already pending on that name must complete first.
-  Closing the connection releases every name.
+  Connection closure releases its names.
 - `bus:export {path, interface, timeout, methods, signals, properties}` declares
-  one interface. `timeout` is required (1–300000 ms); the three member lists are
-  optional, with at least one member required. Introspection is generated from
-  these declarations:
+  one interface and generates introspection. Supply `timeout` (1–300000 ms) and
+  at least one member:
 
   ```lua
   assert(bus:export {
@@ -218,35 +186,26 @@ Register `bus:on_event(function(bus, event) ... end)` before requesting a name.
   })
   ```
 
-- Incoming `method` events contain a unique request `id`, the caller's unique
-  bus name in `sender`, the address and decoded `arguments`. The protocol owner
-  is responsible for authorization. `bus:reply(id, signature, arguments)` or
-  `bus:error(id, error_name, message)` consumes a request on success; invalid
-  replies leave it available until its deadline.
+- Incoming `method` events contain request `id`, `sender`, address and decoded
+  `arguments`. The protocol owner authorizes callers. `bus:reply(id, signature,
+  arguments)` or `bus:error(id, error_name, message)` consumes a request on success.
 - `bus:emit {path, interface, member, signature, arguments, destination}` sends
   a declared signal. Omit `destination` for broadcast. Arguments must match the
   declared signature.
-- Properties implement standard `Get`/`GetAll` and are read-only to remote
-  callers. `bus:set_property(path, interface, name, signature, value)` updates a
-  nonconstant property and publishes `PropertiesChanged`. Type and retained
-  storage limits are checked before replacement.
-- `bus:unexport(path, interface)` removes just that interface and retires its
-  pending requests with `UnknownObject`. Other interfaces and requests continue.
-  Request IDs remain unique across re-export and connection restart.
+- Remote callers read properties through `Get`/`GetAll`.
+  `bus:set_property(path, interface, name, signature, value)` updates a mutable
+  property and publishes `PropertiesChanged`.
+- `bus:unexport(path, interface)` retires that interface's pending requests with
+  `UnknownObject`. Request IDs remain unique across connection restarts.
 - `expired` events include the request ID and reason for timeout, removal or
-  caller disappearance. Further replies are rejected. `peer_gone` events carry
-  a departed unique name in `sender`, including peers with no pending request,
-  so native owners can retire longer-lived sessions. `bus:cancel(id)` cancels local
-  reply tracking; an exported protocol method supplies remote cancellation.
+  caller disappearance. `peer_gone` identifies departed unique names for session
+  cleanup. `bus:cancel(id)` cancels local reply tracking; each exported protocol
+  defines remote cancellation.
 
-Signature `h` uses owned descriptor userdata. `hw.dbus_fd(integer_fd)` duplicates
-an existing descriptor with close-on-exec; received descriptors are also duplicated
-out of their messages. `fd:fileno()` borrows the descriptor number; ownership
-stays with the userdata. `fd:close()` releases that ownership. Garbage
-collection and Lua `<close>` also release ownership. Queued messages and retained
-properties own descriptor duplicates. Delivered descriptors remain valid
-after the sender closes its userdata or connection. In C++, `FileDescriptor`
-copies share ownership; `duplicate()` creates an independent close-on-exec FD.
+Signature `h` uses owned descriptor userdata. `hw.dbus_fd(integer_fd)` and received
+FDs hold close-on-exec duplicates. `fd:fileno()` borrows the number;
+`fd:close()`, garbage collection and Lua `<close>` release ownership. Messages and
+properties retain their own duplicates. C++ `FileDescriptor` copies share ownership.
 
 Each connection bounds outgoing calls/subscriptions to 64 each, incoming requests
 to 32, tracked names to 32, and exported interfaces to 128 (32 members of each
@@ -258,10 +217,6 @@ outgoing operations reject admission at 64 queued transport messages. Async
 decoding/queue failures and uncertain name-operation timeouts fail the connection
 and release its resources; observe `on_status` to discard associated state.
 
-The [native lifecycle checks](tests/dbus_core.cpp) and
-[Lua service fixture](tests/dbus_service.lua) run on private buses and cover
-ownership, cancellation, request expiry and FD lifetimes.
-
 ### ScreenCast portal
 
 `HYPRWORKS_BUILD_PORTAL` enables ScreenCast and requires GUI, Lua, D-Bus and
@@ -272,12 +227,13 @@ local hw = require("hyprworks")
 assert(hw.portal {max_fps = 30})
 ```
 
-Provide the selector in `portal-ui.lua` alongside it in `HYPRWORKS_CONFIG_DIR`,
-then enable the packaged backend service:
+Load the selector as part of the shell's `main.lua`. The shell owns
+`org.hyprworks.PortalUI` and attaches to the backend when it becomes available.
+Enable the shell and backend for the graphical session:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now hyprworks-portal.service
+systemctl --user enable --now hyprworks.service hyprworks-portal.service
 ```
 
 Select the backend in the desktop's `xdg-desktop-portal` configuration:
@@ -287,8 +243,8 @@ Select the backend in the desktop's `xdg-desktop-portal` configuration:
 org.freedesktop.impl.portal.ScreenCast=hyprworks;
 ```
 
-Restart `xdg-desktop-portal.service` to apply routing changes. D-Bus starts the
-selector on demand.
+Restart `xdg-desktop-portal.service` to apply routing changes. The running shell
+presents the chooser and sharing controls.
 
 The backend owns `org.freedesktop.impl.portal.desktop.hyprworks` and implements
 `org.freedesktop.impl.portal.ScreenCast` version 3:
@@ -298,8 +254,8 @@ returns a permission-scoped PipeWire remote to applications. The backend
 accepts protocol methods from that frontend's current unique bus owner.
 Sessions use explicit selection for each start.
 
-The authored selector owns `org.hyprworks.PortalUI`. Its control interface is
-`org.hyprworks.Portal` at `/org/freedesktop/portal/desktop`:
+The shell's selector uses the backend's `org.hyprworks.Portal` control interface
+at `/org/freedesktop/portal/desktop`:
 
 | Method | Input → output |
 |---|---|
@@ -313,8 +269,11 @@ Session dictionaries contain `id` (`t`), `app_id`, `parent_window`, `phase`,
 `types` and `multiple`. Source dictionaries contain `id`, `title` and `type`.
 `Changed` schedules a fresh snapshot; `Failed(ts)` identifies a session and its
 failure message. Signals target the attached selector. Only the current owner
-of the UI name can attach or submit decisions. Session IDs survive selector
+of the UI name can attach or submit decisions. Session IDs survive shell
 reconnection; source revisions reject obsolete selections.
+
+The backend and streams persist across shell reloads. The shell reattaches and
+rebuilds its UI from the snapshot; pending choices retain their request deadline.
 
 `Request.Close`, `Session.Close`, frontend disappearance, source removal and
 invocation shutdown close sessions. Pending interactions expire after three
@@ -339,13 +298,14 @@ the child's inherited environment, including `PATH`.
 local p = assert(hw.process({"cat"}, {timeout = 5000, output_limit = 65536}))
 p:on_output(function(_, stream, bytes) print(stream, #bytes) end)
 assert(p:write("one\0two") == 7)
-assert(p:close_input()) -- send pipe EOF after queued bytes have been written
+assert(p:close_input())
 ```
 
 - `write(bytes)` returns the number **queued**, possibly zero. Retry the
   unaccepted suffix in `on_drain(function(p, discarded) ... end)`. `input_limit`
   defaults to 64 KiB and can be set to 1 byte–1 MiB. `discarded` is zero on a
   successful drain, or the unsent byte count if the child closed its input.
+  `close_input()` sends pipe EOF after queued bytes drain.
 - `on_output(p, "stdout"|"stderr", bytes)` delivers binary chunks as they arrive,
   before `on_exit`. `read_output(stream, offset, limit)` returns a slice of the
   retained stream (zero-based offset, up to 64 KiB).
@@ -378,11 +338,13 @@ for a write; the compositor decides whether to grant the selection.
 
 ```lua
 assert(hw.clipboard_write(seat, {{mime = "image/png", image = capture_event.source}}))
--- Other representations: {mime = "...", file = path} or {mime = "...", data = bytes}.
 local types = assert(hw.clipboard_types(seat))
 assert(hw.clipboard_read(seat, types[1], {file = destination, limit = 32 * 1024 * 1024},
     function(count, err) assert(count, err) end))
 ```
+
+Representations also accept `{mime = "...", file = path}` or
+`{mime = "...", data = bytes}`.
 
 One write publishes up to 16 MIME representations. Captured frames encode as
 PNG; inline data is binary (16 MiB total). File offers pin an open regular
@@ -416,7 +378,7 @@ the authority and owns the helper and retries; Lua supplies the prompt and the
 user's choice of identity. Build with `HYPRWORKS_BUILD_POLKIT=ON`.
 
 ```lua
-local agent = assert(hw.polkit()) -- optional {session = "1", locale = "en_US.UTF-8"}
+local agent = assert(hw.polkit())
 agent:on_status(function(handle)
     local status = handle:status()
     if status.phase == "failed" then show_agent_error(status.error) end
@@ -438,7 +400,8 @@ agent:on_event(function(handle, event)
 end)
 ```
 
-Request and prompt IDs are opaque decimal strings. Choose one of the offered
+`hw.polkit` accepts optional `session` and `locale`. Request and prompt IDs are
+opaque decimal strings. Choose one of the offered
 `{uid, name}` identities. Each response belongs to one prompt and accepts up
 to 4095 bytes of single-line text (NUL, CR and LF are invalid). Mask input
 when `echo` is false and clear the editor after submission or dismissal.
@@ -471,7 +434,6 @@ end))
 The compositor renders active and inactive workspaces. Required `mode = "windows_only"`
 includes windows and decorations over transparency; `"everything"`
 also includes the output's wallpaper, panels, pinned windows and layer surfaces.
-This includes preview UI on that output unless the compositor excludes it.
 Matching requires a unique workspace name on the selected output. The capture
 keeps the native workspace identity across renames and moves.
 
@@ -482,7 +444,7 @@ delivery and releases the session; already delivered image sources remain valid.
 Workspace removal ends capture with `"unavailable"`. Workspace captures remain
 active across window-catalog restarts and closure.
 
-Window and workspace captures share eight active slots and 128 MiB of capture
+Each invocation allows eight active window, workspace or portal captures and 128 MiB of capture
 buffers per invocation, with a 64 MiB per-buffer limit. Required integer
 `max_width` and `max_height` are bounded to 1–1024; required `max_fps` accepts 1–30.
 Frames preserve aspect ratio and are downscaled after capture: these dimensions
@@ -490,8 +452,8 @@ bound delivered images, while compositor buffers retain their native size.
 Retained frame sources share the image subsystem's separate 128 MiB budget.
 Release captures when their previews leave the viewport.
 
-This requires `ext-workspace-v1`, `hyprland-workspace-image-capture-source-v1`
-and `ext-image-copy-capture-v1`, as provided by Hyprland 0.57.2.
+Workspace capture uses `ext-workspace-v1`,
+`hyprland-workspace-image-capture-source-v1` and `ext-image-copy-capture-v1`.
 
 ## Develop and verify
 
@@ -542,9 +504,9 @@ install with `DESTDIR`. GUI builds install user services for enabled features:
 | `hyprworks.service` | `main.lua` | Enable for the graphical session |
 | `hyprworks-polkit.service` | `polkit-agent.lua` | Enable for the graphical session |
 | `hyprworks-portal.service` | `portal-service.lua` | Enable for the graphical session |
-| `hyprworks-portal-ui.service` | `portal-ui.lua` | D-Bus activation |
 
 Units use the installed binary and read `HYPRWORKS_CONFIG_DIR` from the user
-manager's environment. Shell, Polkit and selector units support reload.
-The portal owner runs persistently. Portal builds also install the
-`hyprworks.portal` descriptor and backend/selector D-Bus activation files.
+manager's environment. All three belong to `graphical-session.target`.
+Shell and Polkit units support reload; the portal owner runs persistently.
+Portal builds also install the `hyprworks.portal` descriptor and the backend
+D-Bus activation file.
