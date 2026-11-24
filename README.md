@@ -5,12 +5,16 @@ A C++ runtime for building Hyprland desktop shells in Lua.
 Lua owns desktop composition, appearance and interaction policy. Hyprworks owns
 native connections, element state, input, rendering and asynchronous work.
 The runtime brings those resources together in one invocation and event loop.
+Shell composition, dialogs, preferences and themes live in your configuration
+directory. [ARCHITECTURE.md](ARCHITECTURE.md) describes native ownership,
+publication, callback admission and cleanup.
 
 ## Build and run
 
 Use a C++23 compiler, CMake, Ninja and pkg-config. The build resolves system
 libraries for Wayland, Cairo/Pango, image decoding, Lua, json-c, sd-bus, GIO,
-libpulse and libpolkit-agent. Dependency versions and feature options live in [CMakeLists.txt](CMakeLists.txt).
+libpulse, libpolkit-agent and PipeWire. Dependency versions and feature options
+live in [CMakeLists.txt](CMakeLists.txt).
 
 ```sh
 cmake -S . -B build/local -G Ninja \
@@ -155,11 +159,19 @@ hidden state, enabled/focus state, and a toggle's checked or slider's value stat
 Metadata updates use the same validated transactions and content budgets as
 visual properties.
 
+## Native state and operations
+
 Observers such as `hw.audio()`, `hw.upower()` and `hw.hyprland.workspaces()`
 publish snapshots. Read them in `on_change`; use `on_status` for connection
 lifecycle and `on_result` for action completion. Each setter replaces one
 callback, and `nil` removes it. Status/change subscriptions also schedule an
 initial delivery.
+
+With an `on_result` subscription, action results stay with their connection
+binding until callback admission or `close()`. Closing can take an outstanding
+result once, including from a finalizer that runs while callback arguments are
+being built. Callback delivery checks the live handle, generation and registered
+function after argument allocation.
 
 Use native events to update state and timers for debounce, retry and display
 deadlines. Lua callbacks run serially on the invocation thread. Operational
@@ -179,10 +191,129 @@ Omit it or set it to zero to keep delegated notifications until dismissal.
 Positive sender timeouts take precedence.
 `notifications:close(id, reason)` requires the protocol close reason.
 
-Applications expose external commands as methods on their own D-Bus interface.
-Use `bus:export` to declare the signatures and `bus:reply` or `bus:error` to
-answer a request by ID. The [D-Bus fixture](tests/dbus.lua) exercises replies
-and expiry; the other [live fixtures](tests/) cover surface lifecycle and window capture.
+### D-Bus services
+
+`hw.dbus {bus = "session"}` (or `"system"`) opens an asynchronous connection.
+The C++ API is in [`include/hyprworks/dbus.hpp`](include/hyprworks/dbus.hpp).
+Register `bus:on_event(function(bus, event) ... end)` before requesting a name.
+
+- `bus:request_name(name)` starts acquisition of an available name.
+  `name_acquired`, `name_failed` and `name_lost` events identify the name
+  in `event.member`; failures include `error_name` and `error`.
+- `bus:owned_names()` returns ownership acknowledged through these name operations.
+  `bus:release_name(name)` completes asynchronously
+  with `name_lost`; an operation already pending on that name must complete first.
+  Closing the connection releases every name.
+- `bus:export {path, interface, timeout, methods, signals, properties}` declares
+  one interface. `timeout` is required (1–300000 ms); the three member lists are
+  optional, with at least one member required. Introspection is generated from
+  these declarations:
+
+  ```lua
+  assert(bus:export {
+      path = "/org/example/Service", interface = "org.example.Service", timeout = 30000,
+      methods = {{name = "Stop", input = "o", output = ""}},
+      signals = {{name = "Stopped", signature = "o"}},
+      properties = {{name = "Version", signature = "u", value = 1, constant = true}},
+  })
+  ```
+
+- Incoming `method` events contain a unique request `id`, the caller's unique
+  bus name in `sender`, the address and decoded `arguments`. The protocol owner
+  is responsible for authorization. `bus:reply(id, signature, arguments)` or
+  `bus:error(id, error_name, message)` consumes a request on success; invalid
+  replies leave it available until its deadline.
+- `bus:emit {path, interface, member, signature, arguments, destination}` sends
+  a declared signal. Omit `destination` for broadcast. Arguments must match the
+  declared signature.
+- Properties implement standard `Get`/`GetAll` and are read-only to remote
+  callers. `bus:set_property(path, interface, name, signature, value)` updates a
+  nonconstant property and publishes `PropertiesChanged`. Type and retained
+  storage limits are checked before replacement.
+- `bus:unexport(path, interface)` removes just that interface and retires its
+  pending requests with `UnknownObject`. Other interfaces and requests continue.
+  Request IDs remain unique across re-export and connection restart.
+- `expired` events include the request ID and reason for timeout, removal or
+  caller disappearance. Further replies are rejected. `peer_gone` events carry
+  a departed unique name in `sender`, including peers with no pending request,
+  so native owners can retire longer-lived sessions. `bus:cancel(id)` cancels local
+  reply tracking; an exported protocol method supplies remote cancellation.
+
+Signature `h` uses owned descriptor userdata. `hw.dbus_fd(integer_fd)` duplicates
+an existing descriptor with close-on-exec; received descriptors are also duplicated
+out of their messages. `fd:fileno()` borrows the descriptor number; ownership
+stays with the userdata. `fd:close()` releases that ownership. Garbage
+collection and Lua `<close>` also release ownership. Queued messages and retained
+properties own descriptor duplicates. Delivered descriptors remain valid
+after the sender closes its userdata or connection. In C++, `FileDescriptor`
+copies share ownership; `duplicate()` creates an independent close-on-exec FD.
+
+Each connection bounds outgoing calls/subscriptions to 64 each, incoming requests
+to 32, tracked names to 32, and exported interfaces to 128 (32 members of each
+kind per interface). Bodies allow 8 MiB payload, 65536 values, depth 32 and 64 FDs.
+Retained properties per interface allow 64 KiB payload, 4096 values and 16 FDs;
+nesting also accounts for the standard property response containers. Native
+events per dispatch are limited to 256 entries, 16 MiB and 256 FDs. Explicit
+outgoing operations reject admission at 64 queued transport messages. Async
+decoding/queue failures and uncertain name-operation timeouts fail the connection
+and release its resources; observe `on_status` to discard associated state.
+
+The [native lifecycle checks](tests/dbus_core.cpp) and
+[Lua service fixture](tests/dbus_service.lua) run on private buses and cover
+ownership, cancellation, request expiry and FD lifetimes.
+
+### ScreenCast portal
+
+`HYPRWORKS_BUILD_PORTAL` enables the native ScreenCast backend and requires
+GUI, Lua, D-Bus and PipeWire 1.4 or newer. The build installs
+`hyprworks.portal` in the prefix's `share/xdg-desktop-portal/portals` directory.
+
+A persistent entry starts the owner:
+
+```lua
+local hw = require("hyprworks")
+assert(hw.portal {max_fps = 30})
+```
+
+Run it with `hyprworks --no-watch --entry portal-service.lua`. `hw.portal()`
+starts one Wayland-connected owner per invocation under the service name
+`org.freedesktop.impl.portal.desktop.hyprworks`.
+
+The backend implements `org.freedesktop.impl.portal.ScreenCast` version 3:
+monitor and window selection, single or multiple sources, and hidden or
+embedded cursors. `xdg-desktop-portal` owns the application-facing API and
+returns a permission-scoped PipeWire remote to applications. The backend
+accepts protocol methods from that frontend's current unique bus owner.
+Sessions use explicit selection for each start.
+
+The authored selector owns `org.hyprworks.PortalUI`. Its control interface is
+`org.hyprworks.Portal` at `/org/freedesktop/portal/desktop`:
+
+| Method | Input → output |
+|---|---|
+| `Attach` | `""` → `taa{sv}aa{sv}`: source revision, sessions, sources |
+| `Snapshot` | `""` → the same snapshot, after attaching |
+| `Choose` | `ttas`: session ID, source revision, source IDs |
+| `Cancel` | `t`: pending session ID |
+| `Stop` | `t`: session ID |
+
+Session dictionaries contain `id` (`t`), `app_id`, `parent_window`, `phase`,
+`types` and `multiple`. Source dictionaries contain `id`, `title` and `type`.
+`Changed` schedules a fresh snapshot; `Failed(ts)` identifies a session and its
+failure message. Signals target the attached selector. Only the current owner
+of the UI name can attach or submit decisions. Session IDs survive selector
+reconnection; source revisions reject obsolete selections.
+
+`Request.Close`, `Session.Close`, frontend disappearance, source removal and
+invocation shutdown close sessions. Pending interactions expire after three
+minutes; stream startup has a ten-second deadline.
+
+There are eight sessions and eight capture slots per invocation, with up to
+four sources per selection. Delivered stream dimensions fit within 4096×4096;
+capture buffers use the capture subsystem's 64 MiB per-buffer and 128 MiB total
+limits. Negotiated PipeWire buffers share a 256 MiB budget, with two buffers per
+stream. `max_fps` accepts 1–60. Streams deliver BGRA frames at that rate and
+renegotiate their dimensions when the source resizes.
 
 ### Interactive children
 
@@ -360,11 +491,21 @@ the enabled features. Run these Wayland fixtures in a Hyprland session:
 HYPRWORKS_CONFIG_DIR="$PWD/tests" build/local/hyprworks --entry gui.lua
 HYPRWORKS_CONFIG_DIR="$PWD/tests" build/local/hyprworks --entry windows.lua
 HYPRWORKS_CONFIG_DIR="$PWD/tests" build/local/hyprworks --entry workspace_capture.lua
+HYPRWORKS_CONFIG_DIR="$PWD/tests" dbus-run-session -- sh tests/portal.sh \
+  build/local/hyprworks build/local/hyprworks-pipewire-capture
+dbus-run-session -- sh tests/portal_public.sh \
+  build/local/hyprworks build/local/hyprworks-pipewire-capture
 ```
 
+Portal fixtures use a private D-Bus session and the running Wayland/PipeWire
+servers. The public fixture runs `/usr/lib/xdg-desktop-portal`, exercises its
+application-facing API and consumes the returned permission-scoped remote.
+The backend fixture verifies selector reconnection, cancellation and session
+cleanup with clients supplied in this repository.
+
 With the existing session agent stopped, `tests/polkit.lua` checks real Polkit
-registration, PAM prompt delivery and cancellation using `pkcheck`, without
-submitting a password. Restore the existing agent afterward. `polkit-core`
+registration, PAM prompt delivery and cancellation at the password prompt
+using `pkcheck`. Restore the existing agent afterward. `polkit-core`
 runs on an isolated bus with controlled helper signals to check retries,
 caller ownership and cancellation races.
 

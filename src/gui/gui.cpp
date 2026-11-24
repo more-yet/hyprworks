@@ -1,5 +1,8 @@
 #include "../runtime/invocation.hpp"
 #include "gui.hpp"
+#ifdef HYPRWORKS_HAS_PORTAL
+#include "portal.hpp"
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -280,6 +283,9 @@ void close_gui(Gui& gui) noexcept {
     auto& state = gui.owner;
     if (gui.read_prepared) { wl_display_cancel_read(gui.display); gui.read_prepared = false; }
     gui.images.stop();
+#ifdef HYPRWORKS_HAS_PORTAL
+    gui.portal.reset();
+#endif
     if (gui.windows) {
         close_windows(*gui.windows);
         unref(state.lua, gui.windows->on_change); unref(state.lua, gui.windows->on_status);
@@ -347,6 +353,9 @@ void prepare_gui(Gui& gui, WaitSet& wait) {
     }
     if (gui.windows) prepare_windows(*gui.windows, wait);
     prepare_captures(gui, wait);
+#ifdef HYPRWORKS_HAS_PORTAL
+    if (gui.portal) prepare_portal(*gui.portal, wait);
+#endif
     if (wl_display_prepare_read(gui.display) == 0) gui.read_prepared = true;
     else wait.due(Clock::time_point::min());
     if (wl_display_flush(gui.display) < 0) {
@@ -378,11 +387,17 @@ void read_gui(Gui& gui, const WaitSet& wait) {
     wl_display_dispatch_pending(gui.display);
     check_display(gui);
     if (gui.windows) read_windows(*gui.windows, wait);
+#ifdef HYPRWORKS_HAS_PORTAL
+    if (gui.portal) read_portal(*gui.portal, wait);
+#endif
 }
 
 int dispatch_gui(Gui& gui) {
     auto& state = gui.owner;
     check_display(gui);
+#ifdef HYPRWORKS_HAS_PORTAL
+    if (gui.portal) dispatch_portal(*gui.portal);
+#endif
     for (auto& surface : gui.surfaces)
         if (surface && !surface->closed && !surface->close_pending && surface->dismiss_focus_loss &&
             surface->focus_seen && !surface_focus(*surface).within)
@@ -453,6 +468,9 @@ int dispatch_gui(Gui& gui) {
 }
 
 void open_gui(lua_State* lua) {
+#ifdef HYPRWORKS_HAS_PORTAL
+    register_portal(lua);
+#endif
     register_surfaces(lua);
     register_input(lua);
     const luaL_Reg functions[] = {

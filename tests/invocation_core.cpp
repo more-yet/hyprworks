@@ -84,6 +84,41 @@ int main() {
         workspace.result = native::SwitchResult{17, native::SwitchOutcome::cancelled, false, {}};
         assert(dispatch_workspaces(state.lua, state) == 0);
         assert(workspace.closed && !workspace.result && lua_gettop(state.lua) == 0);
+        for (const bool closing : {true, false}) {
+            auto result_owner = std::make_shared<WorkspaceBinding>();
+            assert(open_active(state.lua, vacant_slot(state.workspaces), result_owner, "hyprworks.workspaces") == 1);
+            lua_setglobal(state.lua, "result_owner");
+            script(R"(
+                collectgarbage("stop")
+                result_deliveries = 0
+                result_owner:on_result(function() error("obsolete result callback") end)
+            )");
+            script(closing ? R"(
+                local garbage = setmetatable({}, {__gc = function()
+                    assert(result_owner:close().id == "23")
+                end})
+            )" : R"(
+                local garbage = setmetatable({}, {__gc = function()
+                    result_owner:on_result(nil)
+                    result_owner:on_result(function(_, id)
+                        assert(id == "23")
+                        result_deliveries = result_deliveries + 1
+                    end)
+                end})
+            )");
+            result_owner->result = native::SwitchResult{23, native::SwitchOutcome::cancelled, false, {}};
+            const auto push = [](lua_State* lua, const native::SwitchResult& result) {
+                lua_gc(lua, LUA_GCCOLLECT);
+                identifier(lua, result.id);
+            };
+            assert(deliver_observer(state.lua, *result_owner, push) == 0);
+            script("assert(result_deliveries == 0)");
+            assert(result_owner->result.has_value() == !closing);
+            assert(deliver_observer(state.lua, *result_owner, push) == 0);
+            assert(!result_owner->result);
+            script(closing ? "assert(result_deliveries == 0)" : "assert(result_deliveries == 1); result_owner:close()");
+            script("collectgarbage('restart')");
+        }
         state.closing = true;
         lua_close(state.lua); state.lua = nullptr;
     }

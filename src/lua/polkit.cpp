@@ -96,22 +96,17 @@ int dispatch_polkit(lua_State* lua, PolkitBinding& binding) {
     if (std::exchange(binding.status_pending, false) &&
         dispatch_callback(lua, binding, binding.on_status, generation, [](lua_State*) { return 0; }) < 0) return -1;
     for (const auto& event : events) {
+        if (binding.closed || binding.generation != generation || invocation(lua).requests.load(std::memory_order_relaxed)) break;
         const auto current = [&] {
-            return !binding.closed && binding.generation == generation &&
-                !invocation(lua).requests.load(std::memory_order_relaxed) &&
-                (event.kind == polkit::EventKind::completed || binding.agent.pending(event.id, event.prompt));
+            return event.kind == polkit::EventKind::completed || binding.agent.pending(event.id, event.prompt);
         };
         if (!current()) continue;
-        const int callback = binding.on_event;
-        if (callback < 0) {
+        if (binding.on_event < 0) {
             // Native cancellation failures are delivered through agent status.
             if (event.kind == polkit::EventKind::request) (void)binding.agent.cancel(event.id);
             continue;
         }
-        lua_pushcfunction(lua, traceback);
-        if (protected_call(lua, [&](lua_State* lua) {
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, callback);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, binding.handle);
+        if (dispatch_callback(lua, binding, binding.on_event, generation, [&](lua_State* lua) {
             lua_createtable(lua, 0, event.request ? 7 : 5);
             static const char* kinds[] = {"request", "prompt", "info", "error", "completed"};
             lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
@@ -144,11 +139,8 @@ int dispatch_polkit(lua_State* lua, PolkitBinding& binding) {
                     lua_pushboolean(lua, event.echo); lua_setfield(lua, -2, "echo");
                 }
             }
-            if (!current() || callback != binding.on_event) return 0;
-            lua_call(lua, 2, 0);
-            return 0;
-        }, 0, 1) < 0) return -1;
-        lua_settop(lua, 0);
+            return 1;
+        }, current) < 0) return -1;
     }
     return 0;
 }

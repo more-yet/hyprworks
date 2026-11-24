@@ -225,7 +225,6 @@ struct MenuBinding {
         if (update.result) result = std::move(update.result);
         activations = std::move(update.activations);
     }
-    dbusmenu::Target target;
     int handle = LUA_NOREF, on_status = LUA_NOREF, on_change = LUA_NOREF, on_result = LUA_NOREF, on_activation = LUA_NOREF;
     bool closed = false, status_pending = false, change_pending = false;
     std::uint64_t generation = 0;
@@ -385,9 +384,9 @@ inline InvocationState& invocation(lua_State* lua) {
     return **static_cast<InvocationState**>(lua_getextraspace(lua));
 }
 
-template<class Binding, class Arguments>
+template<class Binding, class Arguments, class Admit = std::nullptr_t>
 int dispatch_callback(lua_State* lua, Binding& binding, const int& callback,
-    std::uint64_t generation, Arguments arguments) {
+    std::uint64_t generation, Arguments arguments, Admit admit = nullptr) {
     auto& state = invocation(lua);
     if (callback < 0 || binding.closed || binding.generation != generation ||
         state.requests.load(std::memory_order_relaxed)) return 0;
@@ -400,6 +399,8 @@ int dispatch_callback(lua_State* lua, Binding& binding, const int& callback,
         // Argument allocation can run finalizers that replace or close this binding.
         if (binding.closed || binding.generation != generation || state.requests.load(std::memory_order_relaxed) ||
             !callback_matches(lua, callback, reference, count + 1)) return 0;
+        if constexpr (!std::is_same_v<Admit, std::nullptr_t>)
+            if (!admit()) return 0;
         lua_call(lua, count + 1, 0);
         return 0;
     }, 0, 1, 1);
@@ -430,11 +431,14 @@ int deliver_observer(lua_State* lua, Binding& binding, Push push_result = nullpt
     if (status && dispatch_callback(lua, binding, binding.on_status, generation, no_args) < 0) return -1;
     if (change && dispatch_callback(lua, binding, binding.on_change, generation, no_args) < 0) return -1;
     if constexpr (requires { binding.result; }) {
-        // close() may take the result from either of the preceding callbacks.
         if (binding.result && !binding.closed && binding.generation == generation && !invocation(lua).requests.load()) {
-            const auto result = std::exchange(binding.result, {});
+            if (binding.on_result < 0) { binding.result.reset(); return 0; }
+            // Allocation can run close(); retain the result until callback admission.
+            const auto result = binding.result;
             return dispatch_callback(lua, binding, binding.on_result, generation, [&](lua_State* lua) {
                 push_result(lua, *result); return 1;
+            }, [&] {
+                binding.result.reset(); return true;
             });
         }
     }

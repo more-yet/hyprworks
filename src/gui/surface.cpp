@@ -485,11 +485,8 @@ void read_properties(lua_State* lua, int table, ElementPatch& patch, Gui& gui, K
                 std::size_t length; const char* bytes = check_string(lua, -1, &length);
                 image.channels = static_cast<int>(integer_field(lua, -2, "channels", 0, 0, 4));
                 if (image.channels) {
-                    if (image.channels != 3 && image.channels != 4) luaL_error(lua, "raw image channels must be 3 or 4");
                     image.width = static_cast<int>(integer_field(lua, -2, "width", std::nullopt, 1, 4096));
                     image.height = static_cast<int>(integer_field(lua, -2, "height", std::nullopt, 1, 4096));
-                    if (length != static_cast<std::size_t>(image.width * image.height * image.channels))
-                        luaL_error(lua, "raw image dimensions do not match its data");
                 } else image.pixels = static_cast<int>(integer_field(lua, -2, "pixels", 0, 0, 4096));
                 image.set_data({bytes, length});
                 lua_pop(lua, 1);
@@ -1255,17 +1252,19 @@ void initialize_popup(Surface& surface) {
     wl_surface_commit(surface.native);
 }
 
-int notify_surface(Surface& surface, int callback, std::optional<std::uint64_t> grab_generation) {
+int notify_surface(Surface& surface, const int& callback, std::optional<std::uint64_t> grab_generation) {
     auto& state = surface.gui->owner;
     if (callback < 0 || surface.closed || state.requests.load(std::memory_order_relaxed)) return 0;
+    const int reference = callback;
     lua_pushcfunction(state.lua, traceback);
+    lua_rawgeti(state.lua, LUA_REGISTRYINDEX, reference);
     const int result = protected_call(state.lua, [&](lua_State* lua) {
-        lua_rawgeti(lua, LUA_REGISTRYINDEX, callback);
         push_handle(lua, {surface.id, 0, -1}, surface_type);
-        if (surface.closed || state.requests.load(std::memory_order_relaxed)) return 0;
+        if (surface.closed || state.requests.load(std::memory_order_relaxed) ||
+            !callback_matches(lua, callback, reference, 1)) return 0;
         if (grab_generation && *grab_generation != surface.grab_generation) return 0;
         lua_call(lua, 1, 0); return 0;
-    }, 0, 1);
+    }, 0, 1, 1);
     if (result >= 0) lua_settop(state.lua, 0);
     return result;
 }

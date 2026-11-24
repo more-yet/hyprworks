@@ -13,19 +13,30 @@
 namespace hyprworks::dbus {
 
 using Clock = std::chrono::steady_clock;
+class FileDescriptor {
+public:
+    FileDescriptor() = default;
+    static std::expected<FileDescriptor, std::string> duplicate(int fd);
+    int get() const noexcept;
+private:
+    struct Owned;
+    std::shared_ptr<const Owned> fd_;
+};
 struct Value {
     std::string signature;
-    std::variant<bool, std::int64_t, std::uint64_t, double, std::string, std::vector<Value>> data;
+    std::variant<bool, std::int64_t, std::uint64_t, double, std::string, std::vector<Value>, FileDescriptor> data;
 };
 using Body = std::vector<Value>;
 struct Method { std::string name, input, output; };
+struct Signal { std::string name, signature; };
+struct Property { std::string name; Value value; bool constant = false; };
 struct Call {
     std::string destination, path, interface, member;
     Body arguments;
     std::chrono::milliseconds timeout{};
     bool interactive = false;
 };
-enum class EventKind { reply, signal, method, expired };
+enum class EventKind { reply, signal, method, expired, name_acquired, name_lost, name_failed, peer_gone };
 struct Event {
     EventKind kind = EventKind::reply;
     std::uint64_t id = 0;
@@ -59,8 +70,17 @@ public:
     std::expected<void, std::string> cancel(std::uint64_t id);
     std::expected<std::uint64_t, std::string> subscribe(const std::string& match);
     std::expected<void, std::string> unsubscribe(std::uint64_t id);
-    std::expected<void, std::string> export_methods(const std::string& path, const std::string& interface,
-        const std::vector<Method>& methods, std::chrono::milliseconds timeout);
+    std::expected<void, std::string> request_name(const std::string& name);
+    std::expected<void, std::string> release_name(const std::string& name);
+    std::vector<std::string> owned_names() const;
+    std::expected<void, std::string> export_interface(const std::string& path, const std::string& interface,
+        const std::vector<Method>& methods, const std::vector<Signal>& signals,
+        const std::vector<Property>& properties, std::chrono::milliseconds timeout);
+    std::expected<void, std::string> unexport(const std::string& path, const std::string& interface);
+    std::expected<void, std::string> emit(const std::string& path, const std::string& interface,
+        const std::string& member, const Body& arguments, const std::string& destination = {});
+    std::expected<void, std::string> set_property(const std::string& path, const std::string& interface,
+        const std::string& name, const Value& value);
     std::expected<void, std::string> reply(std::uint64_t id, const Body& arguments);
     std::expected<void, std::string> error(std::uint64_t id, const std::string& name, const std::string& message);
     WaitSet prepare_wait();

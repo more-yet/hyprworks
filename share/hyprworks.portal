@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.hyprworks
+Interfaces=org.freedesktop.impl.portal.ScreenCast;
+UseIn=Hyprland;

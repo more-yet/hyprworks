@@ -258,13 +258,18 @@ struct Gui {
     PangoContext* text_context = nullptr;
     std::array<std::unique_ptr<Surface>, 32> surfaces;
     std::unique_ptr<WindowCatalog> windows;
+#ifdef HYPRWORKS_HAS_PORTAL
+    std::unique_ptr<struct Portal> portal;
+#endif
     ext_image_copy_capture_manager_v1* capture_manager = nullptr;
+    ext_output_image_capture_source_manager_v1* output_capture_manager = nullptr;
     hyprland_workspace_image_capture_source_manager_v1* workspace_capture_manager = nullptr;
     ext_workspace_manager_v1* capture_workspaces = nullptr;
-    std::uint32_t capture_manager_name = 0, workspace_capture_manager_name = 0, capture_workspaces_name = 0;
+    std::uint32_t capture_manager_name = 0, output_capture_manager_name = 0, workspace_capture_manager_name = 0, capture_workspaces_name = 0;
     std::vector<std::unique_ptr<WorkspaceCaptureTarget>> capture_targets;
     std::vector<std::unique_ptr<WorkspaceCaptureGroup>> capture_groups;
     std::array<std::shared_ptr<Capture>, 8> captures;
+    std::array<std::shared_ptr<CaptureBinding>, 8> capture_bindings;
     std::size_t capture_bytes = 0;
     bool capture_workspaces_ready = false;
     std::vector<std::unique_ptr<Buffer>> buffers;
@@ -281,7 +286,7 @@ struct Gui {
     Seat* event_seat = nullptr;
     std::uint32_t event_serial = 0;
     std::uint64_t event_surface = 0;
-    ImageWork images;
+    Images images;
     explicit Gui(InvocationState& state);
     ~Gui();
 };
@@ -327,14 +332,14 @@ void retire_surface(std::unique_ptr<Surface>& slot);
 void reposition_popup(Surface& surface);
 void initialize_popup(Surface& surface);
 void update_scale(Surface& surface);
-int notify_surface(Surface& surface, int callback, std::optional<std::uint64_t> grab_generation = {});
+int notify_surface(Surface& surface, const int& callback, std::optional<std::uint64_t> grab_generation = {});
 int notify_element(Surface& surface, int index, const char* kind, std::shared_ptr<Image> loaded = {});
 void register_surfaces(lua_State* lua);
 
 void layout(Surface& surface);
 void reveal_focus(Surface& surface, bool native);
 int layout_index(const Element& element, int index);
-PangoRectangle input_cursor(Element& element, bool focused);
+PangoRectangle input_cursor(const Element& element);
 void render(Surface& surface);
 Box paint_buffer(Surface& surface, Buffer& buffer);
 wl_buffer* create_shm_buffer(wl_shm* shm, int width, int height, std::uint32_t format, void*& mapping);

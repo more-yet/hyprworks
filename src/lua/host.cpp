@@ -484,9 +484,10 @@ int dispatch_utilities(lua_State* lua, InvocationState& state) {
             const auto bytes = binding.process.output(i != 0).substr(binding.delivered[i], 65536);
             if (bytes.empty()) continue;
             const std::string chunk(bytes);
-            binding.delivered[i] += chunk.size();
             if (dispatch_callback(lua, binding, binding.on_output, generation, [&](lua_State* lua) {
                 lua_pushstring(lua, i ? "stderr" : "stdout"); lua_pushlstring(lua, chunk.data(), chunk.size()); return 2;
+            }, [&] {
+                binding.delivered[i] += chunk.size(); return true;
             }) < 0) return -1;
         }
         if (generation != binding.generation) continue;

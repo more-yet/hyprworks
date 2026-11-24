@@ -29,11 +29,11 @@ struct CaptureTarget {
     std::string id;
 };
 struct Capture {
-    Gui* gui = nullptr;
+    Gui* gui;
     WindowCatalog* catalog = nullptr;
+    std::uint32_t output = 0;
     ext_workspace_handle_v1* workspace = nullptr;
     std::string capture_id;
-    int callback = LUA_NOREF, handle = LUA_NOREF;
     ext_image_copy_capture_session_v1* session = nullptr;
     ext_image_copy_capture_frame_v1* frame = nullptr;
     wl_buffer* buffer = nullptr;
@@ -47,6 +47,12 @@ struct Capture {
     const char* error = nullptr;
     unsigned constraint_failures = 0;
     bool closed = false, unavailable = false, constraints = false, ready = false;
+    explicit Capture(Gui& gui) : gui(&gui) {}
+    ~Capture();
+};
+struct CaptureBinding {
+    std::shared_ptr<Capture> capture;
+    int callback = LUA_NOREF, handle = LUA_NOREF;
 };
 struct WorkspaceCaptureTarget {
     Gui* gui = nullptr;
@@ -95,6 +101,10 @@ struct WindowCatalog {
 };
 
 void register_windows(lua_State* lua);
+void start_windows(Gui& gui);
+std::shared_ptr<Capture> capture_source(Gui& gui, const std::string& window, std::uint32_t output, bool cursor, int fps);
+std::shared_ptr<struct Image> advance_capture(Capture& capture);
+void close_capture(Capture& capture);
 void close_windows(WindowCatalog& catalog) noexcept;
 void prepare_windows(WindowCatalog& catalog, WaitSet& wait);
 void read_windows(WindowCatalog& catalog, const WaitSet& wait);

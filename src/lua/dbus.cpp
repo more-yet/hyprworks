@@ -5,7 +5,35 @@ namespace hyprworks::lua {
 namespace {
 
 constexpr char metatable[] = "hyprworks.dbus";
+constexpr char fd_metatable[] = "hyprworks.dbus.fd";
 using Bus = InvocationState::BusBinding;
+
+dbus::FileDescriptor& descriptor(lua_State* lua, int index) {
+    auto* fd = static_cast<dbus::FileDescriptor*>(luaL_testudata(lua, index, fd_metatable));
+    if (!fd) throw std::runtime_error("owned D-Bus file descriptor expected");
+    return *fd;
+}
+
+void push_descriptor(lua_State* lua, const dbus::FileDescriptor& fd) {
+    auto* storage = lua_newuserdatauv(lua, sizeof(dbus::FileDescriptor), 0);
+    new (storage) dbus::FileDescriptor(fd);
+    luaL_setmetatable(lua, fd_metatable);
+}
+
+int fd_close(lua_State* lua) { descriptor(lua, 1) = {}; return 0; }
+int fd_gc(lua_State* lua) {
+    auto& fd = descriptor(lua, 1);
+    lua_pushnil(lua); lua_setmetatable(lua, 1);
+    std::destroy_at(&fd); return 0;
+}
+int fd_number(lua_State* lua) { lua_pushinteger(lua, descriptor(lua, 1).get()); return 1; }
+int fd_duplicate(lua_State* lua) {
+    const auto number = luaL_checkinteger(lua, 1);
+    if (number < 0 || number > INT_MAX) return luaL_error(lua, "invalid file descriptor");
+    const auto result = dbus::FileDescriptor::duplicate(static_cast<int>(number));
+    if (!result) return operation_result(lua, std::expected<void, std::string>(std::unexpected(result.error())));
+    return protected_call(lua, [&](lua_State* lua) { push_descriptor(lua, *result); return 1; }, 1);
+}
 
 Bus& bus_handle(lua_State* lua, bool closed = false) {
     auto* handle = static_cast<std::shared_ptr<Bus>*>(luaL_testudata(lua, 1, metatable));
@@ -35,6 +63,9 @@ void read_value(lua_State* lua, int index, dbus::Value& value, dbus::BodyBudget&
         const char* data = lua_tolstring(lua, index, &size);
         budget.payload(size);
         value.data = std::string(data, size);
+    } else if (type == 'h') {
+        budget.descriptor();
+        value.data = descriptor(lua, index);
     } else if (type == 'b') {
         if (lua_type(lua, index) != LUA_TBOOLEAN) throw std::runtime_error("expected D-Bus boolean");
         value.data = lua_toboolean(lua, index) != 0;
@@ -119,6 +150,7 @@ void push_value(lua_State* lua, const dbus::Value& value) {
         else lua_pushinteger(lua, static_cast<lua_Integer>(*data));
     } else if (const auto* data = std::get_if<double>(&value.data)) lua_pushnumber(lua, *data);
     else if (const auto* data = std::get_if<std::string>(&value.data)) lua_pushlstring(lua, data->data(), data->size());
+    else if (const auto* data = std::get_if<dbus::FileDescriptor>(&value.data)) push_descriptor(lua, *data);
     else {
         const auto& body = std::get<dbus::Body>(value.data);
         const bool variant = value.signature == "v", dictionary = value.signature.starts_with("a{");
@@ -200,14 +232,17 @@ int bus_export(lua_State* lua) {
     luaL_checktype(lua, 2, LUA_TTABLE);
     std::string path, interface;
     std::vector<dbus::Method> methods;
+    std::vector<dbus::Signal> signals;
+    std::vector<dbus::Property> properties;
     std::chrono::milliseconds timeout;
     lua_pushvalue(lua, 2);
     const auto parsed = protected_call(lua, [&](lua_State* lua) {
         text_field(lua, 2, "path", path); text_field(lua, 2, "interface", interface);
         timeout = std::chrono::milliseconds(integer_field(lua, 2, "timeout", std::nullopt, 1, 300000));
-        field(lua, 2, "methods"); luaL_checktype(lua, -1, LUA_TTABLE);
-        const auto count = lua_rawlen(lua, -1);
-        if (count == 0 || count > 32) throw std::runtime_error("D-Bus export needs 1..32 methods");
+        field(lua, 2, "methods");
+        if (!lua_isnil(lua, -1)) luaL_checktype(lua, -1, LUA_TTABLE);
+        const auto count = lua_isnil(lua, -1) ? 0 : lua_rawlen(lua, -1);
+        if (count > 32) throw std::runtime_error("D-Bus export exceeds 32 methods");
         methods.resize(count);
         for (std::size_t i = 0; i < count; ++i) {
             lua_rawgeti(lua, -1, static_cast<lua_Integer>(i + 1)); luaL_checktype(lua, -1, LUA_TTABLE);
@@ -216,10 +251,97 @@ int bus_export(lua_State* lua) {
             text_field(lua, -1, "output", methods[i].output, 255);
             lua_pop(lua, 1);
         }
+        lua_pop(lua, 1);
+        field(lua, 2, "signals");
+        if (!lua_isnil(lua, -1)) luaL_checktype(lua, -1, LUA_TTABLE);
+        const auto signal_count = lua_isnil(lua, -1) ? 0 : lua_rawlen(lua, -1);
+        if (signal_count > 32) throw std::runtime_error("D-Bus export exceeds 32 signals");
+        signals.resize(signal_count);
+        for (std::size_t i = 0; i < signal_count; ++i) {
+            lua_rawgeti(lua, -1, static_cast<lua_Integer>(i + 1)); luaL_checktype(lua, -1, LUA_TTABLE);
+            text_field(lua, -1, "name", signals[i].name, 255);
+            text_field(lua, -1, "signature", signals[i].signature, 255);
+            lua_pop(lua, 1);
+        }
+        lua_pop(lua, 1);
+        field(lua, 2, "properties");
+        if (!lua_isnil(lua, -1)) luaL_checktype(lua, -1, LUA_TTABLE);
+        const auto property_count = lua_isnil(lua, -1) ? 0 : lua_rawlen(lua, -1);
+        if (property_count > 32) throw std::runtime_error("D-Bus export exceeds 32 properties");
+        properties.resize(property_count);
+        dbus::BodyBudget budget;
+        for (std::size_t i = 0; i < property_count; ++i) {
+            lua_rawgeti(lua, -1, static_cast<lua_Integer>(i + 1)); luaL_checktype(lua, -1, LUA_TTABLE);
+            auto& property = properties[i];
+            text_field(lua, -1, "name", property.name, 255);
+            text_field(lua, -1, "signature", property.value.signature, 255);
+            std::string_view rest = property.value.signature;
+            dbus::take_type(rest);
+            if (!rest.empty()) throw std::runtime_error("property needs one complete type");
+            property.constant = boolean_field(lua, -1, "constant", false);
+            field(lua, -1, "value");
+            read_value(lua, -1, property.value, budget, 0);
+            lua_pop(lua, 2);
+        }
         return 0;
     }, 0, 0, 1);
     if (parsed < 0) return -1;
-    return operation_result(lua, bus_handle(lua).connection.export_methods(path, interface, methods, timeout));
+    return operation_result(lua, bus_handle(lua).connection.export_interface(path, interface, methods, signals, properties, timeout));
+}
+
+int bus_request_name(lua_State* lua) {
+    return operation_result(lua, bus_handle(lua).connection.request_name(text(lua, 2, 255)));
+}
+
+int bus_release_name(lua_State* lua) {
+    return operation_result(lua, bus_handle(lua).connection.release_name(text(lua, 2, 255)));
+}
+
+int bus_owned_names(lua_State* lua) {
+    const auto names = bus_handle(lua).connection.owned_names();
+    return protected_call(lua, [&](lua_State* lua) {
+        lua_createtable(lua, static_cast<int>(names.size()), 0);
+        lua_Integer index = 1;
+        for (const auto& name : names) { lua_pushlstring(lua, name.data(), name.size()); lua_rawseti(lua, -2, index++); }
+        return 1;
+    }, 1);
+}
+
+int bus_unexport(lua_State* lua) {
+    return operation_result(lua, bus_handle(lua).connection.unexport(text(lua, 2), text(lua, 3, 255)));
+}
+
+int bus_emit(lua_State* lua) {
+    luaL_checktype(lua, 2, LUA_TTABLE);
+    std::string path, interface, member, destination, signature;
+    dbus::Body body;
+    lua_pushvalue(lua, 2);
+    const auto parsed = protected_call(lua, [&](lua_State* lua) {
+        text_field(lua, 2, "path", path); text_field(lua, 2, "interface", interface);
+        text_field(lua, 2, "member", member); text_field(lua, 2, "destination", destination);
+        text_field(lua, 2, "signature", signature, 255);
+        field(lua, 2, "arguments");
+        if (!signature.empty() || !lua_isnil(lua, -1)) read_body(lua, -1, signature, body);
+        return 0;
+    }, 0, 0, 1);
+    if (parsed < 0) return -1;
+    return operation_result(lua, bus_handle(lua).connection.emit(path, interface, member, body, destination));
+}
+
+int bus_set_property(lua_State* lua) {
+    const auto path = text(lua, 2), interface = text(lua, 3, 255), name = text(lua, 4, 255);
+    dbus::Value value{text(lua, 5, 255), false};
+    std::string_view rest = value.signature;
+    dbus::take_type(rest);
+    if (!rest.empty()) throw std::runtime_error("property needs one complete type");
+    lua_pushvalue(lua, 6);
+    const auto parsed = protected_call(lua, [&](lua_State* lua) {
+        dbus::BodyBudget budget;
+        read_value(lua, 2, value, budget, 0);
+        return 0;
+    }, 0, 0, 1);
+    if (parsed < 0) return -1;
+    return operation_result(lua, bus_handle(lua).connection.set_property(path, interface, name, value));
 }
 
 int bus_reply(lua_State* lua) {
@@ -270,7 +392,7 @@ int bus_close(lua_State* lua) {
 }
 
 void push_bus_event(lua_State* lua, const dbus::Event& event) {
-    static const char* kinds[] = {"reply", "signal", "method", "expired"};
+    static const char* kinds[] = {"reply", "signal", "method", "expired", "name_acquired", "name_lost", "name_failed", "peer_gone"};
     lua_createtable(lua, 0, 9);
     lua_pushstring(lua, kinds[static_cast<unsigned>(event.kind)]); lua_setfield(lua, -2, "kind");
     identifier(lua, event.id); lua_setfield(lua, -2, "id");
@@ -284,11 +406,22 @@ void push_bus_event(lua_State* lua, const dbus::Event& event) {
 }
 
 void register_dbus(lua_State* lua) {
+    luaL_newmetatable(lua, fd_metatable);
+    const luaL_Reg fd_methods[] = {{"close", guarded<fd_close>}, {"fileno", guarded<fd_number>}, {nullptr, nullptr}};
+    userdata_methods(lua, fd_methods);
+    lua_pushcfunction(lua, guarded<fd_gc>); lua_setfield(lua, -2, "__gc");
+    lua_pushcfunction(lua, guarded<fd_close>); lua_setfield(lua, -2, "__close");
+    lua_pushliteral(lua, "hyprworks owned D-Bus file descriptor"); lua_setfield(lua, -2, "__metatable");
+    lua_pop(lua, 1);
+    lua_pushcfunction(lua, guarded<fd_duplicate>); lua_setfield(lua, -2, "dbus_fd");
     luaL_newmetatable(lua, metatable);
     const luaL_Reg methods[] = {
         {"call", guarded<bus_call>}, {"cancel", guarded<bus_cancel>},
         {"subscribe", guarded<bus_subscribe>}, {"unsubscribe", guarded<bus_unsubscribe>},
         {"export", guarded<bus_export>}, {"reply", guarded<bus_reply>}, {"error", guarded<bus_error>},
+        {"request_name", guarded<bus_request_name>}, {"release_name", guarded<bus_release_name>},
+        {"owned_names", guarded<bus_owned_names>}, {"unexport", guarded<bus_unexport>},
+        {"emit", guarded<bus_emit>}, {"set_property", guarded<bus_set_property>},
         {"status", guarded<bus_status>}, {"on_status", guarded<bus_on_status>}, {"on_event", guarded<bus_on_event>},
         {"close", guarded<bus_close>}, {nullptr, nullptr},
     };

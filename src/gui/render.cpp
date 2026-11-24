@@ -219,7 +219,7 @@ void paint(Surface& surface, cairo_t* cr, Box damaged) {
             double offset = 0;
             PangoRectangle cursor{};
             if (element.kind == Kind::input) {
-                cursor = input_cursor(element, static_cast<int>(index) == surface.focused);
+                cursor = input_cursor(element);
                 offset = element.scroll;
                 if ((element.cursor != element.anchor && element.preedit.empty()) ||
                     (!element.preedit.empty() && element.preedit_cursor >= 0 && element.preedit_end >= 0 && element.preedit_cursor != element.preedit_end)) {
@@ -357,19 +357,32 @@ static void measure_tree(Surface& surface) {
 
 void layout(Surface& surface) {
     auto& elements = surface.elements;
-    if (!surface.layout_dirty || elements.empty()) return;
-    if (elements.front().measure_dirty) measure_tree(surface);
-    arrange(surface, 0, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)},
-        {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)});
-    for (const int index : surface.range_elements) {
-        auto& range = elements[static_cast<std::size_t>(index)];
-        if (range.target_index < 0) continue;
-        const auto& target = elements[static_cast<std::size_t>(range.target_index)];
-        range.value = target.scroll_limit > 0 ? target.scroll / target.scroll_limit : 0;
-        range.arrange_dirty = true;
-        arrange(surface, index, range.box, range.clip);
+    if (elements.empty()) return;
+    if (surface.layout_dirty) {
+        if (elements.front().measure_dirty) measure_tree(surface);
+        arrange(surface, 0, {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)},
+            {0, 0, static_cast<double>(surface.width), static_cast<double>(surface.height)});
+        for (const int index : surface.range_elements) {
+            auto& range = elements[static_cast<std::size_t>(index)];
+            if (range.target_index < 0) continue;
+            const auto& target = elements[static_cast<std::size_t>(range.target_index)];
+            range.value = target.scroll_limit > 0 ? target.scroll / target.scroll_limit : 0;
+            range.arrange_dirty = true;
+            arrange(surface, index, range.box, range.clip);
+        }
+        surface.layout_dirty = false;
     }
-    surface.layout_dirty = false;
+    if (surface.focused < 0) return;
+    auto& editor = elements[static_cast<std::size_t>(surface.focused)];
+    if (editor.kind != Kind::input) return;
+    const auto cursor = input_cursor(editor);
+    const double x = std::max(0.0, cursor.x / double(PANGO_SCALE));
+    const double visible = std::max(0.0, editor.box.w - editor.padding * 2 - editor.caret_width);
+    const double scroll = std::clamp(editor.scroll, std::max(0.0, x - visible), x);
+    if (editor.scroll != scroll) {
+        editor.scroll = scroll;
+        damage(surface, editor.clip);
+    }
 }
 
 void reveal_focus(Surface& surface, bool native) {
@@ -418,15 +431,10 @@ int layout_index(const Element& element, int index) {
         static_cast<int>(element.mask.size()) : index;
 }
 
-PangoRectangle input_cursor(Element& element, bool focused) {
+PangoRectangle input_cursor(const Element& element) {
     const int position = element.cursor + (element.preedit_cursor >= 0 ? std::min(element.preedit_cursor, static_cast<int>(element.preedit.size())) : 0);
     PangoRectangle cursor{};
     pango_layout_get_cursor_pos(element.layout, layout_index(element, position), &cursor, nullptr);
-    if (focused) {
-        const double x = std::max(0.0, cursor.x / double(PANGO_SCALE));
-        const double visible = std::max(0.0, element.box.w - element.padding * 2 - element.caret_width);
-        element.scroll = std::clamp(element.scroll, std::max(0.0, x - visible), x);
-    }
     return cursor;
 }
 

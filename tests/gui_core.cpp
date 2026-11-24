@@ -19,21 +19,21 @@ using Clock = std::chrono::steady_clock;
 static void image_worker() {
     const int wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     assert(wake >= 0);
-    ImageWork work;
+    Images images;
     std::vector<std::shared_ptr<Image>> pending;
     for (int i = 0; i < 33; ++i) {
-        auto job = std::make_shared<Image>(work);
-        job->set_data({"\xff\0\0\x80", 4});
+        auto job = std::make_shared<Image>(images);
         job->width = job->height = 1; job->channels = 4;
-        assert(work.submit(job) == (i < 32));
+        job->set_data({"\xff\0\0\x80", 4});
+        assert(images.submit(job) == (i < 32));
         pending.push_back(std::move(job));
     }
-    assert(work.bytes.load() == 33 * 4);
+    assert(images.bytes.load() == 33 * 4);
     auto image = pending.back();
     pending.clear();
-    assert(work.submit(image));
-    assert(work.bytes.load() == 4);
-    work.start(wake);
+    assert(images.submit(image));
+    assert(images.bytes.load() == 4);
+    images.start(wake);
     const auto deadline = Clock::now() + std::chrono::seconds(3);
     while (!image->ready.load(std::memory_order_acquire)) {
         assert(Clock::now() < deadline);
@@ -49,7 +49,7 @@ static void image_worker() {
     for (const int channels : {3, 4, 0}) {
         const int stride = channels == 3 ? 3 : 4;
         const std::string source(5 * static_cast<std::size_t>(stride), '\xff');
-        auto decoded = std::make_shared<Image>(work);
+        auto decoded = std::make_shared<Image>(images);
         decoded->width = 5; decoded->height = 1; decoded->channels = channels;
         if (channels) decoded->set_data(source);
         else {
@@ -62,7 +62,7 @@ static void image_worker() {
             decoded->set_data(std::string_view(encoded).substr(0, size));
             png_image_free(&png);
         }
-        assert(work.submit(decoded));
+        assert(images.submit(decoded));
         while (!decoded->ready.load(std::memory_order_acquire)) {
             pollfd fd{wake, POLLIN, 0};
             assert(poll(&fd, 1, 3000) > 0);
@@ -74,10 +74,10 @@ static void image_worker() {
         assert(decoded->width == 5 && pixels[4] == 0xffffffff);
     }
     for (const int pixels : {0, 12}) {
-        auto svg = std::make_shared<Image>(work);
+        auto svg = std::make_shared<Image>(images);
         svg->pixels = pixels;
         svg->set_data(R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 2"><path fill="red" d="M0 0h4v2H0z"/></svg>)");
-        assert(work.submit(svg));
+        assert(images.submit(svg));
         while (!svg->ready.load(std::memory_order_acquire)) {
             pollfd fd{wake, POLLIN, 0};
             assert(poll(&fd, 1, 3000) > 0);
@@ -92,16 +92,16 @@ static void image_worker() {
         }
     }
     for (int i = 0; i < 200; ++i) {
-        auto job = std::make_shared<Image>(work);
-        job->set_data({"\xff\0\0\xff", 4});
+        auto job = std::make_shared<Image>(images);
         job->width = job->height = 1; job->channels = 4;
-        assert(work.submit(job));
+        job->set_data({"\xff\0\0\xff", 4});
+        assert(images.submit(job));
     }
-    work.stop();
-    assert(work.bytes.load() == 0);
+    images.stop();
+    assert(images.bytes.load() == 0);
     std::uint64_t value;
     while (read(wake, &value, sizeof(value)) > 0) {}
-    ImageWork canceled;
+    Images canceled;
     auto abandoned = std::make_shared<Image>(canceled);
     abandoned->set_data({"\0\0\0\0", 4});
     assert(canceled.submit(abandoned));
@@ -275,7 +275,17 @@ static void capture_lifetimes() {
     assert(dispatch_captures(gui) == 0 && latest() != retained && capture->constraint_failures == 0);
     assert(*reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(latest()->surface)) == 0xff204060u);
     assert(retained_pixels[0] == 0x80402010u);
-    script("assert(capture_frames == 2); latest_source = nil; collectgarbage('collect')");
+    capture->next_frame = Clock::now();
+    assert(dispatch_captures(gui) == 0 && capture->frame);
+    for (unsigned i = 0; i < 32; ++i) static_cast<std::uint32_t*>(capture->pixels)[i] = 0x00010200u + i;
+    frame_events.transform(capture.get(), capture->frame, WL_OUTPUT_TRANSFORM_90);
+    frame_events.ready(capture.get(), capture->frame);
+    assert(dispatch_captures(gui) == 0);
+    assert(latest()->width == 8 && latest()->height == 4);
+    const auto* rotated = reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(latest()->surface));
+    assert(rotated[0] == 0xff01021cu && rotated[31] == 0xff010203u);
+    assert(retained_pixels[0] == 0x80402010u);
+    script("assert(capture_frames == 3); latest_source = nil; collectgarbage('collect')");
     assert(gui.images.bytes.load() == retained->bytes);
     script(R"(
         retry_capture = assert(hw.capture_workspace(capture_options, function(_, event)

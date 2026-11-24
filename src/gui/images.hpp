@@ -12,11 +12,11 @@
 
 namespace hyprworks::lua {
 
-struct ImageWork;
-/// The worker mutates a submitted image until release-publishing ready.
-/// Readers acquire ready before accessing pixels; ImageWork outlives all images.
+struct Images;
+/// The decode thread release-publishes ready. Readers acquire it before reading
+/// pixels; the image budget outlives every image charged to it.
 struct Image {
-    ImageWork& work;
+    Images& images;
     std::string path, encoded, icon, theme, error;
     int width = 0, height = 0, channels = 0, pixels = 0;
     int icon_size = 0;
@@ -24,23 +24,23 @@ struct Image {
     std::size_t bytes = 0;
     bool submitted = false;
     std::atomic<bool> ready{false};
-    explicit Image(ImageWork& owner) : work(owner) {}
+    explicit Image(Images& owner) : images(owner) {}
     void allocate();
     void set_data(std::string_view data);
     ~Image();
 };
 
-struct ImageWork {
+struct Images {
     std::mutex mutex;
     std::condition_variable changed;
     std::deque<std::shared_ptr<Image>> queue;
     std::atomic<std::size_t> bytes{0};
-    std::thread thread;
+    std::thread decode_thread;
     bool stopping = false;
     void start(int wake);
     void stop();
     bool submit(const std::shared_ptr<Image>& image);
-    ~ImageWork();
+    ~Images();
 };
 
 }

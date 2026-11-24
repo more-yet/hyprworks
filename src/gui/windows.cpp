@@ -60,13 +60,6 @@ void stop_capture(Capture& capture) {
     capture.ready = false; capture.error = nullptr;
 }
 
-void close_capture(Capture& capture) {
-    if (capture.closed) return;
-    stop_capture(capture); capture.closed = true;
-    auto* lua = capture.gui->owner.lua;
-    unref(lua, capture.callback); unref(lua, capture.handle);
-}
-
 void capture_error(Capture& capture, const char* message, bool unavailable) {
     if (!capture.session) return;
     stop_capture(capture);
@@ -121,6 +114,7 @@ const ext_image_copy_capture_session_v1_listener capture_session_listener{
     .buffer_size = [](void* data, auto*, std::uint32_t width, std::uint32_t height) {
         auto& capture = *static_cast<Capture*>(data);
         if (std::exchange(capture.constraints, false)) capture.format = UINT32_MAX;
+        if (capture.width != width || capture.height != height) capture.constraint_failures = 0;
         capture.width = width; capture.height = height;
     },
     .shm_format = [](void* data, auto*, std::uint32_t format) {
@@ -139,6 +133,15 @@ const ext_image_copy_capture_session_v1_listener capture_session_listener{
     },
     .done = [](void* data, auto*) {
         auto& capture = *static_cast<Capture*>(data);
+        if (!capture.width || !capture.height || capture.width > 8192 || capture.height > 8192 ||
+            static_cast<std::uint64_t>(capture.width) * capture.height * 4 > 64 * 1024 * 1024) {
+            capture_error(capture, "capture buffer exceeds 64 MiB");
+            return;
+        }
+        if (capture.format == UINT32_MAX) {
+            capture_error(capture, "capture requires ARGB8888 or XRGB8888 shared memory", true);
+            return;
+        }
         capture.constraints = true;
         if (!capture.frame && !capture.ready && !capture.next_frame) capture.next_frame = Clock::now();
     },
@@ -146,7 +149,11 @@ const ext_image_copy_capture_session_v1_listener capture_session_listener{
 };
 
 const ext_image_copy_capture_frame_v1_listener capture_frame_listener{
-    .transform = [](void* data, auto*, std::uint32_t transform) { static_cast<Capture*>(data)->transform = transform; },
+    .transform = [](void* data, auto*, std::uint32_t transform) {
+        auto& capture = *static_cast<Capture*>(data);
+        if (transform > WL_OUTPUT_TRANSFORM_FLIPPED_270) capture_error(capture, "unsupported capture transform");
+        else capture.transform = transform;
+    },
     .damage = [](void*, auto*, std::int32_t, std::int32_t, std::int32_t, std::int32_t) {},
     .presentation_time = [](void*, auto*, std::uint32_t, std::uint32_t, std::uint32_t) {},
     .ready = [](void* data, auto* frame) {
@@ -443,11 +450,7 @@ WindowCatalog& catalog(lua_State* lua) {
 int open(lua_State* lua) {
     auto& owner = invocation(lua);
     if (owner.closing || !owner.gui) return luaL_error(lua, "window subscription requires a live GUI");
-    if (!owner.gui->windows) {
-        owner.gui->windows = std::make_unique<WindowCatalog>();
-        owner.gui->windows->gui = owner.gui.get();
-        start(*owner.gui->windows);
-    }
+    start_windows(*owner.gui);
     auto& value = *owner.gui->windows;
     return retain_handle(lua, value, window_type);
 }
@@ -509,16 +512,25 @@ int shutdown(lua_State* lua) {
     return 0;
 }
 
+void close_capture_binding(CaptureBinding& binding) {
+    auto& gui = *binding.capture->gui;
+    close_capture(*binding.capture);
+    unref(gui.owner.lua, binding.callback); unref(gui.owner.lua, binding.handle);
+    for (auto& slot : gui.capture_bindings)
+        if (slot.get() == &binding) { slot.reset(); break; }
+}
+
 int capture_close(lua_State* lua) {
-    auto& capture = *static_cast<std::shared_ptr<Capture>*>(luaL_checkudata(lua, 1, capture_type));
-    close_capture(*capture);
+    auto binding = *static_cast<std::shared_ptr<CaptureBinding>*>(luaL_checkudata(lua, 1, capture_type));
+    close_capture_binding(*binding);
     return 0;
 }
 
 int capture_gc(lua_State* lua) {
-    auto* capture = static_cast<std::shared_ptr<Capture>*>(luaL_checkudata(lua, 1, capture_type));
-    if (*capture) close_capture(**capture);
-    capture->~shared_ptr();
+    auto* binding = static_cast<std::shared_ptr<CaptureBinding>*>(luaL_checkudata(lua, 1, capture_type));
+    if (*binding) close_capture_binding(**binding);
+    lua_pushnil(lua); lua_setmetatable(lua, 1);
+    std::destroy_at(binding);
     return 0;
 }
 
@@ -529,39 +541,62 @@ int image_gc(lua_State* lua) {
     return 0;
 }
 
+void admit_capture(const std::shared_ptr<Capture>& capture, ext_image_capture_source_v1* source, bool cursor) {
+    const std::unique_ptr<ext_image_capture_source_v1, decltype(&ext_image_capture_source_v1_destroy)>
+        owned_source(source, ext_image_capture_source_v1_destroy);
+    if (!source) throw std::runtime_error("cannot create capture source");
+    auto& gui = *capture->gui;
+    if (!gui.capture_manager) throw std::runtime_error("image capture is unavailable");
+    const auto slot = std::ranges::find_if(gui.captures, [](const auto& item) { return !item || item->closed; });
+    if (slot == gui.captures.end()) throw std::runtime_error("at most eight captures may be active");
+    capture->session = ext_image_copy_capture_manager_v1_create_session(gui.capture_manager, source,
+        cursor ? EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_OPTIONS_PAINT_CURSORS : 0);
+    if (!capture->session) throw std::runtime_error("cannot create capture session");
+    ext_image_copy_capture_session_v1_add_listener(capture->session, &capture_session_listener, capture.get());
+    *slot = capture;
+}
+
+ext_image_capture_source_v1* window_source(Capture& capture, WindowCatalog& catalog, std::string_view id) {
+    if (!catalog.capture_sources || !catalog.records) throw std::runtime_error("window capture is unavailable");
+    const auto record = std::ranges::lower_bound(*catalog.records, id, {}, &WindowRecord::id);
+    if (record == catalog.records->end() || record->id != id || !record->mapped)
+        throw std::runtime_error("window capture identity is unavailable");
+    const auto target = std::ranges::find_if(catalog.targets, [&](const auto& item) { return item->id == record->capture_id; });
+    if (target == catalog.targets.end()) throw std::runtime_error("window capture target is unavailable");
+    capture.catalog = &catalog; capture.capture_id = record->capture_id;
+    return ext_foreign_toplevel_image_capture_source_manager_v1_create_source(catalog.capture_sources, (*target)->native);
+}
+
 template<class ResolveSource>
 int open_capture(lua_State* lua, Gui& gui, int options, int callback, ResolveSource resolve_source) {
     luaL_checktype(lua, options, LUA_TTABLE); luaL_checktype(lua, callback, LUA_TFUNCTION);
     const auto max_width = static_cast<int>(integer_field(lua, options, "max_width", std::nullopt, 1, 1024));
     const auto max_height = static_cast<int>(integer_field(lua, options, "max_height", std::nullopt, 1, 1024));
     const auto max_fps = integer_field(lua, options, "max_fps", std::nullopt, 1, 30);
-    if (!gui.capture_manager) throw std::runtime_error("native image capture is unavailable");
-    auto capture = std::make_shared<Capture>();
-    capture->gui = &gui;
+    auto capture = std::make_shared<Capture>(gui);
+    auto binding = std::make_shared<CaptureBinding>();
+    binding->capture = capture;
     capture->max_width = max_width; capture->max_height = max_height;
     capture->interval = std::chrono::milliseconds((1000 + max_fps - 1) / max_fps);
     lua_pushvalue(lua, callback);
     const int result = protected_call(lua, [&](lua_State* lua) {
-        auto* handle = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<Capture>), 0)) std::shared_ptr<Capture>();
+        auto* handle = new (lua_newuserdatauv(lua, sizeof(std::shared_ptr<CaptureBinding>), 0)) std::shared_ptr<CaptureBinding>();
         luaL_setmetatable(lua, capture_type);
-        *handle = capture;
-        lua_pushvalue(lua, -1); capture->handle = luaL_ref(lua, LUA_REGISTRYINDEX);
-        lua_pushvalue(lua, 2); capture->callback = luaL_ref(lua, LUA_REGISTRYINDEX);
+        *handle = binding;
+        lua_pushvalue(lua, -1); binding->handle = luaL_ref(lua, LUA_REGISTRYINDEX);
+        lua_pushvalue(lua, 2); binding->callback = luaL_ref(lua, LUA_REGISTRYINDEX);
         return 1;
     }, 1, 0, 1);
-    if (result < 0) { close_capture(*capture); return result; }
+    if (result < 0) { close_capture_binding(*binding); return result; }
     try {
-        const auto slot = std::ranges::find_if(gui.captures, [](const auto& item) { return !item || item->closed; });
-        if (slot == gui.captures.end()) throw std::runtime_error("at most eight captures may be active");
-        auto* source = resolve_source(*capture);
-        if (!source) throw std::runtime_error("cannot create capture source");
-        capture->session = ext_image_copy_capture_manager_v1_create_session(gui.capture_manager, source, 0);
-        ext_image_capture_source_v1_destroy(source);
-        if (!capture->session) throw std::runtime_error("cannot create capture session");
-        ext_image_copy_capture_session_v1_add_listener(capture->session, &capture_session_listener, capture.get());
+        for (auto active : gui.capture_bindings)
+            if (active && active->capture->closed) close_capture_binding(*active);
+        const auto slot = std::ranges::find(gui.capture_bindings, nullptr);
+        if (slot == gui.capture_bindings.end()) throw std::runtime_error("at most eight captures may be active");
+        admit_capture(capture, resolve_source(*capture), false);
         capture->deadline = Clock::now() + std::chrono::seconds(2);
-        *slot = std::move(capture);
-    } catch (...) { close_capture(*capture); throw; }
+        *slot = std::move(binding);
+    } catch (...) { close_capture_binding(*binding); throw; }
     return 1;
 }
 
@@ -570,15 +605,7 @@ int capture_window(lua_State* lua) {
     std::size_t length;
     const char* id = check_string(lua, 2, &length);
     return open_capture(lua, *value.gui, 3, 4, [&](Capture& capture) {
-        if (!value.capture_sources || !value.records) throw std::runtime_error("window capture is unavailable");
-        const std::string_view key(id, length);
-        const auto record = std::ranges::lower_bound(*value.records, key, {}, &WindowRecord::id);
-        if (record == value.records->end() || record->id != key || !record->mapped)
-            throw std::runtime_error("window identity is no longer mapped");
-        const auto target = std::ranges::find_if(value.targets, [&](const auto& item) { return item->id == record->capture_id; });
-        if (target == value.targets.end()) throw std::runtime_error("window capture target is unavailable");
-        capture.catalog = &value; capture.capture_id = record->capture_id;
-        return ext_foreign_toplevel_image_capture_source_manager_v1_create_source(value.capture_sources, (*target)->native);
+        return window_source(capture, value, {id, length});
     });
 }
 
@@ -612,6 +639,43 @@ int capture_workspace(lua_State* lua) {
     });
 }
 
+}
+
+void close_capture(Capture& capture) {
+    if (capture.closed) return;
+    stop_capture(capture); capture.closed = true;
+}
+
+Capture::~Capture() { close_capture(*this); }
+
+void start_windows(Gui& gui) {
+    if (!gui.windows) {
+        gui.windows = std::make_unique<WindowCatalog>();
+        gui.windows->gui = &gui;
+        start(*gui.windows);
+    }
+}
+
+std::shared_ptr<Capture> capture_source(Gui& gui, const std::string& window, std::uint32_t output, bool cursor, int fps) {
+    auto capture = std::make_shared<Capture>(gui);
+    capture->output = output;
+    capture->max_width = capture->max_height = 4096;
+    capture->interval = std::chrono::milliseconds((1000 + fps - 1) / fps);
+    ext_image_capture_source_v1* source = nullptr;
+    if (output) {
+        const auto target = std::ranges::find_if(gui.outputs, [&](const auto& item) { return item->id == output; });
+        if (!gui.output_capture_manager || target == gui.outputs.end()) throw std::runtime_error("output is unavailable");
+        source = ext_output_image_capture_source_manager_v1_create_source(gui.output_capture_manager, (*target)->native);
+    } else {
+        auto* catalog = gui.windows.get();
+        if (!catalog) throw std::runtime_error("window capture is unavailable");
+        source = window_source(*capture, *catalog, window);
+    }
+    admit_capture(capture, source, cursor);
+    capture->deadline = Clock::now() + std::chrono::seconds(5);
+    return capture;
+}
+
 std::shared_ptr<Image> advance_capture(Capture& capture) {
     if (!capture.session) return {};
     const auto now = Clock::now();
@@ -626,15 +690,13 @@ std::shared_ptr<Image> advance_capture(Capture& capture) {
                 capture.next_frame = now;
                 return {};
             }
-            if (capture.transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-                capture_error(capture, "unsupported capture transform");
-                return {};
-            }
             auto image = std::make_shared<Image>(capture.gui->images);
-            const double scale = std::min({1.0, static_cast<double>(capture.max_width) / capture.buffer_width,
-                static_cast<double>(capture.max_height) / capture.buffer_height});
-            image->width = std::max(1, static_cast<int>(std::floor(capture.buffer_width * scale)));
-            image->height = std::max(1, static_cast<int>(std::floor(capture.buffer_height * scale)));
+            const double width = capture.buffer_width, height = capture.buffer_height;
+            const bool rotated = capture.transform & 1;
+            const double logical_width = rotated ? height : width, logical_height = rotated ? width : height;
+            const double scale = std::min({1.0, capture.max_width / logical_width, capture.max_height / logical_height});
+            image->width = std::max(1, static_cast<int>(std::floor(logical_width * scale)));
+            image->height = std::max(1, static_cast<int>(std::floor(logical_height * scale)));
             image->allocate();
             std::unique_ptr<cairo_surface_t, decltype(&cairo_surface_destroy)> source(cairo_image_surface_create_for_data(
                 static_cast<unsigned char*>(capture.pixels),
@@ -642,9 +704,15 @@ std::shared_ptr<Image> advance_capture(Capture& capture) {
                 static_cast<int>(capture.buffer_width), static_cast<int>(capture.buffer_height),
                 static_cast<int>(capture.buffer_width * 4)), cairo_surface_destroy);
             std::unique_ptr<cairo_t, decltype(&cairo_destroy)> paint(cairo_create(image->surface), cairo_destroy);
-            cairo_scale(paint.get(), static_cast<double>(image->width) / capture.buffer_width,
-                static_cast<double>(image->height) / capture.buffer_height);
+            cairo_scale(paint.get(), image->width / logical_width, image->height / logical_height);
             cairo_set_source_surface(paint.get(), source.get(), 0, 0);
+            const cairo_matrix_t transforms[] = {
+                {1, 0, 0, 1, 0, 0}, {0, -1, 1, 0, 0, height},
+                {-1, 0, 0, -1, width, height}, {0, 1, -1, 0, width, 0},
+                {-1, 0, 0, 1, width, 0}, {0, 1, 1, 0, 0, 0},
+                {1, 0, 0, -1, 0, height}, {0, -1, -1, 0, width, height},
+            };
+            cairo_pattern_set_matrix(cairo_get_source(paint.get()), &transforms[capture.transform]);
             cairo_pattern_set_filter(cairo_get_source(paint.get()), CAIRO_FILTER_GOOD);
             cairo_set_operator(paint.get(), CAIRO_OPERATOR_SOURCE);
             cairo_paint(paint.get());
@@ -658,15 +726,6 @@ std::shared_ptr<Image> advance_capture(Capture& capture) {
         const bool replace = !capture.buffer || capture.buffer_width != capture.width || capture.buffer_height != capture.height ||
             capture.buffer_format != capture.format;
         if (replace) {
-            if (!capture.width || !capture.height || capture.width > 8192 || capture.height > 8192 ||
-                static_cast<std::uint64_t>(capture.width) * capture.height * 4 > 64 * 1024 * 1024) {
-                capture_error(capture, "capture buffer exceeds 64 MiB");
-                return {};
-            }
-            if (capture.format == UINT32_MAX) {
-                capture_error(capture, "capture requires ARGB8888 or XRGB8888 shared memory", true);
-                return {};
-            }
             release_buffer(capture);
             const auto bytes = static_cast<std::size_t>(capture.width) * capture.height * 4;
             if (bytes > capture_limit - capture.gui->capture_bytes) {
@@ -691,9 +750,13 @@ std::shared_ptr<Image> advance_capture(Capture& capture) {
     return {};
 }
 
-}
-
 void bind_captures(Gui& gui, wl_registry* registry, std::uint32_t name, const char* interface) {
+    if (!std::strcmp(interface, ext_output_image_capture_source_manager_v1_interface.name) && !gui.output_capture_manager) {
+        gui.output_capture_manager = static_cast<ext_output_image_capture_source_manager_v1*>(
+            wl_registry_bind(registry, name, &ext_output_image_capture_source_manager_v1_interface, 1));
+        if (!gui.output_capture_manager) throw std::runtime_error("cannot bind output capture");
+        gui.output_capture_manager_name = name;
+    }
     if (!std::strcmp(interface, ext_image_copy_capture_manager_v1_interface.name) && !gui.capture_manager) {
         gui.capture_manager = static_cast<ext_image_copy_capture_manager_v1*>(
             wl_registry_bind(registry, name, &ext_image_copy_capture_manager_v1_interface, 1));
@@ -715,6 +778,14 @@ void bind_captures(Gui& gui, wl_registry* registry, std::uint32_t name, const ch
 }
 
 void remove_capture_global(Gui& gui, std::uint32_t name) {
+    for (auto& capture : gui.captures)
+        if (capture && capture->output == name) capture_error(*capture, "output removed", true);
+    if (name == gui.output_capture_manager_name) {
+        for (auto& capture : gui.captures)
+            if (capture && capture->output) capture_error(*capture, "output capture removed", true);
+        ext_output_image_capture_source_manager_v1_destroy(std::exchange(gui.output_capture_manager, nullptr));
+        gui.output_capture_manager_name = 0;
+    }
     for (const auto& output : gui.outputs) if (output->id == name)
         for (auto& group : gui.capture_groups) std::erase(group->outputs, output->native);
     if (name != gui.capture_manager_name && name != gui.workspace_capture_manager_name && name != gui.capture_workspaces_name) return;
@@ -742,8 +813,10 @@ void remove_capture_global(Gui& gui, std::uint32_t name) {
 }
 
 void close_captures(Gui& gui) noexcept {
+    for (auto binding : gui.capture_bindings) if (binding) close_capture_binding(*binding);
     for (auto& capture : gui.captures) if (capture) close_capture(*capture);
     gui.captures.fill(nullptr);
+    if (gui.output_capture_manager_name) remove_capture_global(gui, gui.output_capture_manager_name);
     if (gui.capture_manager_name) remove_capture_global(gui, gui.capture_manager_name);
     if (gui.workspace_capture_manager_name) remove_capture_global(gui, gui.workspace_capture_manager_name);
     if (gui.capture_workspaces_name) remove_capture_global(gui, gui.capture_workspaces_name);
@@ -831,16 +904,19 @@ void read_windows(WindowCatalog& catalog, const WaitSet& wait) {
 
 int dispatch_captures(Gui& gui) {
     auto* lua = gui.owner.lua;
-    for (auto capture : gui.captures) {
-        if (!capture || capture->closed || gui.owner.requests.load(std::memory_order_relaxed)) continue;
+    for (auto binding : gui.capture_bindings) {
+        if (!binding) continue;
+        auto& capture = binding->capture;
+        if (capture->closed) { close_capture_binding(*binding); continue; }
+        if (gui.owner.requests.load(std::memory_order_relaxed)) break;
         const auto image = advance_capture(*capture);
         const char* error = std::exchange(capture->error, nullptr);
         if (!image && !error) continue;
-        const int reference = capture->callback;
+        const int reference = binding->callback;
         lua_pushcfunction(lua, traceback);
         if (protected_call(lua, [&](lua_State* lua) {
             lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
-            lua_rawgeti(lua, LUA_REGISTRYINDEX, capture->handle);
+            lua_rawgeti(lua, LUA_REGISTRYINDEX, binding->handle);
             lua_createtable(lua, 0, 6);
             string_field(lua, "kind", error ? (capture->unavailable ? "unavailable" : "error") : "frame");
             if (error) string_field(lua, "error", error);
@@ -853,7 +929,7 @@ int dispatch_captures(Gui& gui) {
                 lua_pushinteger(lua, capture->buffer_width); lua_setfield(lua, -2, "source_width");
                 lua_pushinteger(lua, capture->buffer_height); lua_setfield(lua, -2, "source_height");
             }
-            if (capture->closed || capture->callback != reference) return 0;
+            if (capture->closed || binding->callback != reference) return 0;
             lua_call(lua, 2, 0); return 0;
         }, 0, 1) < 0) return -1;
         lua_settop(lua, 0);

@@ -431,7 +431,7 @@ void update_ime(Seat& seat) {
         seat.ime_enabled = false; seat.ime_element = -1; return;
     }
     layout(*surface);
-    const auto cursor = input_cursor(*element, true);
+    const auto cursor = input_cursor(*element);
     const std::array<int, 4> rectangle{
         static_cast<int>(element->box.x + element->padding - element->scroll) + cursor.x / PANGO_SCALE,
         static_cast<int>(element->box.y + element->padding) + cursor.y / PANGO_SCALE,
@@ -1019,7 +1019,8 @@ int dispatch_input(Gui& gui) {
                 lua_pushboolean(lua, event.touch); lua_setfield(lua, -2, "touch");
                 lua_pushboolean(lua, event.horizontal); lua_setfield(lua, -2, "horizontal");
                 const auto* live = find_surface(gui, event.surface);
-                if (!live || live->close_pending || (!lifecycle && event.generation != live->input_generation) ||
+                if (!live || live->close_pending || !callback_matches(lua, live->on_input, reference, 2) ||
+                    (!lifecycle && event.generation != live->input_generation) ||
                     state.requests.load(std::memory_order_relaxed)) return 0;
                 lua_call(lua, 2, 1);
                 if (!lua_isnil(lua, -1)) luaL_checktype(lua, -1, LUA_TBOOLEAN);

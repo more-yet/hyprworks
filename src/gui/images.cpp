@@ -20,10 +20,10 @@ constexpr std::size_t input_limit = 8 * 1024 * 1024;
 constexpr std::size_t image_limit = 128 * 1024 * 1024;
 
 void reserve(Image& image, std::size_t bytes) {
-    auto used = image.work.bytes.load(std::memory_order_relaxed);
+    auto used = image.images.bytes.load(std::memory_order_relaxed);
     do {
         if (bytes > image_limit - used) throw std::runtime_error("image memory limit reached (128 MiB)");
-    } while (!image.work.bytes.compare_exchange_weak(used, used + bytes, std::memory_order_relaxed));
+    } while (!image.images.bytes.compare_exchange_weak(used, used + bytes, std::memory_order_relaxed));
     image.bytes += bytes;
 }
 
@@ -137,6 +137,9 @@ void decode(Image& image, std::optional<IconTheme>& icons) {
 void Image::set_data(std::string_view data) {
     assert(!submitted && !bytes);
     if (data.size() > input_limit) throw std::runtime_error("image input exceeds 8 MiB");
+    if (channels && ((channels != 3 && channels != 4) || width < 1 || height < 1 || width > 4096 || height > 4096 ||
+        data.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * static_cast<std::size_t>(channels)))
+        throw std::runtime_error("raw image requires matching dimensions and RGB or RGBA data");
     reserve(*this, data.size());
     encoded.assign(data);
 }
@@ -151,10 +154,10 @@ void Image::allocate() {
 
 Image::~Image() {
     if (surface) cairo_surface_destroy(surface);
-    work.bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    images.bytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
-bool ImageWork::submit(const std::shared_ptr<Image>& image) {
+bool Images::submit(const std::shared_ptr<Image>& image) {
     assert(!image->submitted && image->bytes == image->encoded.size());
     std::lock_guard lock(mutex);
     std::erase_if(queue, [](const auto& job) { return job.use_count() == 1; });
@@ -165,9 +168,9 @@ bool ImageWork::submit(const std::shared_ptr<Image>& image) {
     return true;
 }
 
-void ImageWork::start(int wake) {
-    thread = std::thread([this, wake] {
-        std::optional<IconTheme> icons;
+void Images::start(int wake) {
+    decode_thread = std::thread([this, wake] {
+        std::optional<IconTheme> icon_cache;
         for (;;) {
             std::shared_ptr<Image> image;
             {
@@ -177,7 +180,7 @@ void ImageWork::start(int wake) {
                 image = std::move(queue.front()); queue.pop_front();
             }
             if (image.use_count() > 1) {
-                try { decode(*image, icons); }
+                try { decode(*image, icon_cache); }
                 catch (const std::exception& error) { image->error = error.what(); }
                 catch (...) { image->error = "image decoding failed"; }
                 if (!image->error.empty() && image->surface) {
@@ -196,16 +199,16 @@ void ImageWork::start(int wake) {
     });
 }
 
-void ImageWork::stop() {
+void Images::stop() {
     {
         std::lock_guard lock(mutex);
         stopping = true;
         queue.clear();
     }
     changed.notify_one();
-    if (thread.joinable()) thread.join();
+    if (decode_thread.joinable()) decode_thread.join();
 }
 
-ImageWork::~ImageWork() { stop(); }
+Images::~Images() { stop(); }
 
 }

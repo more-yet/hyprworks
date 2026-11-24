@@ -48,9 +48,9 @@ int menu_open(lua_State* lua) {
     luaL_argcheck(lua, owner_length <= 255 && path_length <= 16384, 1, "invalid menu target");
     auto& slot = vacant_slot(state.menus);
     auto created = std::make_shared<MenuBinding>();
-    created->target = {std::string(owner, owner_length), std::string(path, path_length)};
+    const dbusmenu::Target target{std::string(owner, owner_length), std::string(path, path_length)};
     auto& binding = *created;
-    const auto started = binding.connection.start(binding.target); binding.status_pending = !started;
+    const auto started = binding.connection.start(target); binding.status_pending = !started;
     return open_active(lua, slot, created, menu_metatable);
 }
 
@@ -198,7 +198,7 @@ int tray_restart(lua_State* lua) {
 
 int menu_restart(lua_State* lua) {
     auto& binding = menu_handle(lua, true);
-    dbusmenu::Target target = binding.target;
+    dbusmenu::Target target = binding.connection.target();
     const auto generation = binding.generation;
     if (!lua_isnoneornil(lua, 2)) {
         lua_pushvalue(lua, 2);
@@ -215,9 +215,7 @@ int menu_restart(lua_State* lua) {
     }
     if (generation != binding.generation) throw std::runtime_error("menu changed while parsing target");
     if (resume_handle(lua, invocation(lua).menus, binding) < 0) return -1;
-    const auto result = restart_observer(binding, target);
-    if (result) binding.target = std::move(target);
-    return operation_result(lua, result);
+    return operation_result(lua, restart_observer(binding, target));
 }
 
 int tray_close(lua_State* lua) {
