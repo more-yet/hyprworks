@@ -4,6 +4,7 @@
 #include "../native/hyprland/protocol.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <cmath>
 #include <json-c/json.h>
@@ -589,12 +590,10 @@ int open_capture(lua_State* lua, Gui& gui, int options, int callback, ResolveSou
     }, 1, 0, 1);
     if (result < 0) { close_capture_binding(*binding); return result; }
     try {
-        for (auto active : gui.capture_bindings)
-            if (active && active->capture->closed) close_capture_binding(*active);
-        const auto slot = std::ranges::find(gui.capture_bindings, nullptr);
-        if (slot == gui.capture_bindings.end()) throw std::runtime_error("at most eight captures may be active");
         admit_capture(capture, resolve_source(*capture), false);
         capture->deadline = Clock::now() + std::chrono::seconds(2);
+        const auto slot = std::ranges::find(gui.capture_bindings, nullptr);
+        assert(slot != gui.capture_bindings.end());
         *slot = std::move(binding);
     } catch (...) { close_capture_binding(*binding); throw; }
     return 1;
@@ -823,6 +822,8 @@ void close_captures(Gui& gui) noexcept {
 }
 
 void close_windows(WindowCatalog& catalog) noexcept {
+    for (auto binding : catalog.gui->capture_bindings)
+        if (binding && binding->capture->catalog == &catalog) close_capture_binding(*binding);
     for (auto& capture : catalog.gui->captures)
         if (capture && capture->catalog == &catalog) { close_capture(*capture); capture.reset(); }
     for (auto& target : catalog.targets) ext_foreign_toplevel_handle_v1_destroy(target->native);
@@ -907,7 +908,6 @@ int dispatch_captures(Gui& gui) {
     for (auto binding : gui.capture_bindings) {
         if (!binding) continue;
         auto& capture = binding->capture;
-        if (capture->closed) { close_capture_binding(*binding); continue; }
         if (gui.owner.requests.load(std::memory_order_relaxed)) break;
         const auto image = advance_capture(*capture);
         const char* error = std::exchange(capture->error, nullptr);

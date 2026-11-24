@@ -1,0 +1,13 @@
+[Unit]
+Description=Hyprworks screen-sharing selector
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=exec
+ExecStart="@CMAKE_INSTALL_FULL_BINDIR@/hyprworks" --entry portal-ui.lua
+ExecReload=/usr/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2

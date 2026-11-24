@@ -1,0 +1,16 @@
+[Unit]
+Description=Hyprworks ScreenCast portal
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+Requisite=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.hyprworks
+ExecStart="@CMAKE_INSTALL_FULL_BINDIR@/hyprworks" --no-watch --entry portal-service.lua
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

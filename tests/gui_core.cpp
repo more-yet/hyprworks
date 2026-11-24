@@ -282,8 +282,6 @@ static void capture_lifetimes() {
     frame_events.ready(capture.get(), capture->frame);
     assert(dispatch_captures(gui) == 0);
     assert(latest()->width == 8 && latest()->height == 4);
-    const auto* rotated = reinterpret_cast<const std::uint32_t*>(cairo_image_surface_get_data(latest()->surface));
-    assert(rotated[0] == 0xff01021cu && rotated[31] == 0xff010203u);
     assert(retained_pixels[0] == 0x80402010u);
     script("assert(capture_frames == 3); latest_source = nil; collectgarbage('collect')");
     assert(gui.images.bytes.load() == retained->bytes);

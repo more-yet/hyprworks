@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.hyprworks.PortalUI
+Exec="@CMAKE_INSTALL_FULL_BINDIR@/hyprworks" --entry portal-ui.lua
+SystemdService=hyprworks-portal-ui.service

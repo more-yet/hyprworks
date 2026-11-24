@@ -21,11 +21,10 @@ windows:on_change(function()
     assert(target.mapped and target.width > 0 and target.height > 0)
     if stage == 0 then
         stage, original_id = 1, target.id
-        assert(windows:capture(target.id, {max_width = 160, max_height = 90, max_fps = 2}, function(capture, event)
+        assert(windows:capture(target.id, {max_width = 160, max_height = 90, max_fps = 2}, function(_, event)
             assert(stage == 1 and event.kind == "frame", event.error)
             assert(event.width <= 160 and event.height <= 90)
             frames = frames + 1
-            capture:close()
             assert(window:set_content {kind = "image", source = event.source})
             stage = 2
             assert(windows:restart())

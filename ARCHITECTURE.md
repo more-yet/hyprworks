@@ -3,7 +3,8 @@
 Lua owns desktop composition, appearance, interaction choices and application
 decisions. Native code owns protocol state, rendering, asynchronous execution
 and resource lifetimes. Shell entries, dialogs, preferences and themes live in
-the authored configuration directory.
+the authored configuration directory. The runtime package supplies service
+units and D-Bus activation files.
 
 ## Ownership
 
@@ -181,12 +182,11 @@ those constraints. Frame transforms are validated on arrival.
 
 Each Lua capture binding owns its handle, callback and native capture reference.
 It allocates Lua state before resolving the source, then admits the session
-and registers delivery. Dispatch pins the binding through argument allocation
-and callback admission. Native capture closure releases protocol resources;
-binding closure also releases registry roots. Portal streams hold native
-capture references directly. Completed images have independent ownership in
-the image budget. Window catalog closure retires its window captures;
-workspace capture follows the workspace protocol identity.
+and registers delivery. Native admission enforces capture capacity. Dispatch
+pins the binding through argument allocation and callback admission. Catalog
+teardown releases its captures and Lua registry roots together. Portal streams
+hold native capture references directly. Completed images retain independent
+ownership in the image budget; workspace captures follow workspace identity.
 
 ## Portal sessions and PipeWire
 
@@ -195,26 +195,19 @@ Wayland-connected invocation. Its D-Bus connection exports the standard backend
 and a selector control interface. Broker ownership snapshots authenticate the
 desktop portal frontend and the authored selector by unique bus name.
 
-CreateSession admits a bounded session with a fresh identity. SelectSources
-reads recognized options in one pass and commits source types, multiplicity
-and cursor mode. Start retains the incoming request and exports its cancellation
-object. The selector reads snapshots and submits source IDs with their
-publication revision. The portal tracks attachment against the current UI-name
-owner; reconnecting selectors attach to the retained session state.
+Session admission validates identity and source options. Start retains the
+request and exports its cancellation object. The selector attaches under its
+current bus identity and submits source IDs with their publication revision.
+Sessions survive selector reconnection.
 
-A selection resolves the offered sources and opens the portal's PipeWire
-connection. Stream construction creates each node; native capture admission
-resolves live output or window identities. The complete selection commits after
-all streams and captures are admitted. Temporary streams release their captures
-and nodes when admission fails.
+The portal owns the PipeWire connection. A selection admits all captures and
+stream nodes before committing; failed admission releases its temporary resources.
 
 The PipeWire loop contributes a descriptor to the invocation's poll set.
-Protocol and stream callbacks run on the invocation thread. Each stream owns
-its latest image, negotiated format and buffer reservation. The first image
-connects the node; resized images renegotiate its format. Processing copies
-the image into a mapped BGRA buffer and returns the buffer to PipeWire.
-Frame deadlines repeat the latest image while capture waits for source damage.
-Start publishes the node IDs when every selected stream has registered.
+Callbacks run on the invocation thread. Streams own their latest image,
+negotiated format and buffer reservation. The first image connects the node;
+resizing renegotiates its format. Frame deadlines copy the latest image into
+mapped BGRA buffers. Start publishes the registered node IDs.
 
 Request cancellation, source loss, session closure and frontend disappearance
 converge on session cleanup: complete the pending request, retire exported

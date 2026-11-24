@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.hyprworks
+Exec="@CMAKE_INSTALL_FULL_BINDIR@/hyprworks" --no-watch --entry portal-service.lua
+SystemdService=hyprworks-portal.service

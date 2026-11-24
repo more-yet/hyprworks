@@ -264,22 +264,34 @@ ownership, cancellation, request expiry and FD lifetimes.
 
 ### ScreenCast portal
 
-`HYPRWORKS_BUILD_PORTAL` enables the native ScreenCast backend and requires
-GUI, Lua, D-Bus and PipeWire 1.4 or newer. The build installs
-`hyprworks.portal` in the prefix's `share/xdg-desktop-portal/portals` directory.
-
-A persistent entry starts the owner:
+`HYPRWORKS_BUILD_PORTAL` enables ScreenCast and requires GUI, Lua, D-Bus and
+PipeWire 1.4 or newer. Save the persistent entry as `portal-service.lua`:
 
 ```lua
 local hw = require("hyprworks")
 assert(hw.portal {max_fps = 30})
 ```
 
-Run it with `hyprworks --no-watch --entry portal-service.lua`. `hw.portal()`
-starts one Wayland-connected owner per invocation under the service name
-`org.freedesktop.impl.portal.desktop.hyprworks`.
+Provide the selector in `portal-ui.lua` alongside it in `HYPRWORKS_CONFIG_DIR`,
+then enable the packaged backend service:
 
-The backend implements `org.freedesktop.impl.portal.ScreenCast` version 3:
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now hyprworks-portal.service
+```
+
+Select the backend in the desktop's `xdg-desktop-portal` configuration:
+
+```ini
+[preferred]
+org.freedesktop.impl.portal.ScreenCast=hyprworks;
+```
+
+Restart `xdg-desktop-portal.service` to apply routing changes. D-Bus starts the
+selector on demand.
+
+The backend owns `org.freedesktop.impl.portal.desktop.hyprworks` and implements
+`org.freedesktop.impl.portal.ScreenCast` version 3:
 monitor and window selection, single or multiple sources, and hidden or
 embedded cursors. `xdg-desktop-portal` owns the application-facing API and
 returns a permission-scoped PipeWire remote to applications. The backend
@@ -522,18 +534,17 @@ An embedder owns `hyprworks::lua::Invocation`, calls `load()` and `run()`, and
 keeps it alive through cross-thread quit/reload requests. Native-only hosts
 drive each connection's `prepare_wait()` and `dispatch()` themselves.
 
-Set `CMAKE_INSTALL_PREFIX` for installation, then use `cmake --install`.
-Packages stage the same install with `DESTDIR`. The installed
-`hyprworks.service` follows the graphical session and supports
-`systemctl --user reload hyprworks.service`.
+Set `CMAKE_INSTALL_PREFIX`, then use `cmake --install`. Packages stage the same
+install with `DESTDIR`. GUI builds install user services for enabled features:
 
-GUI builds with Polkit also install `hyprworks-polkit.service`. It runs
-`hyprworks --entry polkit-agent.lua`, using the same configuration directory as
-the shell service. Place the prompt and its local modules in the selected
-directory; Lua owns its appearance, identity selection and interaction flow
-through `hw.polkit()`. Services read environment variables from the systemd user
-manager or unit configuration.
+| Service | Entry | Startup |
+|---|---|---|
+| `hyprworks.service` | `main.lua` | Enable for the graphical session |
+| `hyprworks-polkit.service` | `polkit-agent.lua` | Enable for the graphical session |
+| `hyprworks-portal.service` | `portal-service.lua` | Enable for the graphical session |
+| `hyprworks-portal-ui.service` | `portal-ui.lua` | D-Bus activation |
 
-Enable the configured agent manually with
-`systemctl --user enable --now hyprworks-polkit.service`. A service drop-in can
-override `ExecStart` to select another authored filename with `--entry FILE`.
+Units use the installed binary and read `HYPRWORKS_CONFIG_DIR` from the user
+manager's environment. Shell, Polkit and selector units support reload.
+The portal owner runs persistently. Portal builds also install the
+`hyprworks.portal` descriptor and backend/selector D-Bus activation files.
